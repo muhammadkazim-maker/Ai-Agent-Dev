@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">OmniVoice Rebuild</string>
+    <string name="shell_subtitle">PHASE 01 // CONVERSATION SHELL</string>
+    <string name="state_idle">IDLE</string>
+    <string name="state_not_configured">NOT_CONFIGURED</string>
+    <string name="state_paused">PAUSED</string>
+    <string name="state_stopped">STOPPED</string>
+    <string name="mic_status_honest">MIC: INACTIVE (NOT_CONFIGURED IN PHASE 01)</string>
+    <string name="action_start">Start</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_reset_idle">Reset to Idle</string>
+    <string name="action_verify_precedence">Test Stop/Pause Precedence</string>
+    <string name="settings_placeholder_title">Settings (Phase 01 Placeholder)</string>
+    <string name="settings_placeholder_desc">Audio engines, Gemini live/model configuration, call routing, and accessibility services are intentionally omitted in Phase 01 per PROJECT_CONTRACT.md.</string>
+    <string name="transcript_header">CONVERSATION TRANSCRIPT &amp; VERIFIED OUTCOMES</string>
+    <string name="transcript_empty_hint">No active voice engine in Phase 01. Press Start to verify honest NOT_CONFIGURED state transition, or test Stop/Pause precedence.</string>
+    <string name="controls_header">COMMAND DECK (STOP / PAUSE PRECEDENCE)</string>
+    <string name="telemetry_header">COORDINATOR TELEMETRY</string>
+    <string name="cd_settings_button">Open Phase 01 Settings Placeholder</string>
+    <string name="cd_start_button">Start conversation session</string>
+    <string name="cd_pause_button">Pause conversation session</string>
+    <string name="cd_stop_button">Stop conversation session immediately</string>
+</resources>

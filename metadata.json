@@ -1,0 +1,6 @@
+{
+  "name": "OmniVoice Rebuild",
+  "description": "Phase 01 native Kotlin/Jetpack Compose landscape-first conversation shell with single ConversationCoordinator, typed verified outcomes, Stop/Pause precedence, and honest NOT_CONFIGURED state.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
