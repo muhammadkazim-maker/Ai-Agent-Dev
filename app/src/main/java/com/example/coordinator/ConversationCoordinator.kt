@@ -1,6 +1,16 @@
 package com.example.coordinator
 
 import com.example.BuildConfig
+import com.example.audio.AudioAnomaly
+import com.example.audio.AudioCapture
+import com.example.audio.AudioCaptureState
+import com.example.audio.AudioHardwareDriver
+import com.example.audio.AudioOwner
+import com.example.audio.CaptureCallbackEvent
+import com.example.audio.CaptureGenerationId
+import com.example.audio.HardwareStartResult
+import com.example.audio.MicPermissionState
+import com.example.audio.PcmResampler
 import com.example.contract.ActionId
 import com.example.contract.ContractIdGenerator
 import com.example.contract.ConversationState
@@ -15,6 +25,38 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
 /**
+ * Default deterministic hardware driver used when no Android Context driver is injected
+ * (e.g., pure JVM unit tests). Does not fake microphone signal frames unless a test explicitly
+ * injects frames via [AudioCapture.onHardwareCallback].
+ */
+class DefaultNoContextAudioDriver : AudioHardwareDriver {
+    override fun hasMicrophoneDevice(): Boolean = true
+
+    override fun startHardwareCapture(
+        generationId: CaptureGenerationId,
+        onEvent: (CaptureCallbackEvent) -> Unit
+    ): HardwareStartResult = HardwareStartResult.Started(PcmResampler.TARGET_SAMPLE_RATE_HZ)
+
+    override fun stopHardwareCapture() = Unit
+
+    override fun playEphemeralPcm16kHz(
+        generationId: CaptureGenerationId,
+        samples16kHz: ShortArray,
+        onCompleted: (CaptureCallbackEvent.EphemeralPlaybackCompleted) -> Unit
+    ): Boolean {
+        onCompleted(
+            CaptureCallbackEvent.EphemeralPlaybackCompleted(
+                generationId = generationId,
+                playedSamplesCount = samples16kHz.size
+            )
+        )
+        return true
+    }
+
+    override fun stopEphemeralPlayback() = Unit
+}
+
+/**
  * Immutable UI state snapshot emitted by the single [ConversationCoordinator].
  */
 data class ConversationUiState(
@@ -23,29 +65,33 @@ data class ConversationUiState(
     val lastActionId: ActionId,
     val state: ConversationState,
     val isMicrophoneActive: Boolean = false,
-    val microphoneStatusLabel: String = "MIC: INACTIVE (NOT_CONFIGURED IN PHASE 01)",
+    val microphoneStatusLabel: String = "MIC: INACTIVE (LOCAL SELF-TEST READY; GEMINI NOT_CONFIGURED)",
     val modelConfigStatus: String = BuildConfig.MODEL_CONFIG_STATUS,
     val sourceBuildId: String = BuildConfig.SOURCE_BUILD_ID,
     val lastOutcome: VerifiedOutcome? = null,
     val transcript: List<TranscriptEntry> = emptyList(),
     val executedActionCount: Int = 0,
-    val duplicateRejectedCount: Int = 0
+    val duplicateRejectedCount: Int = 0,
+    val audioCaptureState: AudioCaptureState = AudioCaptureState()
 )
 
 /**
- * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01).
+ * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 & Phase 02).
  *
- * EnforcesPROJECT_CONTRACT.md invariants:
- * 1. Single coordinator authority for session, turn, and action state transitions.
- * 2. Strongly-typed SessionId, TurnId, and ActionId on every transition and transcript entry.
+ * Enforces PROJECT_CONTRACT.md invariants:
+ * 1. Single coordinator authority for session, turn, action, and audio owner transitions.
+ * 2. Strongly-typed SessionId, TurnId, ActionId, and CaptureGenerationId.
  * 3. Exactly-once effects: duplicate ActionIds are rejected deterministically without mutating state.
- * 4. Stop/Pause precedence: STOP > PAUSE > START.
- * 5. Honest NOT_CONFIGURED state on Start in Phase 01; never fakes or animates a working microphone.
+ * 4. Stop/Pause precedence: STOP > STOP_MIC_SELF_TEST > PAUSE > START_MIC_SELF_TEST > START.
+ *    Large STOP immediately releases audio capture/playback hardware and wipes ephemeral buffers.
+ * 5. Honest NOT_CONFIGURED state on Start: microphone self-test is strictly local hardware
+ *    verification and never pretends to be an assistant answer.
  * 6. Excludes private data and secrets from logs and state payloads.
  */
 class ConversationCoordinator(
     private val idGenerator: ContractIdGenerator = ContractIdGenerator(),
-    private val clockProvider: () -> String = { "PHASE01-T+${System.currentTimeMillis() % 100000}ms" }
+    val audioCapture: AudioCapture = AudioCapture(DefaultNoContextAudioDriver()),
+    private val clockProvider: () -> String = { "PHASE02-T+${System.currentTimeMillis() % 100000}ms" }
 ) {
     private val executedActionIds = LinkedHashSet<String>()
     private val maxTrackedActions = 512
@@ -61,6 +107,7 @@ class ConversationCoordinator(
             lastActionId = initialActionId,
             state = ConversationState.IDLE,
             isMicrophoneActive = false,
+            audioCaptureState = audioCapture.state.value,
             transcript = listOf(
                 TranscriptEntry(
                     id = "${initialActionId.value}-log",
@@ -70,7 +117,7 @@ class ConversationCoordinator(
                     roleLabel = "COORDINATOR",
                     stateSnapshot = ConversationState.IDLE,
                     outcomeCode = "SHELL_INITIALIZED",
-                    message = "OmniVoice Rebuild Phase 01 shell ready. Single ConversationCoordinator active. Audio, Gemini, accessibility, and call engines are NOT_CONFIGURED in Phase 01.",
+                    message = "OmniVoice Rebuild Phase 02 ready. Single ConversationCoordinator & single AudioCapture owner active. Assistant/Gemini model remains NOT_CONFIGURED; Microphone Self-Test is local hardware verification only.",
                     timestampLabel = "INIT"
                 )
             )
@@ -82,10 +129,82 @@ class ConversationCoordinator(
         recordActionId(initialActionId)
     }
 
-    /**
-     * Generates a fresh [ActionId] for a user or test command.
-     */
     fun nextActionId(verb: String): ActionId = idGenerator.nextActionId(verb)
+
+    /**
+     * Synchronizes the latest [AudioCaptureState] into [ConversationUiState] so the shell
+     * and microphone setup screen always reflect real hardware state.
+     */
+    @Synchronized
+    fun syncAudioState() {
+        val snap = audioCapture.state.value
+        val micLabel = when {
+            snap.isCapturing -> "MIC: CAPTURING (${snap.activeGeneration?.wireId ?: "active"} • ${snap.capturedFrameCount} frames)"
+            snap.isPlayingEphemeralCheck -> "MIC: PLAYING EPHEMERAL CHECK (${snap.activeGeneration?.wireId ?: "play"})"
+            snap.permissionState == MicPermissionState.GRANTED -> "MIC: READY (PERMISSION GRANTED • IDLE)"
+            snap.permissionState == MicPermissionState.PERMANENTLY_DENIED -> "MIC: BLOCKED (PERMANENTLY DENIED — OPEN SETTINGS)"
+            snap.permissionState == MicPermissionState.REFUSED_CAN_RETRY -> "MIC: PERMISSION REFUSED (CAN RETRY)"
+            else -> "MIC: INACTIVE (PERMISSION NOT_REQUESTED)"
+        }
+        _uiState.update { current ->
+            current.copy(
+                isMicrophoneActive = snap.isCapturing,
+                microphoneStatusLabel = micLabel,
+                audioCaptureState = snap
+            )
+        }
+    }
+
+    /**
+     * Updates the Android RECORD_AUDIO permission state in the single [AudioCapture] owner.
+     */
+    @Synchronized
+    fun onMicPermissionUpdated(permissionState: MicPermissionState) {
+        audioCapture.updatePermissionState(permissionState)
+        syncAudioState()
+    }
+
+    /**
+     * Forwards a generation-tagged hardware callback through [AudioCapture] and updates state.
+     * Returns true if accepted by the active generation, false if dropped as stale.
+     */
+    @Synchronized
+    fun onAudioHardwareCallback(event: CaptureCallbackEvent): Boolean {
+        val accepted = audioCapture.onHardwareCallback(event)
+        syncAudioState()
+        return accepted
+    }
+
+    /**
+     * Explicit lifecycle hook when navigating away from the Microphone Setup screen or when
+     * the Activity stops/backgrounds (not a configuration change).
+     * Immediately releases hardware and wipes ephemeral self-test audio.
+     */
+    @Synchronized
+    fun onLifecycleReleaseHardware(reason: String) {
+        val hadActiveHardware = audioCapture.state.value.isCapturing ||
+            audioCapture.state.value.isPlayingEphemeralCheck ||
+            audioCapture.state.value.ephemeralRecordedSamples > 0
+        audioCapture.stopAndRelease(reason = reason, wipeEphemeral = true)
+        syncAudioState()
+        if (hadActiveHardware) {
+            val turn = idGenerator.nextTurnId()
+            val act = idGenerator.nextActionId("lifecycle_release")
+            val current = _uiState.value
+            val entry = TranscriptEntry(
+                id = "${act.value}-${turn.value}",
+                sessionId = current.sessionId,
+                turnId = turn,
+                actionId = act,
+                roleLabel = "LIFECYCLE_GUARD",
+                stateSnapshot = current.state,
+                outcomeCode = "HARDWARE_RELEASED_ON_LIFECYCLE",
+                message = "Audio hardware released & ephemeral check buffer wiped: $reason.",
+                timestampLabel = clockProvider()
+            )
+            _uiState.update { it.copy(transcript = it.transcript + entry) }
+        }
+    }
 
     /**
      * Dispatches a single [CoordinatorCommand] with an explicit [ActionId] to guarantee
@@ -132,13 +251,18 @@ class ConversationCoordinator(
 
         return when (command) {
             CoordinatorCommand.STOP -> {
+                // Large Stop MUST promptly release hardware and wipe ephemeral self-test data
+                audioCapture.stopAndRelease(
+                    reason = "Immediate operator STOP command",
+                    wipeEphemeral = true
+                )
                 val outcome = VerifiedOutcome.StateTransitionVerified(
                     actionId = actionId,
                     sessionId = current.sessionId,
                     turnId = nextTurn,
                     previousState = current.state,
                     resultingState = ConversationState.STOPPED,
-                    detail = "STOP command executed with highest precedence (priority ${CoordinatorCommand.STOP.priority}). Session halted."
+                    detail = "STOP command executed with highest precedence (priority ${CoordinatorCommand.STOP.priority}). Session halted, audio hardware released, and ephemeral buffer wiped."
                 )
                 applyVerifiedOutcome(
                     sessionId = current.sessionId,
@@ -152,7 +276,6 @@ class ConversationCoordinator(
             }
 
             CoordinatorCommand.PAUSE -> {
-                // Stop/Pause Precedence: If already STOPPED, STOP retains precedence over PAUSE.
                 if (current.state == ConversationState.STOPPED) {
                     val preempted = VerifiedOutcome.PreemptedByPrecedence(
                         actionId = actionId,
@@ -173,13 +296,17 @@ class ConversationCoordinator(
                     )
                     preempted
                 } else {
+                    audioCapture.stopAndRelease(
+                        reason = "Operator PAUSE command",
+                        wipeEphemeral = false
+                    )
                     val outcome = VerifiedOutcome.StateTransitionVerified(
                         actionId = actionId,
                         sessionId = current.sessionId,
                         turnId = nextTurn,
                         previousState = current.state,
                         resultingState = ConversationState.PAUSED,
-                        detail = "PAUSE command executed (priority ${CoordinatorCommand.PAUSE.priority}). Conversation shell paused."
+                        detail = "PAUSE command executed (priority ${CoordinatorCommand.PAUSE.priority}). Active audio capture released and shell paused."
                     )
                     applyVerifiedOutcome(
                         sessionId = current.sessionId,
@@ -194,13 +321,13 @@ class ConversationCoordinator(
             }
 
             CoordinatorCommand.START -> {
-                // In Phase 01, Start honestly reports NOT_CONFIGURED without faking a working mic.
+                // Keep conversation shell honest: even when mic is configured, Gemini assistant is NOT_CONFIGURED in Phase 02.
                 val outcome = VerifiedOutcome.HonestNotConfiguredOutcome(
                     actionId = actionId,
                     sessionId = current.sessionId,
                     turnId = nextTurn,
                     resultingState = ConversationState.NOT_CONFIGURED,
-                    detail = "Start requested from ${current.state.wireLabel}: Transitioned to honest NOT_CONFIGURED state. Microphone capture and Gemini model are not wired in Phase 01."
+                    detail = "Start requested from ${current.state.wireLabel}: Transitioned to honest NOT_CONFIGURED state. Gemini assistant model is not wired in Phase 02 (Microphone Self-Test is local hardware verification only, not an assistant answer)."
                 )
                 applyVerifiedOutcome(
                     sessionId = current.sessionId,
@@ -213,7 +340,109 @@ class ConversationCoordinator(
                 outcome
             }
 
+            CoordinatorCommand.START_MIC_SELF_TEST -> {
+                val genId = audioCapture.startCapture(
+                    owner = AudioOwner.MIC_SELF_TEST,
+                    sessionId = current.sessionId
+                )
+                val snap = audioCapture.state.value
+                val outcomeCode = if (snap.isCapturing) {
+                    "MIC_SELF_TEST_STARTED"
+                } else {
+                    "MIC_SELF_TEST_BLOCKED_${snap.anomaly.wireCode}"
+                }
+                val detailMsg = if (snap.isCapturing) {
+                    "Local Microphone Self-Test started (${genId.wireId}, ${snap.hardwareSampleRateHz}Hz -> 16000Hz Mono PCM-16). Note: Self-test verifies local hardware only and is NOT an assistant answer."
+                } else {
+                    "Local Microphone Self-Test could not start (${genId.wireId}): ${snap.statusDetail}"
+                }
+                val outcome = VerifiedOutcome.AudioSelfTestOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    resultingState = current.state,
+                    generationId = genId,
+                    anomaly = snap.anomaly,
+                    isCapturing = snap.isCapturing,
+                    code = outcomeCode,
+                    detail = detailMsg
+                )
+                applyVerifiedOutcome(
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    actionId = actionId,
+                    newState = current.state,
+                    roleLabel = "MIC_SELF_TEST",
+                    outcome = outcome
+                )
+                outcome
+            }
+
+            CoordinatorCommand.STOP_MIC_SELF_TEST -> {
+                val prevGen = audioCapture.state.value.activeGeneration
+                val frames = audioCapture.state.value.capturedFrameCount
+                val peakRms = audioCapture.state.value.peakRmsLinear
+                audioCapture.stopAndRelease(
+                    reason = "Self-test capture stopped and hardware released",
+                    wipeEphemeral = false
+                )
+                val snap = audioCapture.state.value
+                val outcome = VerifiedOutcome.AudioSelfTestOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    resultingState = current.state,
+                    generationId = prevGen,
+                    anomaly = snap.anomaly,
+                    isCapturing = false,
+                    code = "MIC_SELF_TEST_STOPPED_RELEASED",
+                    detail = "Self-test stopped & AudioRecord released (${prevGen?.wireId ?: "none"}): $frames frames captured, peak RMS ${"%.3f".format(peakRms)}."
+                )
+                applyVerifiedOutcome(
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    actionId = actionId,
+                    newState = current.state,
+                    roleLabel = "MIC_SELF_TEST",
+                    outcome = outcome
+                )
+                outcome
+            }
+
+            CoordinatorCommand.PLAY_EPHEMERAL_CHECK -> {
+                val played = audioCapture.playAndDeleteEphemeralCheck(current.sessionId)
+                val snap = audioCapture.state.value
+                val outcome = VerifiedOutcome.AudioSelfTestOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    resultingState = current.state,
+                    generationId = snap.activeGeneration ?: snap.lastCompletedGeneration,
+                    anomaly = snap.anomaly,
+                    isCapturing = false,
+                    code = if (played) "EPHEMERAL_PLAYBACK_AND_DELETE" else "EPHEMERAL_PLAYBACK_EMPTY",
+                    detail = if (played) {
+                        "Ephemeral self-test recording played for intelligibility check and immediately wiped (Retention OFF, 0 bytes retained)."
+                    } else {
+                        "Ephemeral playback skipped: ${snap.statusDetail}"
+                    }
+                )
+                applyVerifiedOutcome(
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    actionId = actionId,
+                    newState = current.state,
+                    roleLabel = "EPHEMERAL_CHECK",
+                    outcome = outcome
+                )
+                outcome
+            }
+
             CoordinatorCommand.RESET_IDLE -> {
+                audioCapture.stopAndRelease(
+                    reason = "Session reset to IDLE",
+                    wipeEphemeral = true
+                )
                 val freshSession = idGenerator.nextSessionId()
                 val outcome = VerifiedOutcome.StateTransitionVerified(
                     actionId = actionId,
@@ -221,7 +450,7 @@ class ConversationCoordinator(
                     turnId = nextTurn,
                     previousState = current.state,
                     resultingState = ConversationState.IDLE,
-                    detail = "Session reset to IDLE with new session ID ${freshSession.value}."
+                    detail = "Session reset to IDLE with new session ID ${freshSession.value}. Audio hardware released."
                 )
                 applyVerifiedOutcome(
                     sessionId = freshSession,
@@ -238,7 +467,7 @@ class ConversationCoordinator(
 
     /**
      * Evaluates a batch of concurrent commands and enforces strict Stop/Pause precedence
-     * (STOP > PAUSE > START). Useful for verifying contract precedence under contention.
+     * (STOP > STOP_MIC_SELF_TEST > PAUSE > START_MIC_SELF_TEST > START).
      */
     @Synchronized
     fun dispatchWithPrecedence(
@@ -260,6 +489,13 @@ class ConversationCoordinator(
         recordActionId(actionId)
         val nextTurn = idGenerator.nextTurnId()
 
+        if (winningCommand == CoordinatorCommand.STOP || winningCommand == CoordinatorCommand.PAUSE) {
+            audioCapture.stopAndRelease(
+                reason = "Preempted by ${winningCommand.name} precedence",
+                wipeEphemeral = (winningCommand == CoordinatorCommand.STOP)
+            )
+        }
+
         val targetState = when (winningCommand) {
             CoordinatorCommand.STOP -> ConversationState.STOPPED
             CoordinatorCommand.PAUSE ->
@@ -267,6 +503,7 @@ class ConversationCoordinator(
                 else ConversationState.PAUSED
             CoordinatorCommand.START -> ConversationState.NOT_CONFIGURED
             CoordinatorCommand.RESET_IDLE -> ConversationState.IDLE
+            else -> current.state
         }
 
         val preemptedList = losingCommands.joinToString(", ") { it.name }
@@ -299,6 +536,16 @@ class ConversationCoordinator(
         roleLabel: String,
         outcome: VerifiedOutcome
     ) {
+        val snap = audioCapture.state.value
+        val micLabel = when {
+            snap.isCapturing -> "MIC: CAPTURING (${snap.activeGeneration?.wireId ?: "active"} • ${snap.capturedFrameCount} frames)"
+            snap.isPlayingEphemeralCheck -> "MIC: PLAYING EPHEMERAL CHECK (${snap.activeGeneration?.wireId ?: "play"})"
+            snap.permissionState == MicPermissionState.GRANTED -> "MIC: READY (PERMISSION GRANTED • IDLE)"
+            snap.permissionState == MicPermissionState.PERMANENTLY_DENIED -> "MIC: BLOCKED (PERMANENTLY DENIED — OPEN SETTINGS)"
+            snap.permissionState == MicPermissionState.REFUSED_CAN_RETRY -> "MIC: PERMISSION REFUSED (CAN RETRY)"
+            else -> "MIC: INACTIVE (NOT_CONFIGURED IN PHASE 01)"
+        }
+
         val entry = TranscriptEntry(
             id = "${actionId.value}-${turnId.value}",
             sessionId = sessionId,
@@ -316,7 +563,9 @@ class ConversationCoordinator(
                 currentTurnId = turnId,
                 lastActionId = actionId,
                 state = newState,
-                isMicrophoneActive = false, // Strictly false in Phase 01; never fake mic activity
+                isMicrophoneActive = snap.isCapturing,
+                microphoneStatusLabel = micLabel,
+                audioCaptureState = snap,
                 lastOutcome = outcome,
                 transcript = state.transcript + entry,
                 executedActionCount = state.executedActionCount + 1

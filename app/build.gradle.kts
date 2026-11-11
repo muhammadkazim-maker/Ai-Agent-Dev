@@ -16,14 +16,14 @@ android {
     applicationId = "com.kazim.omnivoice.rebuild"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "0.1.0-phase01"
+    versionCode = 2
+    versionName = "0.2.0-phase02"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-    buildConfigField("String", "SOURCE_BUILD_ID", "\"ov-rebuild-p01-20261109\"")
-    buildConfigField("String", "PHASE_NAME", "\"Phase 01 - Conversation Shell\"")
-    buildConfigField("String", "MODEL_CONFIG_STATUS", "\"NOT_CONFIGURED (Deferred to Phase 02+)\"")
+    buildConfigField("String", "SOURCE_BUILD_ID", "\"ov-rebuild-p02-20261110\"")
+    buildConfigField("String", "PHASE_NAME", "\"Phase 02 - Microphone Setup & Local AudioCapture\"")
+    buildConfigField("String", "MODEL_CONFIG_STATUS", "\"NOT_CONFIGURED (Audio Self-Test Only; Gemini Deferred)\"")
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,

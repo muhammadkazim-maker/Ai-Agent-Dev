@@ -1,7 +1,17 @@
 package com.example.ui.shell
 
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -17,7 +27,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -31,10 +40,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.MicNone
 import androidx.compose.material.icons.outlined.MicOff
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
@@ -57,11 +68,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -70,12 +82,27 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.R
 import com.example.contract.ConversationState
 import com.example.contract.TranscriptEntry
 import com.example.coordinator.ConversationUiState
+import com.example.ui.mic.MicrophoneSetupScreen
+
+private fun Context.findActivity(): Activity? {
+    var ctx = this
+    while (ctx is ContextWrapper) {
+        if (ctx is Activity) return ctx
+        ctx = ctx.baseContext
+    }
+    return null
+}
 
 @Composable
 fun ConversationShellRoute(
@@ -83,8 +110,80 @@ fun ConversationShellRoute(
     modifier: Modifier = Modifier
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val audioState by viewModel.audioState.collectAsStateWithLifecycle()
+    val activeScreen by viewModel.activeScreen.collectAsStateWithLifecycle()
     val isSettingsOpen by viewModel.isSettingsOpen.collectAsStateWithLifecycle()
     val fontScaleOverride by viewModel.fontScaleOverride.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        val activity = context.findActivity()
+        val shouldShowRationale = activity?.let {
+            ActivityCompat.shouldShowRequestPermissionRationale(
+                it,
+                Manifest.permission.RECORD_AUDIO
+            )
+        } ?: false
+        viewModel.onPermissionRequestResult(
+            granted = isGranted,
+            shouldShowRationale = shouldShowRationale
+        )
+    }
+
+    // Re-check RECORD_AUDIO permission on ON_RESUME (after returning from Settings)
+    // and release hardware on ON_STOP when not rotating.
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            val activity = context.findActivity()
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    val granted = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    val rationale = activity?.let {
+                        ActivityCompat.shouldShowRequestPermissionRationale(
+                            it,
+                            Manifest.permission.RECORD_AUDIO
+                        )
+                    } ?: false
+                    // Only overwrite if OS explicitly reports granted, or if we previously requested
+                    if (granted || viewModel.hasRequestedPermissionOnce.value) {
+                        viewModel.onReCheckPermissionFromOs(
+                            isGranted = granted,
+                            shouldShowRationale = rationale
+                        )
+                    }
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    val changingConfigs = activity?.isChangingConfigurations == true
+                    viewModel.onActivityStopped(isChangingConfigurations = changingConfigs)
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val openSystemAppSettings: () -> Unit = {
+        try {
+            val intent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", context.packageName, null)
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (_: Throwable) {
+        }
+    }
 
     val baseDensity = LocalDensity.current
     val effectiveDensity = if (fontScaleOverride != null) {
@@ -94,20 +193,49 @@ fun ConversationShellRoute(
     }
 
     CompositionLocalProvider(LocalDensity provides effectiveDensity) {
-        ConversationShellScreen(
-            uiState = uiState,
-            isSettingsOpen = isSettingsOpen,
-            fontScaleOverride = fontScaleOverride,
-            onStartClick = { viewModel.onStartClicked() },
-            onPauseClick = { viewModel.onPauseClicked() },
-            onStopClick = { viewModel.onStopClicked() },
-            onResetIdleClick = { viewModel.onResetIdleClicked() },
-            onVerifyPrecedenceClick = { viewModel.onVerifyStopPausePrecedenceClicked() },
-            onOpenSettings = viewModel::onOpenSettings,
-            onDismissSettings = viewModel::onDismissSettings,
-            onSelectFontScale = viewModel::onSetFontScaleOverride,
-            modifier = modifier
-        )
+        when (activeScreen) {
+            ActiveScreen.MICROPHONE_SETUP -> {
+                MicrophoneSetupScreen(
+                    uiState = uiState,
+                    audioState = audioState,
+                    onRequestMicPermission = {
+                        try {
+                            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } catch (_: Throwable) {
+                            // In synthetic test environments without an ActivityResultRegistry launcher
+                            viewModel.onPermissionRequestResult(granted = false, shouldShowRationale = true)
+                        }
+                    },
+                    onOpenAppSettings = openSystemAppSettings,
+                    onStartSelfTest = { viewModel.onStartMicSelfTestClicked() },
+                    onStopSelfTest = { viewModel.onStopMicSelfTestClicked() },
+                    onPlayAndDeleteEphemeral = { viewModel.onPlayAndDeleteEphemeralCheckClicked() },
+                    onWipeEphemeral = viewModel::onWipeEphemeralAudioClicked,
+                    onToggleEphemeralArmed = viewModel::onSetEphemeralCheckArmed,
+                    onLargeStopAll = { viewModel.onStopClicked() },
+                    onNavigateBack = viewModel::onNavigateBackFromMicSetup,
+                    modifier = modifier
+                )
+            }
+
+            ActiveScreen.CONVERSATION_SHELL -> {
+                ConversationShellScreen(
+                    uiState = uiState,
+                    isSettingsOpen = isSettingsOpen,
+                    fontScaleOverride = fontScaleOverride,
+                    onStartClick = { viewModel.onStartClicked() },
+                    onPauseClick = { viewModel.onPauseClicked() },
+                    onStopClick = { viewModel.onStopClicked() },
+                    onResetIdleClick = { viewModel.onResetIdleClicked() },
+                    onVerifyPrecedenceClick = { viewModel.onVerifyStopPausePrecedenceClicked() },
+                    onOpenMicSetup = viewModel::onOpenMicSetup,
+                    onOpenSettings = viewModel::onOpenSettings,
+                    onDismissSettings = viewModel::onDismissSettings,
+                    onSelectFontScale = viewModel::onSetFontScaleOverride,
+                    modifier = modifier
+                )
+            }
+        }
     }
 }
 
@@ -121,6 +249,7 @@ fun ConversationShellScreen(
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
+    onOpenMicSetup: () -> Unit = {},
     onOpenSettings: () -> Unit,
     onDismissSettings: () -> Unit,
     onSelectFontScale: (Float?) -> Unit,
@@ -145,8 +274,6 @@ fun ConversationShellScreen(
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
-            // Landscape-first primary layout when width >= 600.dp or aspect ratio is landscape.
-            // Portrait fallback when compact/vertical.
             val isLandscapeLayout = maxWidth >= 600.dp || maxWidth > maxHeight
 
             Column(
@@ -156,6 +283,7 @@ fun ConversationShellScreen(
                 TopTelemetryHeader(
                     uiState = uiState,
                     isLandscapeLayout = isLandscapeLayout,
+                    onOpenMicSetup = onOpenMicSetup,
                     onOpenSettings = onOpenSettings
                 )
 
@@ -180,6 +308,7 @@ fun ConversationShellScreen(
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
+                            onOpenMicSetup = onOpenMicSetup,
                             modifier = Modifier
                                 .weight(0.40f)
                                 .fillMaxHeight()
@@ -206,6 +335,7 @@ fun ConversationShellScreen(
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
+                            onOpenMicSetup = onOpenMicSetup,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -218,6 +348,10 @@ fun ConversationShellScreen(
                 uiState = uiState,
                 fontScaleOverride = fontScaleOverride,
                 onSelectFontScale = onSelectFontScale,
+                onOpenMicSetup = {
+                    onDismissSettings()
+                    onOpenMicSetup()
+                },
                 onDismiss = onDismissSettings
             )
         }
@@ -229,6 +363,7 @@ fun ConversationShellScreen(
 private fun TopTelemetryHeader(
     uiState: ConversationUiState,
     isLandscapeLayout: Boolean,
+    onOpenMicSetup: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     Surface(
@@ -270,6 +405,19 @@ private fun TopTelemetryHeader(
                     RealStateBadge(state = uiState.state)
 
                     IconButton(
+                        onClick = onOpenMicSetup,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("top_mic_setup_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Mic,
+                            contentDescription = stringResource(R.string.cd_mic_setup_button),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    IconButton(
                         onClick = onOpenSettings,
                         modifier = Modifier
                             .minimumInteractiveComponentSize()
@@ -301,7 +449,10 @@ private fun TopTelemetryHeader(
                     label = "ACTION: ${uiState.lastActionId.value}",
                     tag = "action_id_label"
                 )
-                HonestMicrophoneBadge(label = uiState.microphoneStatusLabel)
+                HonestMicrophoneBadge(
+                    label = uiState.microphoneStatusLabel,
+                    isCapturing = uiState.isMicrophoneActive
+                )
             }
         }
     }
@@ -380,12 +531,22 @@ private fun TelemetryChip(label: String, tag: String) {
 }
 
 @Composable
-private fun HonestMicrophoneBadge(label: String) {
+private fun HonestMicrophoneBadge(
+    label: String,
+    isCapturing: Boolean
+) {
     Surface(
         modifier = Modifier.testTag("mic_honest_indicator"),
-        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f),
+        color = if (isCapturing) {
+            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)
+        } else {
+            MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
+        },
         shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f))
+        border = BorderStroke(
+            1.dp,
+            if (isCapturing) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f)
+        )
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -393,15 +554,19 @@ private fun HonestMicrophoneBadge(label: String) {
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Icon(
-                imageVector = Icons.Outlined.MicOff,
+                imageVector = if (isCapturing) Icons.Outlined.MicNone else Icons.Outlined.MicOff,
                 contentDescription = stringResource(R.string.mic_status_honest),
                 modifier = Modifier.size(14.dp),
-                tint = MaterialTheme.colorScheme.secondary
+                tint = if (isCapturing) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.secondary
             )
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer
+                color = if (isCapturing) {
+                    MaterialTheme.colorScheme.onTertiaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSecondaryContainer
+                }
             )
         }
     }
@@ -441,7 +606,6 @@ private fun TranscriptAndTelemetryPane(
                 )
             }
 
-            // State summary callout banner
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -547,6 +711,7 @@ private fun CommandDeckPane(
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
+    onOpenMicSetup: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -596,7 +761,7 @@ private fun CommandDeckPane(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Reports honest NOT_CONFIGURED in Phase 01",
+                        text = "Honest NOT_CONFIGURED (Gemini deferred)",
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
@@ -660,9 +825,35 @@ private fun CommandDeckPane(
                 }
             }
 
+            // Phase 02 Microphone Setup & Local Self-Test Entry Button
+            Button(
+                onClick = onOpenMicSetup,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("open_mic_setup_button"),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Mic,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(R.string.action_open_mic_setup),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
-            // Contract diagnostic controls: Reset to IDLE and Verify Stop/Pause Precedence
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -709,7 +900,6 @@ private fun CommandDeckPane(
                 }
             }
 
-            // Contract & Build Identifier Footer
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -743,6 +933,7 @@ private fun SettingsPlaceholderDialog(
     uiState: ConversationUiState,
     fontScaleOverride: Float?,
     onSelectFontScale: (Float?) -> Unit,
+    onOpenMicSetup: () -> Unit,
     onDismiss: () -> Unit
 ) {
     AlertDialog(
@@ -767,10 +958,27 @@ private fun SettingsPlaceholderDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
+                Button(
+                    onClick = onOpenMicSetup,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("settings_open_mic_setup_button"),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Mic,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(stringResource(R.string.action_open_mic_setup))
+                }
+
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
                 Text(
-                    text = "PHASE 01 ENVIRONMENT & CONTRACT TELEMETRY",
+                    text = "PHASE 02 ENVIRONMENT & CONTRACT TELEMETRY",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -780,6 +988,8 @@ private fun SettingsPlaceholderDialog(
                         "• Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
                         "• Source/Build ID: ${BuildConfig.SOURCE_BUILD_ID}\n" +
                         "• Model Config: ${BuildConfig.MODEL_CONFIG_STATUS}\n" +
+                        "• Audio Owner: ${uiState.audioCaptureState.owner.wireLabel} (Gen: ${uiState.audioCaptureState.activeGeneration?.wireId ?: "NONE"})\n" +
+                        "• Mic Permission: ${uiState.audioCaptureState.permissionState.wireLabel}\n" +
                         "• Runtime API Level: Android SDK ${Build.VERSION.SDK_INT} (minSdk 24, targetSdk 36)\n" +
                         "• Coordinator Actions Executed: ${uiState.executedActionCount}\n" +
                         "• Duplicate Actions Rejected: ${uiState.duplicateRejectedCount}",

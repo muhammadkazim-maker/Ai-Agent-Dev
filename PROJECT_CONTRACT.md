@@ -4,8 +4,8 @@
 - **Project Name**: `OmniVoice Rebuild`
 - **Application ID**: `com.kazim.omnivoice.rebuild` (coexists cleanly alongside any legacy OmniVoice installation)
 - **Namespace**: `com.example` (preserved for AI Studio Android template resource/build compatibility)
-- **Source / Build Identifier**: `ov-rebuild-p01-20261109` (`BuildConfig.SOURCE_BUILD_ID`)
-- **Current Phase**: `Phase 01 — Minimal Responsive Conversation Shell` (`0.1.0-phase01`, `versionCode = 1`)
+- **Source / Build Identifier**: `ov-rebuild-p02-20261110` (`BuildConfig.SOURCE_BUILD_ID`)
+- **Current Phase**: `Phase 02 — Microphone Setup & Local AudioCapture` (`0.2.0-phase02`, `versionCode = 2`)
 - **Toolchain**:
   - Android Gradle Plugin (AGP): `9.1.1`
   - Kotlin: `2.2.10` (Compose Compiler plugin integrated)
@@ -17,7 +17,7 @@
   - `minSdk`: `24` (Android 7.0)
   - `targetSdk`: `36`
   - `compileSdk`: `36` (minorApiLevel `1`)
-- **Model Configuration Status**: `NOT_CONFIGURED (Deferred to Phase 02+)` (`BuildConfig.MODEL_CONFIG_STATUS`)
+- **Model Configuration Status**: `NOT_CONFIGURED (Audio Self-Test Only; Gemini Deferred)` (`BuildConfig.MODEL_CONFIG_STATUS`)
 
 ---
 
@@ -28,25 +28,29 @@ All phases of **OmniVoice Rebuild** strictly adhere to the following non-negotia
 1. **Native Kotlin / Jetpack Compose Only**:
    - Built exclusively as a native Android application using Kotlin and Jetpack Compose. No web imitation wrappers or WebView shells.
 2. **Clean-Room Rebuild (No Old Repository Import)**:
-   - Zero previous engines, legacy repositories, or old repair prompts may be imported. Built from scratch in a clean package hierarchy (`com.example.contract`, `com.example.coordinator`, `com.example.ui.shell`, `com.example.ui.theme`).
-3. **Single Conversation Coordinator**:
-   - All conversation state transitions flow through a single authoritative `ConversationCoordinator`. No competing state machines or uncoordinated side-channel state mutations.
+   - Zero previous engines, legacy repositories, or old repair prompts may be imported. Built from scratch in a clean package hierarchy (`com.example.contract`, `com.example.coordinator`, `com.example.audio`, `com.example.ui.shell`, `com.example.ui.mic`, `com.example.ui.theme`).
+3. **Single Conversation Coordinator & Single Audio Owner**:
+   - All conversation state transitions flow through a single authoritative `ConversationCoordinator`, which owns the single `AudioCapture` component (`AudioOwner`: `NONE`, `SHELL_CONVERSATION`, `MIC_SELF_TEST`).
+   - Simultaneous `SpeechRecognizer` and `AudioRecord` loops are strictly prohibited.
+   - Every capture or playback run is bound to a monotonic `CaptureGenerationId`. Any callback from a stale generation is deterministically dropped.
 4. **Session / Turn / Action IDs**:
    - Every session, turn, and command execution carries strongly-typed `SessionId`, `TurnId`, and `ActionId` identifiers (`ov01-sess-*`, `ov01-turn-*`, `ov01-act-*`).
 5. **Typed Verified Outcomes**:
-   - Every command dispatched to `ConversationCoordinator` returns a sealed, auditable `VerifiedOutcome` (`StateTransitionVerified`, `HonestNotConfiguredOutcome`, `PreemptedByPrecedence`, `DuplicateActionRejected`).
+   - Every command dispatched to `ConversationCoordinator` returns a sealed, auditable `VerifiedOutcome` (`StateTransitionVerified`, `HonestNotConfiguredOutcome`, `PreemptedByPrecedence`, `DuplicateActionRejected`, `AudioSelfTestOutcome`).
 6. **Exactly-Once Effects**:
    - Action execution is idempotent by `ActionId`. Re-dispatching an already-processed `ActionId` is deterministically rejected (`DuplicateActionRejected`) with zero state mutation or duplicate side effects.
-7. **Strict Stop / Pause Precedence**:
-   - `STOP` (priority 100) holds highest precedence over `PAUSE` (priority 50) and `START` (priority 10).
-   - `PAUSE` holds precedence over `START`.
-   - Once `STOPPED`, `PAUSE` cannot override `STOPPED` unless explicitly reset or restarted.
-8. **Honest Hardware & Model States (No Fake Microphone)**:
-   - When audio capture or Gemini models are not configured (as in Phase 01), pressing `Start` transitions to an explicit, honest `NOT_CONFIGURED` state and keeps `isMicrophoneActive = false`. The UI never animates or simulates a fake working microphone.
+7. **Strict Stop / Pause Precedence & Prompt Hardware Release**:
+   - `STOP` (priority 100) holds highest precedence over `STOP_MIC_SELF_TEST` (90), `PAUSE` (50), `START_MIC_SELF_TEST` (20), and `START` (10).
+   - Large `STOP` immediately halts active `AudioRecord`/`AudioTrack` hardware and wipes any ephemeral self-test buffer.
+   - Navigating away from Microphone Setup or backgrounding the Activity immediately releases audio hardware and wipes ephemeral audio.
+8. **Honest Hardware & Model States**:
+   - Pressing `Start` in the Conversation Shell transitions to an explicit, honest `NOT_CONFIGURED` state because Gemini/assistant models remain deferred in Phase 02.
+   - Microphone Self-Test is a local hardware verification only and never masquerades as an assistant answer.
+   - Because a moving RMS meter alone is not proof of intelligible sound, Phase 02 includes a user-invoked ephemeral recording/playback check with retention OFF and immediate deletion after playback or Stop.
 9. **Explicit Permissions**:
-   - Runtime and manifest permissions are requested only in the phase where the corresponding hardware/OS capability is genuinely wired. Phase 01 requests zero unnecessary permissions.
+   - Phase 02 declares `android.permission.RECORD_AUDIO` in `AndroidManifest.xml`, explains why microphone access is needed prior to requesting, handles refusal vs. permanent denial, and re-checks permission automatically on `ON_RESUME` after returning from System App Settings.
 10. **Privacy & Secret Exclusion from Logs**:
-    - Private user transcripts, personal identifiers, API keys, and signing credentials are never written to logcat, diagnostic strings, or committed files. `.gitignore` excludes `.env`, `local.properties`, `*.jks`, `*.keystore`, `debug.keystore`, and build outputs.
+    - Private user transcripts, audio samples, personal identifiers, API keys, and signing credentials are never written to logcat, diagnostic strings, or committed files. `.gitignore` excludes `.env`, `local.properties`, `*.jks`, `*.keystore`, `debug.keystore`, and build outputs.
 11. **Non-Destructive Memory Migrations**:
     - When local or cloud persistence is introduced in later phases, schema migrations must be non-destructive and preserve existing user records.
 12. **Current Documented API / Model Configuration & Bounded Retries**:
@@ -62,26 +66,11 @@ All phases of **OmniVoice Rebuild** strictly adhere to the following non-negotia
 
 ## 3. Repository & ZIP-to-Local-Git Setup (`omnivoice-rebuild`)
 
-Because the cloud AI Studio container does not have direct outbound GitHub push credentials pre-attached in the agent shell, use either the **AI Studio "Push to GitHub" / "Export ZIP" menu** in the top-right UI or the following **ZIP-to-local-Git commands** to initialize the `omnivoice-rebuild` repository locally without claiming an automated remote sync occurred:
-
 ```bash
-# 1. Export the project ZIP from AI Studio and extract it locally:
-unzip omnivoice-rebuild-phase01.zip -d omnivoice-rebuild
+# Export the project ZIP from AI Studio and commit Phase 02 locally:
+unzip omnivoice-rebuild-phase02.zip -d omnivoice-rebuild
 cd omnivoice-rebuild
-
-# 2. Initialize a fresh Git repository on main:
-git init -b main
-
-# 3. Verify that credentials (.env, *.keystore, *.jks, local.properties) and /build are ignored:
-git status --ignored
-
-# 4. Stage and commit Phase 01:
 git add .
-git commit -m "Phase 01: OmniVoice Rebuild native Compose shell and ConversationCoordinator"
-
-# 5. Create and push to the new 'omnivoice-rebuild' repository (using GitHub CLI or remote URL):
-gh repo create omnivoice-rebuild --private --source=. --remote=origin --push
-# Or manually:
-# git remote add origin https://github.com/<your-username>/omnivoice-rebuild.git
-# git push -u origin main
+git commit -m "Phase 02: Microphone setup screen, single AudioCapture with generation IDs, 16kHz resampler, and zero-retention playback check"
+git push origin main
 ```

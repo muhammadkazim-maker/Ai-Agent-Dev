@@ -1,5 +1,7 @@
 package com.example.contract
 
+import com.example.audio.AudioAnomaly
+import com.example.audio.CaptureGenerationId
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -57,9 +59,9 @@ class ContractIdGenerator(
 }
 
 /**
- * Real, honest conversation states for Phase 01.
- * Start transitions to [NOT_CONFIGURED] because Gemini/audio/call engines are intentionally
- * omitted in Phase 01. Never simulates or animates a fake active microphone.
+ * Real, honest conversation states for Phase 01 & Phase 02.
+ * Start transitions to [NOT_CONFIGURED] because Gemini/assistant models are intentionally
+ * omitted in Phase 01–02. Local microphone self-test never masquerades as an assistant answer.
  */
 enum class ConversationState(
     val wireLabel: String,
@@ -69,39 +71,48 @@ enum class ConversationState(
     IDLE(
         wireLabel = "IDLE",
         badgeTitle = "IDLE",
-        summary = "Coordinator initialized. Awaiting operator command."
+        summary = "Coordinator initialized. Awaiting operator command or Microphone Self-Test."
     ),
     NOT_CONFIGURED(
         wireLabel = "NOT_CONFIGURED",
         badgeTitle = "NOT_CONFIGURED",
-        summary = "Honest Phase 01 state: Audio capture & Gemini model are not configured in Phase 01."
+        summary = "Honest state: Assistant/Gemini model is not configured in Phase 02. Use Microphone Setup & Self-Test for local 16kHz PCM hardware verification."
     ),
     PAUSED(
         wireLabel = "PAUSED",
         badgeTitle = "PAUSED",
-        summary = "Session paused by operator. Pause precedence active."
+        summary = "Session paused by operator. Active audio capture released; Pause precedence active."
     ),
     STOPPED(
         wireLabel = "STOPPED",
         badgeTitle = "STOPPED",
-        summary = "Session halted immediately. Stop holds highest precedence."
+        summary = "Session halted & audio hardware immediately released. Stop holds highest precedence."
     )
 }
 
 /**
- * Operator or system commands dispatched to the single ConversationCoordinator.
+ * Operator or system commands dispatched through the single [com.example.coordinator.ConversationCoordinator].
  */
 enum class CoordinatorCommand(val priority: Int) {
-    /** Highest precedence (priority 100): immediately halts any state or pending start/pause. */
+    /** Highest precedence (priority 100): immediately halts any state, releases hardware, and wipes ephemeral buffers. */
     STOP(priority = 100),
 
-    /** Second precedence (priority 50): preempts Start/active states unless Stopped. */
+    /** Stops an active local microphone self-test and releases hardware (priority 90). */
+    STOP_MIC_SELF_TEST(priority = 90),
+
+    /** Second precedence (priority 50): preempts Start/capture states unless Stopped, and releases active capture. */
     PAUSE(priority = 50),
 
-    /** Normal precedence (priority 10): requests session start (transitions to NOT_CONFIGURED in Phase 01). */
+    /** Starts a local 16kHz PCM microphone self-test under MIC_SELF_TEST owner (priority 20). */
+    START_MIC_SELF_TEST(priority = 20),
+
+    /** Plays and immediately deletes the ephemeral self-test recording (priority 15). */
+    PLAY_EPHEMERAL_CHECK(priority = 15),
+
+    /** Normal precedence (priority 10): requests conversation session start (transitions to NOT_CONFIGURED in Phase 01–02). */
     START(priority = 10),
 
-    /** Resets shell state back to IDLE with a fresh SessionId. */
+    /** Resets shell state back to IDLE with a fresh SessionId and releases any held audio hardware. */
     RESET_IDLE(priority = 5)
 }
 
@@ -159,6 +170,18 @@ sealed interface VerifiedOutcome {
     ) : VerifiedOutcome {
         override val code: String = "EXACTLY_ONCE_DUPLICATE_REJECTED"
     }
+
+    data class AudioSelfTestOutcome(
+        override val actionId: ActionId,
+        override val sessionId: SessionId,
+        override val turnId: TurnId,
+        override val resultingState: ConversationState,
+        val generationId: CaptureGenerationId?,
+        val anomaly: AudioAnomaly,
+        val isCapturing: Boolean,
+        override val code: String,
+        override val detail: String
+    ) : VerifiedOutcome
 }
 
 /**
