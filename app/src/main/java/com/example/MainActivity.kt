@@ -10,6 +10,10 @@ import androidx.lifecycle.ViewModelProvider
 import com.example.audio.AndroidAudioHardwareDriver
 import com.example.audio.AudioCapture
 import com.example.coordinator.ConversationCoordinator
+import com.example.live.AndroidLiveNetworkMonitor
+import com.example.live.FirebaseAiLiveTransportDriver
+import com.example.live.GeminiLiveConnectionAdapter
+import com.example.live.configureAppCheck
 import com.example.ui.shell.ConversationShellRoute
 import com.example.ui.shell.ConversationShellViewModel
 import com.example.ui.theme.OmniVoiceRebuildTheme
@@ -25,7 +29,15 @@ class MainActivity : ComponentActivity() {
                     driver = hardwareDriver,
                     ephemeralCacheDir = appContext.cacheDir
                 )
-                val coordinator = ConversationCoordinator(audioCapture = audioCapture)
+                val networkMonitor = AndroidLiveNetworkMonitor(appContext)
+                val liveAdapter = GeminiLiveConnectionAdapter(
+                    driver = FirebaseAiLiveTransportDriver(networkMonitor = networkMonitor),
+                    networkMonitor = networkMonitor
+                )
+                val coordinator = ConversationCoordinator(
+                    audioCapture = audioCapture,
+                    liveAdapter = liveAdapter
+                )
                 return ConversationShellViewModel(coordinator = coordinator) as T
             }
         }
@@ -33,6 +45,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
         setContent {
             OmniVoiceRebuildTheme {

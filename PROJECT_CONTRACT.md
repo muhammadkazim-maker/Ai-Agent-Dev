@@ -1,76 +1,54 @@
-# PROJECT_CONTRACT.md — OmniVoice Rebuild
+# OmniVoice Rebuild — Project Contract (`PROJECT_CONTRACT.md`)
 
-## 1. Project Identity & Build Metadata
-- **Project Name**: `OmniVoice Rebuild`
+## 1. Identity & Coexistence
+- **Application Name**: `OmniVoice Rebuild`
+- **Root Project Name**: `omnivoice-rebuild`
 - **Application ID**: `com.kazim.omnivoice.rebuild` (coexists cleanly alongside any legacy OmniVoice installation)
-- **Namespace**: `com.example` (preserved for AI Studio Android template resource/build compatibility)
-- **Source / Build Identifier**: `ov-rebuild-p02-20261110` (`BuildConfig.SOURCE_BUILD_ID`)
-- **Current Phase**: `Phase 02 — Microphone Setup & Local AudioCapture` (`0.2.0-phase02`, `versionCode = 2`)
-- **Toolchain**:
-  - Android Gradle Plugin (AGP): `9.1.1`
-  - Kotlin: `2.2.10` (Compose Compiler plugin integrated)
-  - Gradle Distribution: `9.3.1`
-  - Java Bytecode Target: `JavaVersion.VERSION_11`
-  - Jetpack Compose BOM: `2024.09.00`
-  - Testing: JUnit `4.13.2`, Robolectric `4.16.1`, Compose UI Test JUnit4
-- **SDK Levels**:
-  - `minSdk`: `24` (Android 7.0)
-  - `targetSdk`: `36`
-  - `compileSdk`: `36` (minorApiLevel `1`)
-- **Model Configuration Status**: `NOT_CONFIGURED (Audio Self-Test Only; Gemini Deferred)` (`BuildConfig.MODEL_CONFIG_STATUS`)
+- **Namespace**: `com.example` (preserved for Android R-class & package stability)
+- **Source / Build Identifier**: `ov-rebuild-p03-20261111` (`versionCode = 3`, `versionName = "0.3.0-phase03"`)
+- **Signing Identity**: Preserves `debugConfig` (`debug.keystore`) and `release` signing configurations in `app/build.gradle.kts` without modification.
 
----
-
-## 2. Shared Architecture & Engineering Contract
-
-All phases of **OmniVoice Rebuild** strictly adhere to the following non-negotiable invariants:
-
+## 2. Core Architectural & Safety Invariants
 1. **Native Kotlin / Jetpack Compose Only**:
-   - Built exclusively as a native Android application using Kotlin and Jetpack Compose. No web imitation wrappers or WebView shells.
-2. **Clean-Room Rebuild (No Old Repository Import)**:
-   - Zero previous engines, legacy repositories, or old repair prompts may be imported. Built from scratch in a clean package hierarchy (`com.example.contract`, `com.example.coordinator`, `com.example.audio`, `com.example.ui.shell`, `com.example.ui.mic`, `com.example.ui.theme`).
-3. **Single Conversation Coordinator & Single Audio Owner**:
-   - All conversation state transitions flow through a single authoritative `ConversationCoordinator`, which owns the single `AudioCapture` component (`AudioOwner`: `NONE`, `SHELL_CONVERSATION`, `MIC_SELF_TEST`).
-   - Simultaneous `SpeechRecognizer` and `AudioRecord` loops are strictly prohibited.
-   - Every capture or playback run is bound to a monotonic `CaptureGenerationId`. Any callback from a stale generation is deterministically dropped.
-4. **Session / Turn / Action IDs**:
-   - Every session, turn, and command execution carries strongly-typed `SessionId`, `TurnId`, and `ActionId` identifiers (`ov01-sess-*`, `ov01-turn-*`, `ov01-act-*`).
-5. **Typed Verified Outcomes**:
-   - Every command dispatched to `ConversationCoordinator` returns a sealed, auditable `VerifiedOutcome` (`StateTransitionVerified`, `HonestNotConfiguredOutcome`, `PreemptedByPrecedence`, `DuplicateActionRejected`, `AudioSelfTestOutcome`).
-6. **Exactly-Once Effects**:
-   - Action execution is idempotent by `ActionId`. Re-dispatching an already-processed `ActionId` is deterministically rejected (`DuplicateActionRejected`) with zero state mutation or duplicate side effects.
-7. **Strict Stop / Pause Precedence & Prompt Hardware Release**:
-   - `STOP` (priority 100) holds highest precedence over `STOP_MIC_SELF_TEST` (90), `PAUSE` (50), `START_MIC_SELF_TEST` (20), and `START` (10).
-   - Large `STOP` immediately halts active `AudioRecord`/`AudioTrack` hardware and wipes any ephemeral self-test buffer.
-   - Navigating away from Microphone Setup or backgrounding the Activity immediately releases audio hardware and wipes ephemeral audio.
-8. **Honest Hardware & Model States**:
-   - Pressing `Start` in the Conversation Shell transitions to an explicit, honest `NOT_CONFIGURED` state because Gemini/assistant models remain deferred in Phase 02.
-   - Microphone Self-Test is a local hardware verification only and never masquerades as an assistant answer.
-   - Because a moving RMS meter alone is not proof of intelligible sound, Phase 02 includes a user-invoked ephemeral recording/playback check with retention OFF and immediate deletion after playback or Stop.
-9. **Explicit Permissions**:
-   - Phase 02 declares `android.permission.RECORD_AUDIO` in `AndroidManifest.xml`, explains why microphone access is needed prior to requesting, handles refusal vs. permanent denial, and re-checks permission automatically on `ON_RESUME` after returning from System App Settings.
-10. **Privacy & Secret Exclusion from Logs**:
-    - Private user transcripts, audio samples, personal identifiers, API keys, and signing credentials are never written to logcat, diagnostic strings, or committed files. `.gitignore` excludes `.env`, `local.properties`, `*.jks`, `*.keystore`, `debug.keystore`, and build outputs.
-11. **Non-Destructive Memory Migrations**:
-    - When local or cloud persistence is introduced in later phases, schema migrations must be non-destructive and preserve existing user records.
-12. **Current Documented API / Model Configuration & Bounded Retries**:
-    - Future AI/network phases must use current documented SDK/model configurations with explicit bounded retry policies.
-13. **Real-Device Proof for Audio & Actions**:
-    - Audio capture, playback, and system actions require real-device verification checklists rather than assuming JVM/emulator parity.
-14. **No Unsupported OS-Control Claims**:
-    - The application never claims privileged or unsupported Android OS control capabilities.
-15. **No Unrequested Publish, Purchase, Repository Deletion, or Security Changes**:
-    - Signing configurations (`release` and `debugConfig`) in `app/build.gradle.kts` are preserved intact for future updates. No unrequested store publishing, billing, repo deletion, or security policy alterations are performed.
+   - Built 100% in Kotlin with Jetpack Compose Material 3 (`1.4.0`). No web imitation, no WebView shell, and zero imported legacy engines or repair prompts.
+2. **Single Conversation Coordinator (`com.example.coordinator.ConversationCoordinator`)**:
+   - All operator and system commands flow through a single coordinator authority.
+   - Every session, turn, action, audio capture loop, and live socket attempt is tagged with strongly-typed IDs: `SessionId`, `TurnId`, `ActionId`, `CaptureGenerationId`, and `LiveSessionGenerationId`.
+   - Every command returns a sealed, auditable `VerifiedOutcome` (`StateTransitionVerified`, `HonestNotConfiguredOutcome`, `PreemptedByPrecedence`, `DuplicateActionRejected`, `AudioSelfTestOutcome`, `LiveConnectionOutcome`).
+3. **Single Audio Owner (`com.example.audio.AudioCapture`)**:
+   - Exactly one `AudioCapture` component manages microphone hardware with explicit `AudioOwner` (`NONE`, `MIC_SELF_TEST`) and monotonically increasing `CaptureGenerationId` (`cap-gen-0001-...`).
+   - All hardware callbacks (`FrameCaptured`, `RecorderError`, `InterruptionDetected`, `EphemeralPlaybackCompleted`) must match the active `CaptureGenerationId`; stale callbacks from prior generations are deterministically dropped and counted.
+   - No simultaneous `SpeechRecognizer` and `AudioRecord` loops exist anywhere in the project.
+   - Uses 16,000 Hz, 16-bit mono PCM (`ENCODING_PCM_16BIT`, `CHANNEL_IN_MONO`) with deterministic linear-interpolation resampling (`PcmResampler`) when hardware reports 44.1 kHz or 48 kHz.
+   - Ephemeral self-test recording/playback check defaults to retention OFF and immediately overwrites/deletes the buffer (`0 bytes`) after playback or on Stop/lifecycle exit.
+4. **Single Gemini Live Connection Adapter (`com.example.live.GeminiLiveConnectionAdapter`) — Phase 03**:
+   - **Documented Runtime Model & API Version**: Uses `gemini-3.1-flash-live-preview` over `v1beta` (`BidiGenerateContent` WebSocket via official Android Firebase AI Logic `Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(...)`). Never infers runtime model IDs from AI Studio's coding-model picker and never switches silently to guessed models on failure.
+   - **Single Supported Managed Authentication Route**: Uses official Android **Firebase AI Logic** (`com.google.firebase:firebase-ai` in `firebase-bom:34.17.0`) with **Firebase App Check** (`DebugAppCheckProviderFactory` in debug builds, `RecaptchaAppCheckProviderFactory` in release builds), initialized synchronously via `.commit()` in `MainActivity.onCreate()` before any UI or Firebase calls.
+   - **Zero Embedded Secrets**: No long-lived `GEMINI_API_KEY` or bearer token is embedded in the APK, `.env`, repository, or logs.
+   - **Connection States & Failure Classification**: Exposes `DISCONNECTED`, `CONNECTING`, `SETUP_ACCEPTED`, `RETRY_BACKOFF_WAITING`, and `FAILED`, with classified failures (`BAD_CREDENTIALS_OR_APP_CHECK`, `UNSUPPORTED_MODEL_OR_ENDPOINT`, `QUOTA_EXHAUSTED`, `TRANSIENT_NETWORK_OR_SOCKET`, `CANCELLED_BY_STOP_OR_PAUSE`).
+   - **Socket/Session Generation Binding**: Every socket callback (`SetupAccepted`, `HandshakeFailed`, `SocketClosedRemotely`) is bound to `LiveSessionGenerationId` (`live-gen-0001-...`); stale callbacks from superseded or closed sockets are deterministically dropped and counted.
+   - **Bounded Backoff & Non-Retryable Halt**: Applies bounded exponential backoff (`maxAttempts = 3`, `500ms -> 1000ms`) strictly to `TRANSIENT_NETWORK_OR_SOCKET`. Immediately stops automatic retries on `BAD_CREDENTIALS_OR_APP_CHECK` (`401/403`), `UNSUPPORTED_MODEL_OR_ENDPOINT` (`400/404`), and `QUOTA_EXHAUSTED` (`429`).
+   - **Phase 03 Honesty Scope**: Verifies WebSocket handshake (`LiveGenerativeModel.connect()`) and displays redacted diagnostics (`modelId`, `endpointFamily`, `authRoute`, `sessionGenerationWireId`, `failureCode`). Does **NOT** claim audio playback (`audioPlaybackClaimed = false`, never calls `startAudioConversation()`) and registers **zero action tools** (`tools = emptyList()`).
+5. **Exactly-Once Effects**:
+   - The coordinator tracks executed `ActionId`s and deterministically rejects duplicate dispatches with `VerifiedOutcome.DuplicateActionRejected`.
+6. **Stop / Pause Precedence & Prompt Resource Release**:
+   - `STOP` (priority 100) holds highest precedence over `STOP_MIC_SELF_TEST` (90), `DISCONNECT_LIVE_SESSION` (80), `PAUSE` (50), `CONNECT_LIVE_SESSION` (25), `START_MIC_SELF_TEST` (20), `PLAY_EPHEMERAL_CHECK` (15), `START` (10), and `RESET_IDLE` (5).
+   - Large `STOP` immediately halts any active or connecting Gemini Live WebSocket session, releases `AudioRecord` / `AudioTrack` hardware, and wipes any ephemeral self-test buffer.
+7. **Privacy, Redaction & Non-Destructive Evolution**:
+   - Private user data, raw audio samples, API keys, and App Check tokens are excluded from logs and UI diagnostics via `DiagnosticRedactor`.
+   - Future memory/storage migrations must be non-destructive.
+   - No unsupported OS-control claims, and no unrequested publish, purchase, repository deletion, or security changes.
 
----
-
-## 3. Repository & ZIP-to-Local-Git Setup (`omnivoice-rebuild`)
-
-```bash
-# Export the project ZIP from AI Studio and commit Phase 02 locally:
-unzip omnivoice-rebuild-phase02.zip -d omnivoice-rebuild
-cd omnivoice-rebuild
-git add .
-git commit -m "Phase 02: Microphone setup screen, single AudioCapture with generation IDs, 16kHz resampler, and zero-retention playback check"
-git push origin main
-```
+## 3. Toolchain & SDK Matrix
+| Parameter | Value |
+| :--- | :--- |
+| **Android Gradle Plugin (AGP)** | `9.1.0` |
+| **Kotlin Version** | `2.3.20` |
+| **KSP Version** | `2.3.6` |
+| **Compile SDK** | `36` (`minorApiLevel = 1`) |
+| **Target SDK** | `36` |
+| **Minimum SDK** | `24` |
+| **Compose BOM** | `2026.03.01` (`material3 = 1.4.0`) |
+| **Firebase BOM** | `34.17.0` (`firebase-ai`, `firebase-appcheck-recaptcha`, `firebase-appcheck-debug`) |
+| **Model Configuration Status** | `PHASE_03_LIVE_HANDSHAKE_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta; AUDIO_PLAYBACK_NOT_CLAIMED; TOOLS=0)` |
+| **Source / Build ID** | `ov-rebuild-p03-20261111` |

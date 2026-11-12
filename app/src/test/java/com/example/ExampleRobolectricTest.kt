@@ -11,6 +11,8 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.CaptureCallbackEvent
 import com.example.audio.MicPermissionState
+import com.example.live.LiveConfigConstants
+import com.example.live.LiveConnectionPhase
 import com.example.ui.shell.ActiveScreen
 import com.example.ui.shell.ConversationShellRoute
 import com.example.ui.shell.ConversationShellViewModel
@@ -36,7 +38,8 @@ class ExampleRobolectricTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         assertEquals("OmniVoice Rebuild", context.getString(R.string.app_name))
         assertEquals("com.kazim.omnivoice.rebuild", BuildConfig.APPLICATION_ID)
-        assertEquals("ov-rebuild-p02-20261110", BuildConfig.SOURCE_BUILD_ID)
+        assertEquals("ov-rebuild-p03-20261111", BuildConfig.SOURCE_BUILD_ID)
+        assertEquals(LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID, BuildConfig.LIVE_MODEL_ID)
     }
 
     @Test
@@ -188,5 +191,213 @@ class ExampleRobolectricTest {
         composeTestRule.waitForIdle()
         assertEquals(ActiveScreen.CONVERSATION_SHELL, viewModel.activeScreen.value)
         assertFalse("Navigating away must release AudioCapture hardware", viewModel.audioState.value.isCapturing)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w840dp-h480dp-land")
+    fun `live diagnostics screen verifies handshake transition to SETUP_ACCEPTED, redacted telemetry, and Large Stop socket release`() {
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = com.example.live.DeterministicTestLiveTransportDriver()
+            )
+        )
+        val viewModel = ConversationShellViewModel(coordinator = coordinator)
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Navigate to Live Diagnostics screen from top bar
+        composeTestRule.onNodeWithTag("top_live_diagnostics_button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(ActiveScreen.LIVE_DIAGNOSTICS, viewModel.activeScreen.value)
+        composeTestRule.onNodeWithTag("live_diagnostics_screen_root").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("live_diag_honest_boundary_banner").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("DISCONNECTED")
+
+        // Verify redacted diagnostic chips for model, endpoint family, and auth route
+        composeTestRule.onNodeWithTag("live_diag_model_label", useUnmergedTree = true)
+            .assertTextContains("gemini-3.1-flash-live-preview", substring = true)
+        composeTestRule.onNodeWithTag("live_diag_endpoint_family_label", useUnmergedTree = true)
+            .assertTextContains("FIREBASE_AI_LOGIC_GOOGLE_AI_V1BETA_BIDI", substring = true)
+        composeTestRule.onNodeWithTag("live_diag_auth_route_label", useUnmergedTree = true)
+            .assertTextContains("FIREBASE_AI_LOGIC_MANAGED_APP_CHECK", substring = true)
+
+        // Click Verify Live Handshake (Connect) -> transitions to SETUP_ACCEPTED
+        composeTestRule.onNodeWithTag("connect_live_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, viewModel.liveState.value.phase)
+        assertTrue(viewModel.liveState.value.handshakeVerified)
+        assertFalse(viewModel.liveState.value.audioPlaybackClaimed)
+        assertEquals(0, viewModel.liveState.value.registeredActionToolsCount)
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("SETUP_ACCEPTED")
+
+        // Click Large Stop -> immediately disconnects Live socket and transitions shell to STOPPED
+        composeTestRule.onNodeWithTag("live_diag_large_stop_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(LiveConnectionPhase.DISCONNECTED, viewModel.liveState.value.phase)
+        assertFalse(viewModel.liveState.value.handshakeVerified)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w840dp-h480dp-land")
+    fun `production default live diagnostics screen honestly reports FAILED and BLOCKED when runtime credentials are unconfigured`() {
+        com.google.firebase.FirebaseApp.clearInstancesForTest()
+        val viewModel = ConversationShellViewModel()
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("top_live_diagnostics_button").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("connect_live_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(LiveConnectionPhase.FAILED, viewModel.liveState.value.phase)
+        assertFalse(viewModel.liveState.value.handshakeVerified)
+        assertEquals(1, viewModel.liveState.value.attemptCount)
+        assertEquals(0, viewModel.liveState.value.retryCount)
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("FAILED")
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w411dp-h891dp-port")
+    fun `portrait mode initializes DebugAppCheckProviderFactory in debug build and opens and closes Gemini Live Handshake and Diagnostics 5 times without crashing`() {
+        androidx.test.core.app.ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                assertTrue(activity != null)
+                assertTrue("Debug build flag must be true in debug test", BuildConfig.DEBUG)
+            }
+        }
+
+        // Simulate unconfigured state to deterministically verify NEEDS_SETUP / CONFIG_ERROR UI in unit test
+        com.google.firebase.FirebaseApp.clearInstancesForTest()
+        val viewModel = ConversationShellViewModel()
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Open and close "Gemini Live Handshake & Diagnostics" 5 times in portrait mode
+        repeat(5) { iteration ->
+            if (iteration % 2 == 0) {
+                composeTestRule.onNodeWithTag("open_live_diagnostics_button")
+                    .performScrollTo()
+                    .performClick()
+            } else {
+                composeTestRule.onNodeWithTag("top_live_diagnostics_button")
+                    .performClick()
+            }
+            composeTestRule.waitForIdle()
+            composeTestRule.onNodeWithTag("live_diagnostics_screen_root").assertIsDisplayed()
+            composeTestRule.onNodeWithTag("live_diag_portrait_column").assertIsDisplayed()
+
+            // On the 5th open, also trigger Connect in portrait mode and verify readable NEEDS_SETUP / CONFIG_ERROR state
+            if (iteration == 4) {
+                composeTestRule.onNodeWithTag("connect_live_button")
+                    .performScrollTo()
+                    .performClick()
+                composeTestRule.waitForIdle()
+                composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+                    .assertTextEquals("FAILED")
+                composeTestRule.onNodeWithTag("live_diag_config_status_label", useUnmergedTree = true)
+                    .assertTextContains("NEEDS_SETUP / CONFIG_ERROR", substring = true)
+            }
+
+            composeTestRule.onNodeWithTag("live_diag_back_button").performClick()
+            composeTestRule.waitForIdle()
+            composeTestRule.onNodeWithTag("conversation_shell_root").assertIsDisplayed()
+        }
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w411dp-h891dp-port")
+    fun `live diagnostics UI invalidates SETUP_ACCEPTED to NETWORK_UNAVAILABLE on internet loss, blocks offline Verify, and recovers with one reconnect`() {
+        val networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true)
+        val driver = com.example.live.DeterministicTestLiveTransportDriver()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = driver,
+                networkMonitor = networkMonitor,
+                autoReconnectOnNetworkRestore = true,
+                delayRunner = {}
+            )
+        )
+        val viewModel = ConversationShellViewModel(coordinator = coordinator)
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Open Live Diagnostics screen -> registers network monitor
+        composeTestRule.onNodeWithTag("top_live_diagnostics_button").performClick()
+        composeTestRule.waitForIdle()
+        assertTrue("Network monitor must be active while diagnostics screen is open", networkMonitor.isMonitoringActive)
+
+        // 1. Connect while online -> SETUP_ACCEPTED
+        composeTestRule.onNodeWithTag("connect_live_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("SETUP_ACCEPTED")
+        assertEquals(1, driver.invocationCount)
+
+        // 2. Disable Wi-Fi and mobile data -> UI immediately shows NETWORK_UNAVAILABLE
+        networkMonitor.setInternetValidated(false)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("NETWORK_UNAVAILABLE")
+        composeTestRule.onNodeWithTag("live_diag_network_status_label", useUnmergedTree = true)
+            .assertTextContains("NETWORK_UNAVAILABLE", substring = true)
+
+        // 3. Press Verify while offline -> makes zero Firebase/Gemini requests and stays NETWORK_UNAVAILABLE
+        composeTestRule.onNodeWithTag("connect_live_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("Offline Verify must not invoke transport driver", 1, driver.invocationCount)
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("NETWORK_UNAVAILABLE")
+
+        // 4. Restore validated internet -> performs at most 1 controlled reconnect
+        networkMonitor.setInternetValidated(true)
+        composeTestRule.waitForIdle()
+        assertEquals(2, driver.invocationCount)
+        composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
+            .assertTextEquals("SETUP_ACCEPTED")
+
+        // 5. Disconnect and navigate back -> unregisters network monitor safely
+        composeTestRule.onNodeWithTag("disconnect_live_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("live_diag_back_button").performClick()
+        composeTestRule.waitForIdle()
+        assertFalse("Network monitor must unregister when diagnostics screen is disposed and session is disconnected", networkMonitor.isMonitoringActive)
     }
 }

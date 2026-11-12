@@ -8,6 +8,8 @@ import com.example.contract.CoordinatorCommand
 import com.example.contract.VerifiedOutcome
 import com.example.coordinator.ConversationCoordinator
 import com.example.coordinator.ConversationUiState
+import com.example.live.LiveConnectionState
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,12 +19,14 @@ import kotlinx.coroutines.launch
 
 enum class ActiveScreen {
     CONVERSATION_SHELL,
-    MICROPHONE_SETUP
+    MICROPHONE_SETUP,
+    LIVE_DIAGNOSTICS
 }
 
 /**
- * ViewModel wrapping the single [ConversationCoordinator] and single [com.example.audio.AudioCapture]
- * owner, managing screen navigation, permission state transitions, and lifecycle hardware release.
+ * ViewModel wrapping the single [ConversationCoordinator], single [com.example.audio.AudioCapture]
+ * owner, and single [com.example.live.GeminiLiveConnectionAdapter], managing screen navigation,
+ * permission state transitions, live handshake verification, and lifecycle resource release.
  */
 class ConversationShellViewModel(
     val coordinator: ConversationCoordinator = ConversationCoordinator()
@@ -30,6 +34,7 @@ class ConversationShellViewModel(
 
     val uiState: StateFlow<ConversationUiState> = coordinator.uiState
     val audioState: StateFlow<AudioCaptureState> = coordinator.audioCapture.state
+    val liveState: StateFlow<LiveConnectionState> = coordinator.liveAdapter.state
 
     private val _activeScreen = MutableStateFlow(ActiveScreen.CONVERSATION_SHELL)
     val activeScreen: StateFlow<ActiveScreen> = _activeScreen.asStateFlow()
@@ -43,10 +48,17 @@ class ConversationShellViewModel(
     private val _hasRequestedPermissionOnce = MutableStateFlow(false)
     val hasRequestedPermissionOnce: StateFlow<Boolean> = _hasRequestedPermissionOnce.asStateFlow()
 
+    private var activeLiveConnectJob: Job? = null
+
     init {
         viewModelScope.launch {
             coordinator.audioCapture.state.collectLatest {
                 coordinator.syncAudioState()
+            }
+        }
+        viewModelScope.launch {
+            coordinator.liveAdapter.state.collectLatest {
+                coordinator.syncLiveState()
             }
         }
     }
@@ -54,19 +66,31 @@ class ConversationShellViewModel(
     fun onStartClicked(): VerifiedOutcome =
         coordinator.dispatch(CoordinatorCommand.START)
 
-    fun onPauseClicked(): VerifiedOutcome =
-        coordinator.dispatch(CoordinatorCommand.PAUSE)
+    fun onPauseClicked(): VerifiedOutcome {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        return coordinator.dispatch(CoordinatorCommand.PAUSE)
+    }
 
-    fun onStopClicked(): VerifiedOutcome =
-        coordinator.dispatch(CoordinatorCommand.STOP)
+    fun onStopClicked(): VerifiedOutcome {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        return coordinator.dispatch(CoordinatorCommand.STOP)
+    }
 
-    fun onResetIdleClicked(): VerifiedOutcome =
-        coordinator.dispatch(CoordinatorCommand.RESET_IDLE)
+    fun onResetIdleClicked(): VerifiedOutcome {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        return coordinator.dispatch(CoordinatorCommand.RESET_IDLE)
+    }
 
-    fun onVerifyStopPausePrecedenceClicked(): VerifiedOutcome =
-        coordinator.dispatchWithPrecedence(
+    fun onVerifyStopPausePrecedenceClicked(): VerifiedOutcome {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        return coordinator.dispatchWithPrecedence(
             listOf(CoordinatorCommand.START, CoordinatorCommand.PAUSE, CoordinatorCommand.STOP)
         )
+    }
 
     fun onStartMicSelfTestClicked(): VerifiedOutcome =
         coordinator.dispatch(CoordinatorCommand.START_MIC_SELF_TEST)
@@ -89,8 +113,36 @@ class ConversationShellViewModel(
         coordinator.syncAudioState()
     }
 
+    fun onConnectLiveHandshakeClicked() {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = viewModelScope.launch {
+            coordinator.connectLiveSessionWithHandshake()
+        }
+    }
+
+    fun onDisconnectLiveSessionClicked(): VerifiedOutcome {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        return coordinator.dispatch(CoordinatorCommand.DISCONNECT_LIVE_SESSION)
+    }
+
     fun onOpenMicSetup() {
         _activeScreen.update { ActiveScreen.MICROPHONE_SETUP }
+    }
+
+    fun onOpenLiveDiagnostics() {
+        coordinator.startLiveNetworkMonitoring()
+        _activeScreen.update { ActiveScreen.LIVE_DIAGNOSTICS }
+    }
+
+    fun onLiveDiagnosticsScreenActive() {
+        coordinator.startLiveNetworkMonitoring()
+    }
+
+    fun onLiveDiagnosticsScreenDisposed() {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        coordinator.onLiveDiagnosticsDisposed("Live Diagnostics screen disposed")
     }
 
     /**
@@ -99,18 +151,37 @@ class ConversationShellViewModel(
      * and any temporary recording is wiped.
      */
     fun onNavigateBackFromMicSetup() {
-        coordinator.onLifecycleReleaseHardware("Navigated away from Microphone Setup screen")
+        coordinator.onLifecycleReleaseHardware(
+            reason = "Navigated away from Microphone Setup screen",
+            disconnectLive = false
+        )
+        _activeScreen.update { ActiveScreen.CONVERSATION_SHELL }
+    }
+
+    /**
+     * Navigating away from the Live Diagnostics screen cancels any scheduled retries,
+     * unregisters network monitoring if no session is active, and returns to the Conversation Shell.
+     */
+    fun onNavigateBackFromLiveDiagnostics() {
+        activeLiveConnectJob?.cancel()
+        activeLiveConnectJob = null
+        coordinator.onLiveDiagnosticsDisposed("Navigated back from Live Diagnostics screen")
         _activeScreen.update { ActiveScreen.CONVERSATION_SHELL }
     }
 
     /**
      * Called from Activity/Composable lifecycle when Activity stops.
      * If [isChangingConfigurations] is false (user backgrounded app or navigated away),
-     * promptly releases hardware and wipes ephemeral self-test data.
+     * promptly releases hardware, wipes ephemeral self-test data, and disconnects live sockets.
      */
     fun onActivityStopped(isChangingConfigurations: Boolean) {
         if (!isChangingConfigurations) {
-            coordinator.onLifecycleReleaseHardware("Activity stopped (backgrounded / navigated away)")
+            activeLiveConnectJob?.cancel()
+            activeLiveConnectJob = null
+            coordinator.onLifecycleReleaseHardware(
+                reason = "Activity stopped (backgrounded / navigated away)",
+                disconnectLive = true
+            )
         }
     }
 
@@ -157,7 +228,11 @@ class ConversationShellViewModel(
     }
 
     override fun onCleared() {
-        coordinator.onLifecycleReleaseHardware("ViewModel cleared")
+        activeLiveConnectJob?.cancel()
+        coordinator.onLifecycleReleaseHardware(
+            reason = "ViewModel cleared",
+            disconnectLive = true
+        )
         super.onCleared()
     }
 }

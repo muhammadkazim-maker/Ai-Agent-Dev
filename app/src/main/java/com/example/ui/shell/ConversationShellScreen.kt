@@ -40,6 +40,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -93,6 +94,7 @@ import com.example.R
 import com.example.contract.ConversationState
 import com.example.contract.TranscriptEntry
 import com.example.coordinator.ConversationUiState
+import com.example.ui.live.LiveDiagnosticsScreen
 import com.example.ui.mic.MicrophoneSetupScreen
 
 private fun Context.findActivity(): Activity? {
@@ -111,6 +113,7 @@ fun ConversationShellRoute(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val audioState by viewModel.audioState.collectAsStateWithLifecycle()
+    val liveState by viewModel.liveState.collectAsStateWithLifecycle()
     val activeScreen by viewModel.activeScreen.collectAsStateWithLifecycle()
     val isSettingsOpen by viewModel.isSettingsOpen.collectAsStateWithLifecycle()
     val fontScaleOverride by viewModel.fontScaleOverride.collectAsStateWithLifecycle()
@@ -202,7 +205,6 @@ fun ConversationShellRoute(
                         try {
                             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         } catch (_: Throwable) {
-                            // In synthetic test environments without an ActivityResultRegistry launcher
                             viewModel.onPermissionRequestResult(granted = false, shouldShowRationale = true)
                         }
                     },
@@ -218,6 +220,20 @@ fun ConversationShellRoute(
                 )
             }
 
+            ActiveScreen.LIVE_DIAGNOSTICS -> {
+                LiveDiagnosticsScreen(
+                    uiState = uiState,
+                    liveState = liveState,
+                    onConnectLiveHandshake = viewModel::onConnectLiveHandshakeClicked,
+                    onDisconnectLiveSession = { viewModel.onDisconnectLiveSessionClicked() },
+                    onLargeStopAll = { viewModel.onStopClicked() },
+                    onNavigateBack = viewModel::onNavigateBackFromLiveDiagnostics,
+                    onScreenActive = viewModel::onLiveDiagnosticsScreenActive,
+                    onScreenDisposed = viewModel::onLiveDiagnosticsScreenDisposed,
+                    modifier = modifier
+                )
+            }
+
             ActiveScreen.CONVERSATION_SHELL -> {
                 ConversationShellScreen(
                     uiState = uiState,
@@ -229,6 +245,7 @@ fun ConversationShellRoute(
                     onResetIdleClick = { viewModel.onResetIdleClicked() },
                     onVerifyPrecedenceClick = { viewModel.onVerifyStopPausePrecedenceClicked() },
                     onOpenMicSetup = viewModel::onOpenMicSetup,
+                    onOpenLiveDiagnostics = viewModel::onOpenLiveDiagnostics,
                     onOpenSettings = viewModel::onOpenSettings,
                     onDismissSettings = viewModel::onDismissSettings,
                     onSelectFontScale = viewModel::onSetFontScaleOverride,
@@ -250,6 +267,7 @@ fun ConversationShellScreen(
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
     onOpenMicSetup: () -> Unit = {},
+    onOpenLiveDiagnostics: () -> Unit = {},
     onOpenSettings: () -> Unit,
     onDismissSettings: () -> Unit,
     onSelectFontScale: (Float?) -> Unit,
@@ -284,6 +302,7 @@ fun ConversationShellScreen(
                     uiState = uiState,
                     isLandscapeLayout = isLandscapeLayout,
                     onOpenMicSetup = onOpenMicSetup,
+                    onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                     onOpenSettings = onOpenSettings
                 )
 
@@ -309,6 +328,7 @@ fun ConversationShellScreen(
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
                             onOpenMicSetup = onOpenMicSetup,
+                            onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                             modifier = Modifier
                                 .weight(0.40f)
                                 .fillMaxHeight()
@@ -336,6 +356,7 @@ fun ConversationShellScreen(
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
                             onOpenMicSetup = onOpenMicSetup,
+                            onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -352,6 +373,10 @@ fun ConversationShellScreen(
                     onDismissSettings()
                     onOpenMicSetup()
                 },
+                onOpenLiveDiagnostics = {
+                    onDismissSettings()
+                    onOpenLiveDiagnostics()
+                },
                 onDismiss = onDismissSettings
             )
         }
@@ -364,6 +389,7 @@ private fun TopTelemetryHeader(
     uiState: ConversationUiState,
     isLandscapeLayout: Boolean,
     onOpenMicSetup: () -> Unit,
+    onOpenLiveDiagnostics: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     Surface(
@@ -400,9 +426,22 @@ private fun TopTelemetryHeader(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     RealStateBadge(state = uiState.state)
+
+                    IconButton(
+                        onClick = onOpenLiveDiagnostics,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("top_live_diagnostics_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.CloudSync,
+                            contentDescription = stringResource(R.string.cd_live_diag_button),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
 
                     IconButton(
                         onClick = onOpenMicSetup,
@@ -448,6 +487,10 @@ private fun TopTelemetryHeader(
                 TelemetryChip(
                     label = "ACTION: ${uiState.lastActionId.value}",
                     tag = "action_id_label"
+                )
+                TelemetryChip(
+                    label = "LIVE: ${uiState.liveConnectionState.phase.wireCode} (${uiState.liveConnectionState.configuredModelId})",
+                    tag = "live_status_indicator"
                 )
                 HonestMicrophoneBadge(
                     label = uiState.microphoneStatusLabel,
@@ -712,6 +755,7 @@ private fun CommandDeckPane(
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
     onOpenMicSetup: () -> Unit,
+    onOpenLiveDiagnostics: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -761,7 +805,7 @@ private fun CommandDeckPane(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Honest NOT_CONFIGURED (Gemini deferred)",
+                        text = "Honest NOT_CONFIGURED (Audio Playback Deferred)",
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
@@ -823,6 +867,33 @@ private fun CommandDeckPane(
                         style = MaterialTheme.typography.labelLarge
                     )
                 }
+            }
+
+            // Phase 03 Gemini Live Connection & Diagnostics Screen Entry Button
+            Button(
+                onClick = onOpenLiveDiagnostics,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("open_live_diagnostics_button"),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.CloudSync,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(R.string.action_open_live_diagnostics),
+                    style = MaterialTheme.typography.labelLarge
+                )
             }
 
             // Phase 02 Microphone Setup & Local Self-Test Entry Button
@@ -934,6 +1005,7 @@ private fun SettingsPlaceholderDialog(
     fontScaleOverride: Float?,
     onSelectFontScale: (Float?) -> Unit,
     onOpenMicSetup: () -> Unit,
+    onOpenLiveDiagnostics: () -> Unit,
     onDismiss: () -> Unit
 ) {
     AlertDialog(
@@ -959,6 +1031,23 @@ private fun SettingsPlaceholderDialog(
                 )
 
                 Button(
+                    onClick = onOpenLiveDiagnostics,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("settings_open_live_diag_button"),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.CloudSync,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(stringResource(R.string.action_open_live_diagnostics))
+                }
+
+                Button(
                     onClick = onOpenMicSetup,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -978,7 +1067,7 @@ private fun SettingsPlaceholderDialog(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
                 Text(
-                    text = "PHASE 02 ENVIRONMENT & CONTRACT TELEMETRY",
+                    text = "PHASE 03 ENVIRONMENT & CONTRACT TELEMETRY",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -988,6 +1077,8 @@ private fun SettingsPlaceholderDialog(
                         "• Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
                         "• Source/Build ID: ${BuildConfig.SOURCE_BUILD_ID}\n" +
                         "• Model Config: ${BuildConfig.MODEL_CONFIG_STATUS}\n" +
+                        "• Live Model ID: ${uiState.liveConnectionState.configuredModelId} (${uiState.liveConnectionState.phase.wireCode})\n" +
+                        "• Live Session Gen: ${uiState.liveConnectionState.diagnostics.sessionGenerationWireId}\n" +
                         "• Audio Owner: ${uiState.audioCaptureState.owner.wireLabel} (Gen: ${uiState.audioCaptureState.activeGeneration?.wireId ?: "NONE"})\n" +
                         "• Mic Permission: ${uiState.audioCaptureState.permissionState.wireLabel}\n" +
                         "• Runtime API Level: Android SDK ${Build.VERSION.SDK_INT} (minSdk 24, targetSdk 36)\n" +

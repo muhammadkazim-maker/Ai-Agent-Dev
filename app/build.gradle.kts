@@ -16,14 +16,16 @@ android {
     applicationId = "com.kazim.omnivoice.rebuild"
     minSdk = 24
     targetSdk = 36
-    versionCode = 2
-    versionName = "0.2.0-phase02"
+    versionCode = 3
+    versionName = "0.3.0-phase03"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-    buildConfigField("String", "SOURCE_BUILD_ID", "\"ov-rebuild-p02-20261110\"")
-    buildConfigField("String", "PHASE_NAME", "\"Phase 02 - Microphone Setup & Local AudioCapture\"")
-    buildConfigField("String", "MODEL_CONFIG_STATUS", "\"NOT_CONFIGURED (Audio Self-Test Only; Gemini Deferred)\"")
+    buildConfigField("String", "SOURCE_BUILD_ID", "\"ov-rebuild-p03-20261111\"")
+    buildConfigField("String", "PHASE_NAME", "\"Phase 03 - Gemini Live Connection Adapter & Diagnostics\"")
+    buildConfigField("String", "MODEL_CONFIG_STATUS", "\"LIVE_ADAPTER_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta)\"")
+    buildConfigField("String", "LIVE_MODEL_ID", "\"gemini-3.1-flash-live-preview\"")
+    buildConfigField("String", "LIVE_API_VERSION", "\"v1beta (Firebase AI Logic Managed WebSocket)\"")
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -105,7 +107,7 @@ googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.W
 // This makes it easy to add them back in the future if needed.
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
-  // implementation(platform(libs.firebase.bom))
+  implementation(platform(libs.firebase.bom))
   // implementation(libs.accompanist.permissions)
   implementation(libs.androidx.activity.compose)
   // implementation(libs.androidx.camera.camera2)
@@ -128,7 +130,7 @@ dependencies {
   // implementation(libs.androidx.room.runtime)
   // implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
-  // implementation(libs.firebase.ai)
+  implementation(libs.firebase.ai)
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 
@@ -138,8 +140,9 @@ dependencies {
   // implementation(libs.androidx.credentials)
   // implementation(libs.androidx.credentials.play.services)
   // implementation(libs.googleid)
-  // implementation(libs.firebase.appcheck.recaptcha)
-  // implementation(libs.firebase.appcheck.debug)
+  implementation(libs.firebase.appcheck.playintegrity)
+  implementation(libs.firebase.appcheck.recaptcha)
+  implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   // implementation(libs.logging.interceptor)

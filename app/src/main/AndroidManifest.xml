@@ -4,6 +4,9 @@
 
     <!-- Phase 02: Explicit microphone permission for local 16kHz PCM capture & self-test only -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Phase 03: Network permissions for authenticated Gemini Live WebSocket handshake -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="true"

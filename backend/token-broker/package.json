@@ -1,0 +1,14 @@
+{
+  "name": "omnivoice-rebuild-live-token-broker",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Minimal authenticated external short-lived Gemini Live ephemeral token broker for OmniVoice Rebuild Phase 03",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

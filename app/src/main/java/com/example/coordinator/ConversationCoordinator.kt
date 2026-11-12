@@ -1,7 +1,6 @@
 package com.example.coordinator
 
 import com.example.BuildConfig
-import com.example.audio.AudioAnomaly
 import com.example.audio.AudioCapture
 import com.example.audio.AudioCaptureState
 import com.example.audio.AudioHardwareDriver
@@ -19,6 +18,11 @@ import com.example.contract.SessionId
 import com.example.contract.TranscriptEntry
 import com.example.contract.TurnId
 import com.example.contract.VerifiedOutcome
+import com.example.live.GeminiLiveConnectionAdapter
+import com.example.live.LiveConnectionPhase
+import com.example.live.LiveConnectionState
+import com.example.live.LiveFailureClassification
+import com.example.live.LiveSocketCallbackEvent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,33 +69,35 @@ data class ConversationUiState(
     val lastActionId: ActionId,
     val state: ConversationState,
     val isMicrophoneActive: Boolean = false,
-    val microphoneStatusLabel: String = "MIC: INACTIVE (LOCAL SELF-TEST READY; GEMINI NOT_CONFIGURED)",
+    val microphoneStatusLabel: String = "MIC: INACTIVE (LOCAL SELF-TEST READY; GEMINI PLAYBACK NOT_CLAIMED)",
     val modelConfigStatus: String = BuildConfig.MODEL_CONFIG_STATUS,
     val sourceBuildId: String = BuildConfig.SOURCE_BUILD_ID,
     val lastOutcome: VerifiedOutcome? = null,
     val transcript: List<TranscriptEntry> = emptyList(),
     val executedActionCount: Int = 0,
     val duplicateRejectedCount: Int = 0,
-    val audioCaptureState: AudioCaptureState = AudioCaptureState()
+    val audioCaptureState: AudioCaptureState = AudioCaptureState(),
+    val liveConnectionState: LiveConnectionState = LiveConnectionState()
 )
 
 /**
- * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 & Phase 02).
+ * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01, Phase 02 & Phase 03).
  *
  * Enforces PROJECT_CONTRACT.md invariants:
- * 1. Single coordinator authority for session, turn, action, and audio owner transitions.
- * 2. Strongly-typed SessionId, TurnId, ActionId, and CaptureGenerationId.
+ * 1. Single coordinator authority for session, turn, action, audio owner, and Gemini Live adapter transitions.
+ * 2. Strongly-typed SessionId, TurnId, ActionId, CaptureGenerationId, and LiveSessionGenerationId.
  * 3. Exactly-once effects: duplicate ActionIds are rejected deterministically without mutating state.
- * 4. Stop/Pause precedence: STOP > STOP_MIC_SELF_TEST > PAUSE > START_MIC_SELF_TEST > START.
- *    Large STOP immediately releases audio capture/playback hardware and wipes ephemeral buffers.
- * 5. Honest NOT_CONFIGURED state on Start: microphone self-test is strictly local hardware
- *    verification and never pretends to be an assistant answer.
- * 6. Excludes private data and secrets from logs and state payloads.
+ * 4. Stop/Pause precedence: STOP > STOP_MIC_SELF_TEST > DISCONNECT_LIVE_SESSION > PAUSE > CONNECT_LIVE_SESSION > START_MIC_SELF_TEST > START.
+ *    Large STOP immediately closes active Gemini Live WebSockets, releases audio capture/playback hardware, and wipes ephemeral buffers.
+ * 5. Honest NOT_CONFIGURED state on Start: Phase 03 verifies the Gemini Live WebSocket handshake and diagnostics only,
+ *    without claiming audio playback (`audioPlaybackClaimed = false`) or registering action tools (`tools = 0`).
+ * 6. Excludes private data and secrets from logs and state payloads via [com.example.live.DiagnosticRedactor].
  */
 class ConversationCoordinator(
     private val idGenerator: ContractIdGenerator = ContractIdGenerator(),
     val audioCapture: AudioCapture = AudioCapture(DefaultNoContextAudioDriver()),
-    private val clockProvider: () -> String = { "PHASE02-T+${System.currentTimeMillis() % 100000}ms" }
+    val liveAdapter: GeminiLiveConnectionAdapter = GeminiLiveConnectionAdapter(),
+    private val clockProvider: () -> String = { "PHASE03-T+${System.currentTimeMillis() % 100000}ms" }
 ) {
     private val executedActionIds = LinkedHashSet<String>()
     private val maxTrackedActions = 512
@@ -108,6 +114,7 @@ class ConversationCoordinator(
             state = ConversationState.IDLE,
             isMicrophoneActive = false,
             audioCaptureState = audioCapture.state.value,
+            liveConnectionState = liveAdapter.state.value,
             transcript = listOf(
                 TranscriptEntry(
                     id = "${initialActionId.value}-log",
@@ -117,7 +124,7 @@ class ConversationCoordinator(
                     roleLabel = "COORDINATOR",
                     stateSnapshot = ConversationState.IDLE,
                     outcomeCode = "SHELL_INITIALIZED",
-                    message = "OmniVoice Rebuild Phase 02 ready. Single ConversationCoordinator & single AudioCapture owner active. Assistant/Gemini model remains NOT_CONFIGURED; Microphone Self-Test is local hardware verification only.",
+                    message = "OmniVoice Rebuild Phase 03 ready. Single ConversationCoordinator, single AudioCapture owner, and single GeminiLiveConnectionAdapter (${liveAdapter.configuredModelId}) active. Audio playback is not claimed in Phase 03; zero action tools registered.",
                     timestampLabel = "INIT"
                 )
             )
@@ -132,26 +139,32 @@ class ConversationCoordinator(
     fun nextActionId(verb: String): ActionId = idGenerator.nextActionId(verb)
 
     /**
-     * Synchronizes the latest [AudioCaptureState] into [ConversationUiState] so the shell
-     * and microphone setup screen always reflect real hardware state.
+     * Synchronizes the latest [AudioCaptureState] and [LiveConnectionState] into [ConversationUiState]
+     * so the shell, microphone setup screen, and live diagnostics screen always reflect real state.
      */
     @Synchronized
     fun syncAudioState() {
         val snap = audioCapture.state.value
-        val micLabel = when {
-            snap.isCapturing -> "MIC: CAPTURING (${snap.activeGeneration?.wireId ?: "active"} • ${snap.capturedFrameCount} frames)"
-            snap.isPlayingEphemeralCheck -> "MIC: PLAYING EPHEMERAL CHECK (${snap.activeGeneration?.wireId ?: "play"})"
-            snap.permissionState == MicPermissionState.GRANTED -> "MIC: READY (PERMISSION GRANTED • IDLE)"
-            snap.permissionState == MicPermissionState.PERMANENTLY_DENIED -> "MIC: BLOCKED (PERMANENTLY DENIED — OPEN SETTINGS)"
-            snap.permissionState == MicPermissionState.REFUSED_CAN_RETRY -> "MIC: PERMISSION REFUSED (CAN RETRY)"
-            else -> "MIC: INACTIVE (PERMISSION NOT_REQUESTED)"
-        }
+        val liveSnap = liveAdapter.state.value
+        val micLabel = formatMicLabel(snap)
         _uiState.update { current ->
             current.copy(
                 isMicrophoneActive = snap.isCapturing,
                 microphoneStatusLabel = micLabel,
-                audioCaptureState = snap
+                audioCaptureState = snap,
+                liveConnectionState = liveSnap
             )
+        }
+    }
+
+    /**
+     * Synchronizes the latest [LiveConnectionState] from [liveAdapter] into [ConversationUiState].
+     */
+    @Synchronized
+    fun syncLiveState() {
+        val liveSnap = liveAdapter.state.value
+        _uiState.update { current ->
+            current.copy(liveConnectionState = liveSnap)
         }
     }
 
@@ -176,18 +189,147 @@ class ConversationCoordinator(
     }
 
     /**
-     * Explicit lifecycle hook when navigating away from the Microphone Setup screen or when
-     * the Activity stops/backgrounds (not a configuration change).
-     * Immediately releases hardware and wipes ephemeral self-test audio.
+     * Forwards a generation-tagged socket callback through [GeminiLiveConnectionAdapter] and updates state.
+     * Returns true if accepted by the active socket generation, false if dropped as stale.
      */
     @Synchronized
-    fun onLifecycleReleaseHardware(reason: String) {
+    fun onLiveSocketCallback(event: LiveSocketCallbackEvent): Boolean {
+        val accepted = liveAdapter.onSocketCallback(event)
+        syncLiveState()
+        return accepted
+    }
+
+    /**
+     * Starts lifecycle-safe connectivity monitoring (`ConnectivityManager.NetworkCallback`) while
+     * the diagnostics screen or a Gemini Live session is active.
+     */
+    @Synchronized
+    fun startLiveNetworkMonitoring() {
+        liveAdapter.startNetworkMonitoring()
+        syncLiveState()
+    }
+
+    /**
+     * Unregisters connectivity monitoring safely when no longer needed.
+     */
+    @Synchronized
+    fun stopLiveNetworkMonitoring() {
+        liveAdapter.stopNetworkMonitoring()
+        syncLiveState()
+    }
+
+    /**
+     * Called when the Live Diagnostics screen is disposed (navigated away).
+     * Cancels any scheduled retry backoff (`CONNECTING` / `RETRY_BACKOFF_WAITING`), and unregisters
+     * the network callback if no active `SETUP_ACCEPTED` session is being monitored.
+     */
+    @Synchronized
+    fun onLiveDiagnosticsDisposed(reason: String = "Live Diagnostics screen disposed") {
+        liveAdapter.cancelScheduledRetries(reason)
+        if (liveAdapter.state.value.phase != LiveConnectionPhase.SETUP_ACCEPTED) {
+            liveAdapter.stopNetworkMonitoring()
+        }
+        syncLiveState()
+    }
+
+    /**
+     * Initiates an authenticated Gemini Live WebSocket handshake with bounded backoff for transient
+     * failures through the single [GeminiLiveConnectionAdapter], recording a typed [VerifiedOutcome.LiveConnectionOutcome]
+     * in the coordinator transcript.
+     */
+    suspend fun connectLiveSessionWithHandshake(
+        actionId: ActionId = idGenerator.nextActionId("connect_live")
+    ): VerifiedOutcome.LiveConnectionOutcome {
+        val sessionSnapshot = synchronized(this) {
+            val current = _uiState.value
+            if (executedActionIds.contains(actionId.value)) {
+                return VerifiedOutcome.LiveConnectionOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = current.currentTurnId,
+                    resultingState = current.state,
+                    livePhase = current.liveConnectionState.phase,
+                    generationId = current.liveConnectionState.activeGeneration,
+                    failureClassification = current.liveConnectionState.failureClassification,
+                    code = "EXACTLY_ONCE_DUPLICATE_REJECTED",
+                    detail = "Duplicate Live connect ActionId ${actionId.value} rejected."
+                )
+            }
+            recordActionId(actionId)
+            liveAdapter.startNetworkMonitoring()
+            current.sessionId
+        }
+
+        val finalLiveState = liveAdapter.connectWithBoundedRetry(sessionSnapshot)
+
+        return synchronized(this) {
+            val current = _uiState.value
+            val nextTurn = idGenerator.nextTurnId()
+            val outcomeCode = when (finalLiveState.phase) {
+                LiveConnectionPhase.SETUP_ACCEPTED -> "LIVE_SETUP_ACCEPTED"
+                LiveConnectionPhase.NETWORK_UNAVAILABLE -> "LIVE_NETWORK_UNAVAILABLE"
+                LiveConnectionPhase.NETWORK_RESTORED -> "LIVE_NETWORK_RESTORED"
+                LiveConnectionPhase.FAILED -> "LIVE_FAILED_${finalLiveState.failureClassification.wireCode}"
+                LiveConnectionPhase.DISCONNECTED -> "LIVE_DISCONNECTED"
+                else -> "LIVE_${finalLiveState.phase.wireCode}"
+            }
+            val detailMsg = when (finalLiveState.phase) {
+                LiveConnectionPhase.SETUP_ACCEPTED ->
+                    "Gemini Live handshake verified (${finalLiveState.diagnostics.modelId} @ ${finalLiveState.diagnostics.sessionGenerationWireId}, attempts=${finalLiveState.attemptCount}, tools=0, audioPlayback=NOT_CLAIMED)."
+                LiveConnectionPhase.NETWORK_UNAVAILABLE ->
+                    "Gemini Live handshake blocked [NETWORK_UNAVAILABLE]: ${finalLiveState.diagnostics.redactedSummary}"
+                LiveConnectionPhase.FAILED ->
+                    "Gemini Live handshake failed [${finalLiveState.failureClassification.wireCode}] after ${finalLiveState.attemptCount} attempt(s) (retries=${finalLiveState.retryCount}): ${finalLiveState.diagnostics.redactedSummary}"
+                else ->
+                    finalLiveState.diagnostics.redactedSummary
+            }
+            val outcome = VerifiedOutcome.LiveConnectionOutcome(
+                actionId = actionId,
+                sessionId = current.sessionId,
+                turnId = nextTurn,
+                resultingState = current.state,
+                livePhase = finalLiveState.phase,
+                generationId = finalLiveState.activeGeneration ?: finalLiveState.lastCompletedGeneration,
+                failureClassification = finalLiveState.failureClassification,
+                code = outcomeCode,
+                detail = detailMsg
+            )
+            applyVerifiedOutcome(
+                sessionId = current.sessionId,
+                turnId = nextTurn,
+                actionId = actionId,
+                newState = current.state,
+                roleLabel = "LIVE_ADAPTER",
+                outcome = outcome
+            )
+            outcome
+        }
+    }
+
+    /**
+     * Explicit lifecycle hook when navigating away from the Microphone Setup screen or when
+     * the Activity stops/backgrounds (not a configuration change).
+     * Immediately releases audio hardware, wipes ephemeral self-test audio, closes any active live socket,
+     * and unregisters connectivity callbacks when disconnecting Live.
+     */
+    @Synchronized
+    fun onLifecycleReleaseHardware(reason: String, disconnectLive: Boolean = false) {
         val hadActiveHardware = audioCapture.state.value.isCapturing ||
             audioCapture.state.value.isPlayingEphemeralCheck ||
             audioCapture.state.value.ephemeralRecordedSamples > 0
+        val hadActiveLive = disconnectLive && (
+            liveAdapter.state.value.phase == LiveConnectionPhase.CONNECTING ||
+                liveAdapter.state.value.phase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                liveAdapter.state.value.phase == LiveConnectionPhase.RETRY_BACKOFF_WAITING
+            )
+
         audioCapture.stopAndRelease(reason = reason, wipeEphemeral = true)
+        if (disconnectLive) {
+            liveAdapter.disconnectAndRelease(reason = reason)
+            liveAdapter.stopNetworkMonitoring()
+        }
         syncAudioState()
-        if (hadActiveHardware) {
+        if (hadActiveHardware || hadActiveLive) {
             val turn = idGenerator.nextTurnId()
             val act = idGenerator.nextActionId("lifecycle_release")
             val current = _uiState.value
@@ -251,18 +393,19 @@ class ConversationCoordinator(
 
         return when (command) {
             CoordinatorCommand.STOP -> {
-                // Large Stop MUST promptly release hardware and wipe ephemeral self-test data
+                // Large Stop MUST promptly release hardware, wipe ephemeral self-test data, and close live sockets
                 audioCapture.stopAndRelease(
                     reason = "Immediate operator STOP command",
                     wipeEphemeral = true
                 )
+                liveAdapter.disconnectAndRelease(reason = "Immediate operator STOP command")
                 val outcome = VerifiedOutcome.StateTransitionVerified(
                     actionId = actionId,
                     sessionId = current.sessionId,
                     turnId = nextTurn,
                     previousState = current.state,
                     resultingState = ConversationState.STOPPED,
-                    detail = "STOP command executed with highest precedence (priority ${CoordinatorCommand.STOP.priority}). Session halted, audio hardware released, and ephemeral buffer wiped."
+                    detail = "STOP command executed with highest precedence (priority ${CoordinatorCommand.STOP.priority}). Session halted, live socket closed, audio hardware released, and ephemeral buffer wiped."
                 )
                 applyVerifiedOutcome(
                     sessionId = current.sessionId,
@@ -300,13 +443,14 @@ class ConversationCoordinator(
                         reason = "Operator PAUSE command",
                         wipeEphemeral = false
                     )
+                    liveAdapter.disconnectAndRelease(reason = "Operator PAUSE command")
                     val outcome = VerifiedOutcome.StateTransitionVerified(
                         actionId = actionId,
                         sessionId = current.sessionId,
                         turnId = nextTurn,
                         previousState = current.state,
                         resultingState = ConversationState.PAUSED,
-                        detail = "PAUSE command executed (priority ${CoordinatorCommand.PAUSE.priority}). Active audio capture released and shell paused."
+                        detail = "PAUSE command executed (priority ${CoordinatorCommand.PAUSE.priority}). Active audio capture and live socket released; shell paused."
                     )
                     applyVerifiedOutcome(
                         sessionId = current.sessionId,
@@ -321,13 +465,14 @@ class ConversationCoordinator(
             }
 
             CoordinatorCommand.START -> {
-                // Keep conversation shell honest: even when mic is configured, Gemini assistant is NOT_CONFIGURED in Phase 02.
+                // Keep conversation shell honest: Phase 03 verifies the Gemini Live WebSocket handshake only;
+                // audio playback and full voice turns are not claimed in Phase 03.
                 val outcome = VerifiedOutcome.HonestNotConfiguredOutcome(
                     actionId = actionId,
                     sessionId = current.sessionId,
                     turnId = nextTurn,
                     resultingState = ConversationState.NOT_CONFIGURED,
-                    detail = "Start requested from ${current.state.wireLabel}: Transitioned to honest NOT_CONFIGURED state. Gemini assistant model is not wired in Phase 02 (Microphone Self-Test is local hardware verification only, not an assistant answer)."
+                    detail = "Start requested from ${current.state.wireLabel}: Transitioned to honest NOT_CONFIGURED state. Full voice-turn audio playback is not claimed in Phase 03. Use Live Connection & Diagnostics to verify the Gemini Live WebSocket handshake (${liveAdapter.configuredModelId}), or Microphone Setup for local PCM check."
                 )
                 applyVerifiedOutcome(
                     sessionId = current.sessionId,
@@ -335,6 +480,56 @@ class ConversationCoordinator(
                     actionId = actionId,
                     newState = ConversationState.NOT_CONFIGURED,
                     roleLabel = "OPERATOR_START",
+                    outcome = outcome
+                )
+                outcome
+            }
+
+            CoordinatorCommand.DISCONNECT_LIVE_SESSION -> {
+                val prevGen = liveAdapter.state.value.activeGeneration ?: liveAdapter.state.value.lastCompletedGeneration
+                liveAdapter.disconnectAndRelease(reason = "Operator disconnected Gemini Live session")
+                val liveSnap = liveAdapter.state.value
+                val outcome = VerifiedOutcome.LiveConnectionOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    resultingState = current.state,
+                    livePhase = liveSnap.phase,
+                    generationId = prevGen,
+                    failureClassification = LiveFailureClassification.NONE,
+                    code = "LIVE_SESSION_DISCONNECTED",
+                    detail = "Gemini Live session disconnected and socket released (${prevGen?.wireId ?: "NONE"})."
+                )
+                applyVerifiedOutcome(
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    actionId = actionId,
+                    newState = current.state,
+                    roleLabel = "LIVE_ADAPTER",
+                    outcome = outcome
+                )
+                outcome
+            }
+
+            CoordinatorCommand.CONNECT_LIVE_SESSION -> {
+                val liveSnap = liveAdapter.state.value
+                val outcome = VerifiedOutcome.LiveConnectionOutcome(
+                    actionId = actionId,
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    resultingState = current.state,
+                    livePhase = liveSnap.phase,
+                    generationId = liveSnap.activeGeneration,
+                    failureClassification = liveSnap.failureClassification,
+                    code = "LIVE_CONNECT_REQUESTED",
+                    detail = "Gemini Live handshake verification requested for ${liveAdapter.configuredModelId}."
+                )
+                applyVerifiedOutcome(
+                    sessionId = current.sessionId,
+                    turnId = nextTurn,
+                    actionId = actionId,
+                    newState = current.state,
+                    roleLabel = "LIVE_ADAPTER",
                     outcome = outcome
                 )
                 outcome
@@ -443,6 +638,7 @@ class ConversationCoordinator(
                     reason = "Session reset to IDLE",
                     wipeEphemeral = true
                 )
+                liveAdapter.disconnectAndRelease(reason = "Session reset to IDLE")
                 val freshSession = idGenerator.nextSessionId()
                 val outcome = VerifiedOutcome.StateTransitionVerified(
                     actionId = actionId,
@@ -450,7 +646,7 @@ class ConversationCoordinator(
                     turnId = nextTurn,
                     previousState = current.state,
                     resultingState = ConversationState.IDLE,
-                    detail = "Session reset to IDLE with new session ID ${freshSession.value}. Audio hardware released."
+                    detail = "Session reset to IDLE with new session ID ${freshSession.value}. Audio hardware and live socket released."
                 )
                 applyVerifiedOutcome(
                     sessionId = freshSession,
@@ -467,7 +663,7 @@ class ConversationCoordinator(
 
     /**
      * Evaluates a batch of concurrent commands and enforces strict Stop/Pause precedence
-     * (STOP > STOP_MIC_SELF_TEST > PAUSE > START_MIC_SELF_TEST > START).
+     * (STOP > STOP_MIC_SELF_TEST > DISCONNECT_LIVE_SESSION > PAUSE > CONNECT_LIVE_SESSION > START_MIC_SELF_TEST > START).
      */
     @Synchronized
     fun dispatchWithPrecedence(
@@ -493,6 +689,9 @@ class ConversationCoordinator(
             audioCapture.stopAndRelease(
                 reason = "Preempted by ${winningCommand.name} precedence",
                 wipeEphemeral = (winningCommand == CoordinatorCommand.STOP)
+            )
+            liveAdapter.disconnectAndRelease(
+                reason = "Preempted by ${winningCommand.name} precedence"
             )
         }
 
@@ -528,6 +727,15 @@ class ConversationCoordinator(
         return outcome
     }
 
+    private fun formatMicLabel(snap: AudioCaptureState): String = when {
+        snap.isCapturing -> "MIC: CAPTURING (${snap.activeGeneration?.wireId ?: "active"} • ${snap.capturedFrameCount} frames)"
+        snap.isPlayingEphemeralCheck -> "MIC: PLAYING EPHEMERAL CHECK (${snap.activeGeneration?.wireId ?: "play"})"
+        snap.permissionState == MicPermissionState.GRANTED -> "MIC: READY (PERMISSION GRANTED • IDLE)"
+        snap.permissionState == MicPermissionState.PERMANENTLY_DENIED -> "MIC: BLOCKED (PERMANENTLY DENIED — OPEN SETTINGS)"
+        snap.permissionState == MicPermissionState.REFUSED_CAN_RETRY -> "MIC: PERMISSION REFUSED (CAN RETRY)"
+        else -> "MIC: INACTIVE (NOT_CONFIGURED IN PHASE 01)"
+    }
+
     private fun applyVerifiedOutcome(
         sessionId: SessionId,
         turnId: TurnId,
@@ -537,14 +745,8 @@ class ConversationCoordinator(
         outcome: VerifiedOutcome
     ) {
         val snap = audioCapture.state.value
-        val micLabel = when {
-            snap.isCapturing -> "MIC: CAPTURING (${snap.activeGeneration?.wireId ?: "active"} • ${snap.capturedFrameCount} frames)"
-            snap.isPlayingEphemeralCheck -> "MIC: PLAYING EPHEMERAL CHECK (${snap.activeGeneration?.wireId ?: "play"})"
-            snap.permissionState == MicPermissionState.GRANTED -> "MIC: READY (PERMISSION GRANTED • IDLE)"
-            snap.permissionState == MicPermissionState.PERMANENTLY_DENIED -> "MIC: BLOCKED (PERMANENTLY DENIED — OPEN SETTINGS)"
-            snap.permissionState == MicPermissionState.REFUSED_CAN_RETRY -> "MIC: PERMISSION REFUSED (CAN RETRY)"
-            else -> "MIC: INACTIVE (NOT_CONFIGURED IN PHASE 01)"
-        }
+        val liveSnap = liveAdapter.state.value
+        val micLabel = formatMicLabel(snap)
 
         val entry = TranscriptEntry(
             id = "${actionId.value}-${turnId.value}",
@@ -566,6 +768,7 @@ class ConversationCoordinator(
                 isMicrophoneActive = snap.isCapturing,
                 microphoneStatusLabel = micLabel,
                 audioCaptureState = snap,
+                liveConnectionState = liveSnap,
                 lastOutcome = outcome,
                 transcript = state.transcript + entry,
                 executedActionCount = state.executedActionCount + 1
