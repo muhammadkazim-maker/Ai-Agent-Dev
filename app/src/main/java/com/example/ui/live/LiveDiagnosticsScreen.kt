@@ -170,6 +170,7 @@ fun LiveDiagnosticsScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun LiveDiagnosticsTopBar(
     liveState: LiveConnectionState,
@@ -183,17 +184,16 @@ private fun LiveDiagnosticsTopBar(
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.fillMaxWidth()
             ) {
                 IconButton(
                     onClick = onNavigateBack,
@@ -207,21 +207,29 @@ private fun LiveDiagnosticsTopBar(
                         tint = MaterialTheme.colorScheme.primary
                     )
                 }
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Gemini Live Connection & Configuration Diagnostics",
                         style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurface
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.fillMaxWidth()
                     )
                     Text(
                         text = "PHASE 03 // ONE LIVE ADAPTER • FIREBASE AI LOGIC APP CHECK • ZERO TOOLS",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }
 
-            LivePhaseBadge(phase = liveState.phase)
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                LivePhaseBadge(phase = liveState.phase)
+            }
         }
     }
 }

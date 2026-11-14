@@ -40,11 +40,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudSync
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.MicNone
 import androidx.compose.material.icons.outlined.MicOff
@@ -71,6 +74,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -91,6 +97,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.R
+import com.example.audio.MicPermissionState
 import com.example.contract.ConversationState
 import com.example.contract.TranscriptEntry
 import com.example.coordinator.ConversationUiState
@@ -120,6 +127,7 @@ fun ConversationShellRoute(
 
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    var pendingStartAfterPermissionGrant by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -135,6 +143,12 @@ fun ConversationShellRoute(
             granted = isGranted,
             shouldShowRationale = shouldShowRationale
         )
+        if (pendingStartAfterPermissionGrant && isGranted) {
+            pendingStartAfterPermissionGrant = false
+            viewModel.onStartClicked()
+        } else {
+            pendingStartAfterPermissionGrant = false
+        }
     }
 
     // Re-check RECORD_AUDIO permission on ON_RESUME (after returning from Settings)
@@ -185,6 +199,26 @@ fun ConversationShellRoute(
             }
             context.startActivity(intent)
         } catch (_: Throwable) {
+        }
+    }
+
+    val handleMainStartClick: () -> Unit = {
+        val osGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (osGranted && viewModel.audioState.value.permissionState != MicPermissionState.GRANTED) {
+            viewModel.onReCheckPermissionFromOs(isGranted = true, shouldShowRationale = false)
+        }
+        val permBeforeStart = viewModel.audioState.value.permissionState
+        viewModel.onStartClicked()
+        if (permBeforeStart == MicPermissionState.NOT_REQUESTED && !osGranted) {
+            pendingStartAfterPermissionGrant = true
+            try {
+                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            } catch (_: Throwable) {
+                pendingStartAfterPermissionGrant = false
+            }
         }
     }
 
@@ -239,7 +273,8 @@ fun ConversationShellRoute(
                     uiState = uiState,
                     isSettingsOpen = isSettingsOpen,
                     fontScaleOverride = fontScaleOverride,
-                    onStartClick = { viewModel.onStartClicked() },
+                    onStartClick = handleMainStartClick,
+                    onFinishSpokenTurnClick = viewModel::onFinishSpokenTurnClicked,
                     onPauseClick = { viewModel.onPauseClicked() },
                     onStopClick = { viewModel.onStopClicked() },
                     onResetIdleClick = { viewModel.onResetIdleClicked() },
@@ -262,6 +297,7 @@ fun ConversationShellScreen(
     isSettingsOpen: Boolean,
     fontScaleOverride: Float?,
     onStartClick: () -> Unit,
+    onFinishSpokenTurnClick: () -> Unit = {},
     onPauseClick: () -> Unit,
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
@@ -314,15 +350,28 @@ fun ConversationShellScreen(
                             .testTag("landscape_split_container"),
                         horizontalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        TranscriptAndTelemetryPane(
-                            uiState = uiState,
+                        Column(
                             modifier = Modifier
-                                .weight(0.60f)
-                                .fillMaxHeight()
-                        )
+                                .weight(0.58f)
+                                .fillMaxHeight(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            VoiceTurnPipelineCard(
+                                uiState = uiState,
+                                onFinishSpokenTurnClick = onFinishSpokenTurnClick,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            TranscriptAndTelemetryPane(
+                                uiState = uiState,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth()
+                            )
+                        }
                         CommandDeckPane(
                             uiState = uiState,
                             onStartClick = onStartClick,
+                            onFinishSpokenTurnClick = onFinishSpokenTurnClick,
                             onPauseClick = onPauseClick,
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
@@ -330,33 +379,41 @@ fun ConversationShellScreen(
                             onOpenMicSetup = onOpenMicSetup,
                             onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                             modifier = Modifier
-                                .weight(0.40f)
+                                .weight(0.42f)
                                 .fillMaxHeight()
                         )
                     }
                 } else {
+                    // Portrait mode: usable, dense cyber layout with no unexplained empty box
                     Column(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
                             .testTag("portrait_fallback_container"),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        TranscriptAndTelemetryPane(
+                        VoiceTurnPipelineCard(
                             uiState = uiState,
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxWidth()
+                            onFinishSpokenTurnClick = onFinishSpokenTurnClick,
+                            modifier = Modifier.fillMaxWidth()
                         )
                         CommandDeckPane(
                             uiState = uiState,
                             onStartClick = onStartClick,
+                            onFinishSpokenTurnClick = onFinishSpokenTurnClick,
                             onPauseClick = onPauseClick,
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
                             onOpenMicSetup = onOpenMicSetup,
                             onOpenLiveDiagnostics = onOpenLiveDiagnostics,
+                            isPortraitEmbedded = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        TranscriptAndTelemetryPane(
+                            uiState = uiState,
+                            isPortraitEmbedded = true,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -403,33 +460,51 @@ private fun TopTelemetryHeader(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            // Full-width title & phase description so words stay intact and never wrap character-by-character
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("top_header_title_column"),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = stringResource(R.string.app_name),
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "${stringResource(R.string.shell_subtitle)} • ${if (isLandscapeLayout) "LANDSCAPE DECK" else "PORTRAIT FALLBACK"}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                Text(
+                    text = stringResource(R.string.app_name),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("app_title_text")
+                )
+                Text(
+                    text = "${stringResource(R.string.shell_subtitle)} • ${if (isLandscapeLayout) "LANDSCAPE DECK" else "PORTRAIT DECK"}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("app_subtitle_text")
+                )
+            }
+
+            // Separate responsive row for state badge and navigation/action icons
+            FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("top_header_status_action_row"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(modifier = Modifier.align(Alignment.CenterVertically)) {
+                    RealStateBadge(state = uiState.state)
                 }
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    RealStateBadge(state = uiState.state)
-
                     IconButton(
                         onClick = onOpenLiveDiagnostics,
                         modifier = Modifier
@@ -509,6 +584,25 @@ private fun RealStateBadge(state: ConversationState) {
             MaterialTheme.colorScheme.outline,
             MaterialTheme.colorScheme.onSurface
         )
+        ConversationState.CONNECTING,
+        ConversationState.PROCESSING -> Triple(
+            MaterialTheme.colorScheme.primaryContainer,
+            MaterialTheme.colorScheme.primary,
+            MaterialTheme.colorScheme.onPrimaryContainer
+        )
+        ConversationState.LISTENING,
+        ConversationState.SPEAKING,
+        ConversationState.READY -> Triple(
+            MaterialTheme.colorScheme.tertiaryContainer,
+            MaterialTheme.colorScheme.tertiary,
+            MaterialTheme.colorScheme.onTertiaryContainer
+        )
+        ConversationState.ERROR,
+        ConversationState.STOPPED -> Triple(
+            MaterialTheme.colorScheme.errorContainer,
+            MaterialTheme.colorScheme.error,
+            MaterialTheme.colorScheme.onErrorContainer
+        )
         ConversationState.NOT_CONFIGURED -> Triple(
             MaterialTheme.colorScheme.secondaryContainer,
             MaterialTheme.colorScheme.secondary,
@@ -518,11 +612,6 @@ private fun RealStateBadge(state: ConversationState) {
             MaterialTheme.colorScheme.primaryContainer,
             MaterialTheme.colorScheme.primary,
             MaterialTheme.colorScheme.onPrimaryContainer
-        )
-        ConversationState.STOPPED -> Triple(
-            MaterialTheme.colorScheme.errorContainer,
-            MaterialTheme.colorScheme.error,
-            MaterialTheme.colorScheme.onErrorContainer
         )
     }
 
@@ -615,9 +704,309 @@ private fun HonestMicrophoneBadge(
     }
 }
 
+/**
+ * Phase 04 Voice Turn Pipeline & Streaming Audio Telemetry Card.
+ * Replaces the old blank space in portrait mode with live visual feedback of
+ * `CONNECTING -> LISTENING -> PROCESSING -> SPEAKING -> READY`, microphone frames sent,
+ * native-audio playback drain progress, language mirroring status, and honest error classification.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun VoiceTurnPipelineCard(
+    uiState: ConversationUiState,
+    onFinishSpokenTurnClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val pipelineStages = listOf(
+        ConversationState.CONNECTING,
+        ConversationState.LISTENING,
+        ConversationState.PROCESSING,
+        ConversationState.SPEAKING,
+        ConversationState.READY
+    )
+    val playSnap = uiState.playbackState
+
+    Card(
+        modifier = modifier.testTag("voice_turn_pipeline_card"),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "PHASE 04 VOICE TURN PIPELINE & AUDIO HARDWARE",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.testTag("pipeline_card_header_text")
+                )
+                Text(
+                    text = if (playSnap.isPlaybackDrained) {
+                        "PLAYBACK: DRAINED"
+                    } else if (playSnap.isPlaying) {
+                        "PLAYBACK: STREAMING (${playSnap.verifiedSampleRateHz}Hz)"
+                    } else {
+                        "PLAYBACK: IDLE"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (playSnap.isPlaybackDrained || playSnap.isPlaying) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.testTag("playback_drain_status_text")
+                )
+            }
+
+            // 5-stage visual pipeline: CONNECTING -> LISTENING -> PROCESSING -> SPEAKING -> READY
+            FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("voice_turn_stage_row"),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                pipelineStages.forEach { stage ->
+                    val isCurrent = uiState.state == stage
+                    val isVisited = uiState.voiceTurnStateSequence.contains(stage)
+                    val chipBg = when {
+                        isCurrent -> MaterialTheme.colorScheme.primaryContainer
+                        isVisited -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f)
+                        else -> MaterialTheme.colorScheme.surfaceVariant
+                    }
+                    val chipBorder = when {
+                        isCurrent -> MaterialTheme.colorScheme.primary
+                        isVisited -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.outline
+                    }
+                    val chipText = when {
+                        isCurrent -> MaterialTheme.colorScheme.onPrimaryContainer
+                        isVisited -> MaterialTheme.colorScheme.onTertiaryContainer
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Surface(
+                        color = chipBg,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(if (isCurrent) 1.5.dp else 1.dp, chipBorder),
+                        modifier = Modifier.testTag("pipeline_stage_${stage.wireLabel.lowercase()}")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (isVisited && !isCurrent) {
+                                Icon(
+                                    imageVector = Icons.Filled.CheckCircle,
+                                    contentDescription = null,
+                                    tint = chipBorder,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                            }
+                            Text(
+                                text = stage.wireLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = if (isCurrent || isVisited) FontWeight.Bold else FontWeight.Normal,
+                                color = chipText
+                            )
+                        }
+                    }
+                }
+            }
+
+            // State summary banner
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("state_summary_banner"),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = if (uiState.state == ConversationState.SPEAKING || uiState.state == ConversationState.LISTENING) {
+                            Icons.Filled.GraphicEq
+                        } else {
+                            Icons.Outlined.Info
+                        },
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "STATE: ${uiState.state.wireLabel}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = uiState.lastVoiceTurnSummary.ifBlank { uiState.state.summary },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // Honest Prerequisite / Runtime Error Banner when an error occurs
+            if (uiState.activeVoiceTurnErrorCode != null) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("voice_turn_error_banner"),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.error)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.ErrorOutline,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "ERROR CODE: ${uiState.activeVoiceTurnErrorCode}",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.testTag("voice_turn_error_code_text")
+                            )
+                            Text(
+                                text = uiState.activeVoiceTurnErrorDetail ?: "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Live Mic, AudioTrack & Language Policy Telemetry Chips
+            val displayedMicRms = maxOf(
+                uiState.voiceTurnPeakRmsLinear,
+                uiState.audioCaptureState.currentRmsLinear,
+                uiState.audioCaptureState.peakRmsLinear
+            )
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                TelemetryChip(
+                    label = "MIC SENT: ${uiState.voiceTurnFramesSent} frames (${uiState.voiceTurnBytesSent} B) • RMS ${"%.3f".format(displayedMicRms)}",
+                    tag = "voice_turn_mic_metrics"
+                )
+                TelemetryChip(
+                    label = "AUDIOTRACK: ${playSnap.hardwarePlaybackHeadFrames}/${playSnap.totalFramesWrittenToHardware} frames (recv=${playSnap.framesReceivedFromServer}, ${playSnap.chunksReceived} chunks)",
+                    tag = "voice_turn_playback_metrics"
+                )
+                TelemetryChip(
+                    label = "LANGUAGE: MIRROR SPOKEN TURN (EN / UR / ROMAN-UR)",
+                    tag = "voice_turn_language_policy_chip"
+                )
+            }
+
+            if (uiState.currentTurnUserTranscript.isNotBlank() || uiState.currentTurnModelTranscript.isNotBlank()) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("voice_turn_live_transcript_box"),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (uiState.currentTurnUserTranscript.isNotBlank()) {
+                            Text(
+                                text = "YOU: ${uiState.currentTurnUserTranscript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("voice_turn_user_transcript_text")
+                            )
+                        }
+                        if (uiState.currentTurnModelTranscript.isNotBlank()) {
+                            Text(
+                                text = "OMNIVOICE: ${uiState.currentTurnModelTranscript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("voice_turn_model_transcript_text")
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (uiState.state == ConversationState.LISTENING) {
+                Button(
+                    onClick = onFinishSpokenTurnClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp)
+                        .minimumInteractiveComponentSize()
+                        .testTag("pipeline_end_spoken_turn_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary,
+                        contentColor = MaterialTheme.colorScheme.onTertiary
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.GraphicEq,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.action_end_spoken_turn),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TranscriptAndTelemetryPane(
     uiState: ConversationUiState,
+    isPortraitEmbedded: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -628,14 +1017,15 @@ private fun TranscriptAndTelemetryPane(
     ) {
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
+                .then(if (isPortraitEmbedded) Modifier else Modifier.fillMaxSize())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
                     text = stringResource(R.string.transcript_header),
@@ -649,53 +1039,32 @@ private fun TranscriptAndTelemetryPane(
                 )
             }
 
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("state_summary_banner"),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+            if (isPortraitEmbedded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("transcript_list"),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Info,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "STATE: ${uiState.state.wireLabel}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = uiState.state.summary,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    uiState.transcript.asReversed().take(8).forEach { entry ->
+                        TranscriptEntryCard(entry = entry)
                     }
                 }
-            }
-
-            LazyColumn(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .testTag("transcript_list"),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(vertical = 4.dp)
-            ) {
-                items(
-                    items = uiState.transcript.asReversed(),
-                    key = { it.id }
-                ) { entry ->
-                    TranscriptEntryCard(entry = entry)
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .testTag("transcript_list"),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 4.dp)
+                ) {
+                    items(
+                        items = uiState.transcript.asReversed(),
+                        key = { it.id }
+                    ) { entry ->
+                        TranscriptEntryCard(entry = entry)
+                    }
                 }
             }
         }
@@ -739,7 +1108,8 @@ private fun TranscriptEntryCard(entry: TranscriptEntry) {
             Text(
                 text = entry.message,
                 style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }
@@ -750,12 +1120,14 @@ private fun TranscriptEntryCard(entry: TranscriptEntry) {
 private fun CommandDeckPane(
     uiState: ConversationUiState,
     onStartClick: () -> Unit,
+    onFinishSpokenTurnClick: () -> Unit,
     onPauseClick: () -> Unit,
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
     onOpenMicSetup: () -> Unit,
     onOpenLiveDiagnostics: () -> Unit,
+    isPortraitEmbedded: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -767,7 +1139,7 @@ private fun CommandDeckPane(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
+                .then(if (isPortraitEmbedded) Modifier else Modifier.verticalScroll(rememberScrollState()))
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -787,6 +1159,7 @@ private fun CommandDeckPane(
                     .testTag("start_button")
                     .semantics { contentDescription = "Start conversation session" },
                 shape = RoundedCornerShape(14.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary
@@ -798,23 +1171,58 @@ private fun CommandDeckPane(
                     modifier = Modifier.size(26.dp)
                 )
                 Spacer(modifier = Modifier.width(10.dp))
-                Column(horizontalAlignment = Alignment.Start) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.Start
+                ) {
                     Text(
                         text = stringResource(R.string.action_start),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Honest NOT_CONFIGURED (Audio Playback Deferred)",
+                        text = "One-Turn Gemini Live Voice (CONNECTING → LISTENING → SPEAKING → READY)",
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
             }
 
+            // End Spoken Turn Button (active during LISTENING to immediately finish spoken question)
+            OutlinedButton(
+                onClick = onFinishSpokenTurnClick,
+                enabled = uiState.state == ConversationState.LISTENING,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 50.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("end_spoken_turn_button"),
+                shape = RoundedCornerShape(12.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (uiState.state == ConversationState.LISTENING) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        MaterialTheme.colorScheme.outline
+                    }
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.GraphicEq,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(R.string.action_end_spoken_turn),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+
             // Large Pause & Stop Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Button(
                     onClick = onPauseClick,
@@ -825,6 +1233,7 @@ private fun CommandDeckPane(
                         .testTag("pause_button")
                         .semantics { contentDescription = "Pause conversation session" },
                     shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.secondary,
                         contentColor = MaterialTheme.colorScheme.onSecondary
@@ -833,7 +1242,7 @@ private fun CommandDeckPane(
                     Icon(
                         imageVector = Icons.Filled.Pause,
                         contentDescription = null,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
@@ -851,6 +1260,7 @@ private fun CommandDeckPane(
                         .testTag("stop_button")
                         .semantics { contentDescription = "Stop conversation session immediately" },
                     shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError
@@ -859,7 +1269,7 @@ private fun CommandDeckPane(
                     Icon(
                         imageVector = Icons.Filled.Stop,
                         contentDescription = null,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
@@ -1067,7 +1477,7 @@ private fun SettingsPlaceholderDialog(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
                 Text(
-                    text = "PHASE 03 ENVIRONMENT & CONTRACT TELEMETRY",
+                    text = "PHASE 04 ENVIRONMENT & CONTRACT TELEMETRY",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -1080,6 +1490,7 @@ private fun SettingsPlaceholderDialog(
                         "• Live Model ID: ${uiState.liveConnectionState.configuredModelId} (${uiState.liveConnectionState.phase.wireCode})\n" +
                         "• Live Session Gen: ${uiState.liveConnectionState.diagnostics.sessionGenerationWireId}\n" +
                         "• Audio Owner: ${uiState.audioCaptureState.owner.wireLabel} (Gen: ${uiState.audioCaptureState.activeGeneration?.wireId ?: "NONE"})\n" +
+                        "• Playback Gen: ${uiState.playbackState.activeGeneration?.wireId ?: "NONE"} (Drained: ${uiState.playbackState.isPlaybackDrained})\n" +
                         "• Mic Permission: ${uiState.audioCaptureState.permissionState.wireLabel}\n" +
                         "• Runtime API Level: Android SDK ${Build.VERSION.SDK_INT} (minSdk 24, targetSdk 36)\n" +
                         "• Coordinator Actions Executed: ${uiState.executedActionCount}\n" +

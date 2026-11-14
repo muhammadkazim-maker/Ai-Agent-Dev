@@ -3,12 +3,14 @@ package com.example.ui.shell
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.AudioCaptureState
+import com.example.audio.LiveAudioPlaybackState
 import com.example.audio.MicPermissionState
 import com.example.contract.CoordinatorCommand
 import com.example.contract.VerifiedOutcome
 import com.example.coordinator.ConversationCoordinator
 import com.example.coordinator.ConversationUiState
 import com.example.live.LiveConnectionState
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,16 +27,19 @@ enum class ActiveScreen {
 
 /**
  * ViewModel wrapping the single [ConversationCoordinator], single [com.example.audio.AudioCapture]
- * owner, and single [com.example.live.GeminiLiveConnectionAdapter], managing screen navigation,
- * permission state transitions, live handshake verification, and lifecycle resource release.
+ * owner, single [com.example.live.GeminiLiveConnectionAdapter], and single
+ * [com.example.audio.LiveAudioPlaybackAdapter], managing Phase 04 one-turn voice conversation,
+ * screen navigation, permission state transitions, live handshake verification, and lifecycle resource release.
  */
 class ConversationShellViewModel(
-    val coordinator: ConversationCoordinator = ConversationCoordinator()
+    val coordinator: ConversationCoordinator = ConversationCoordinator(),
+    val workDispatcher: CoroutineDispatcher = coordinator.backgroundDispatcher
 ) : ViewModel() {
 
     val uiState: StateFlow<ConversationUiState> = coordinator.uiState
     val audioState: StateFlow<AudioCaptureState> = coordinator.audioCapture.state
     val liveState: StateFlow<LiveConnectionState> = coordinator.liveAdapter.state
+    val playbackState: StateFlow<LiveAudioPlaybackState> = coordinator.playbackAdapter.state
 
     private val _activeScreen = MutableStateFlow(ActiveScreen.CONVERSATION_SHELL)
     val activeScreen: StateFlow<ActiveScreen> = _activeScreen.asStateFlow()
@@ -49,6 +54,8 @@ class ConversationShellViewModel(
     val hasRequestedPermissionOnce: StateFlow<Boolean> = _hasRequestedPermissionOnce.asStateFlow()
 
     private var activeLiveConnectJob: Job? = null
+    private var activeVoiceTurnJob: Job? = null
+    private var activeFinishTurnJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -61,30 +68,77 @@ class ConversationShellViewModel(
                 coordinator.syncLiveState()
             }
         }
+        viewModelScope.launch {
+            coordinator.playbackAdapter.state.collectLatest {
+                coordinator.syncPlaybackState()
+            }
+        }
     }
 
-    fun onStartClicked(): VerifiedOutcome =
-        coordinator.dispatch(CoordinatorCommand.START)
+    fun onStartClicked() {
+        val currentState = coordinator.uiState.value.state
+        val isTurnInFlight = currentState == com.example.contract.ConversationState.CONNECTING ||
+            currentState == com.example.contract.ConversationState.LISTENING ||
+            currentState == com.example.contract.ConversationState.PROCESSING ||
+            currentState == com.example.contract.ConversationState.SPEAKING
+        if (isTurnInFlight || coordinator.isVoiceTurnInProgress()) {
+            viewModelScope.launch(workDispatcher) {
+                coordinator.startVoiceTurn()
+            }
+            return
+        }
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = null
+        activeVoiceTurnJob?.cancel()
+        activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
+            coordinator.startVoiceTurn()
+        }
+    }
+
+    fun onFinishSpokenTurnClicked() {
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = viewModelScope.launch(workDispatcher) {
+            coordinator.finishSpokenTurnAndAwaitResponse(
+                reason = "Operator tapped Send Spoken Question"
+            )
+        }
+    }
 
     fun onPauseClicked(): VerifiedOutcome {
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = null
+        activeVoiceTurnJob?.cancel()
+        activeVoiceTurnJob = null
         activeLiveConnectJob?.cancel()
         activeLiveConnectJob = null
         return coordinator.dispatch(CoordinatorCommand.PAUSE)
     }
 
     fun onStopClicked(): VerifiedOutcome {
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = null
+        activeVoiceTurnJob?.cancel()
+        activeVoiceTurnJob = null
         activeLiveConnectJob?.cancel()
         activeLiveConnectJob = null
         return coordinator.dispatch(CoordinatorCommand.STOP)
     }
 
     fun onResetIdleClicked(): VerifiedOutcome {
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = null
+        activeVoiceTurnJob?.cancel()
+        activeVoiceTurnJob = null
         activeLiveConnectJob?.cancel()
         activeLiveConnectJob = null
         return coordinator.dispatch(CoordinatorCommand.RESET_IDLE)
     }
 
     fun onVerifyStopPausePrecedenceClicked(): VerifiedOutcome {
+        activeFinishTurnJob?.cancel()
+        activeFinishTurnJob = null
+        activeVoiceTurnJob?.cancel()
+        activeVoiceTurnJob = null
         activeLiveConnectJob?.cancel()
         activeLiveConnectJob = null
         return coordinator.dispatchWithPrecedence(
@@ -115,7 +169,7 @@ class ConversationShellViewModel(
 
     fun onConnectLiveHandshakeClicked() {
         activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = viewModelScope.launch {
+        activeLiveConnectJob = viewModelScope.launch(workDispatcher) {
             coordinator.connectLiveSessionWithHandshake()
         }
     }
@@ -176,6 +230,10 @@ class ConversationShellViewModel(
      */
     fun onActivityStopped(isChangingConfigurations: Boolean) {
         if (!isChangingConfigurations) {
+            activeFinishTurnJob?.cancel()
+            activeFinishTurnJob = null
+            activeVoiceTurnJob?.cancel()
+            activeVoiceTurnJob = null
             activeLiveConnectJob?.cancel()
             activeLiveConnectJob = null
             coordinator.onLifecycleReleaseHardware(
@@ -228,6 +286,8 @@ class ConversationShellViewModel(
     }
 
     override fun onCleared() {
+        activeFinishTurnJob?.cancel()
+        activeVoiceTurnJob?.cancel()
         activeLiveConnectJob?.cancel()
         coordinator.onLifecycleReleaseHardware(
             reason = "ViewModel cleared",

@@ -103,6 +103,9 @@ class AndroidLiveNetworkMonitor(
     private var registeredCallback: ConnectivityManager.NetworkCallback? = null
     private var activeListener: ((Boolean) -> Unit)? = null
 
+    @Volatile
+    private var latestCallbackValidated: Boolean? = null
+
     override fun isInternetValidated(): Boolean {
         val cm = connectivityManager ?: return false
         return try {
@@ -120,37 +123,69 @@ class AndroidLiveNetworkMonitor(
         synchronized(lock) {
             activeListener = onValidatedChanged
             if (cm == null) {
+                latestCallbackValidated = false
                 onValidatedChanged(false)
                 return
             }
             if (registeredCallback != null) {
-                onValidatedChanged(isInternetValidated())
+                val current = latestCallbackValidated ?: isInternetValidated()
+                onValidatedChanged(current)
                 return
             }
 
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    notifyCurrentState()
+                    val validated = try {
+                        val caps = cm.getNetworkCapabilities(network)
+                        caps != null &&
+                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    latestCallbackValidated = validated
+                    val listenerSnapshot = synchronized(lock) { activeListener }
+                    listenerSnapshot?.invoke(validated)
                 }
 
                 override fun onCapabilitiesChanged(
                     network: Network,
                     networkCapabilities: NetworkCapabilities
                 ) {
+                    // In registerDefaultNetworkCallback, networkCapabilities is the fresh
+                    // authoritative capability set for the current default network.
                     val hasValidInternet =
                         networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                             networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                    // Also check active network state so non-default networks don't mask loss
-                    val effectiveValidated = hasValidInternet && isInternetValidated()
+                    latestCallbackValidated = hasValidInternet
                     val listenerSnapshot = synchronized(lock) { activeListener }
-                    listenerSnapshot?.invoke(effectiveValidated)
+                    listenerSnapshot?.invoke(hasValidInternet)
                 }
 
                 override fun onLost(network: Network) {
-                    notifyCurrentState()
+                    // When the default network is lost, cm.activeNetwork may still briefly point
+                    // to the dying network for a few milliseconds. Treat it as unvalidated unless
+                    // a *different* active network is already validated.
+                    val fallbackValidated = try {
+                        val currentActive = cm.activeNetwork
+                        if (currentActive == null || currentActive == network) {
+                            false
+                        } else {
+                            val caps = cm.getNetworkCapabilities(currentActive)
+                            caps != null &&
+                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                        }
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    latestCallbackValidated = fallbackValidated
+                    val listenerSnapshot = synchronized(lock) { activeListener }
+                    listenerSnapshot?.invoke(fallbackValidated)
                 }
 
                 override fun onUnavailable() {
+                    latestCallbackValidated = false
                     val listenerSnapshot = synchronized(lock) { activeListener }
                     listenerSnapshot?.invoke(false)
                 }
@@ -163,7 +198,9 @@ class AndroidLiveNetworkMonitor(
                 registeredCallback = null
             }
         }
-        onValidatedChanged(isInternetValidated())
+        val initial = isInternetValidated()
+        latestCallbackValidated = initial
+        onValidatedChanged(initial)
     }
 
     override fun stopMonitoring() {
@@ -173,6 +210,7 @@ class AndroidLiveNetworkMonitor(
             callbackToUnregister = registeredCallback
             registeredCallback = null
             activeListener = null
+            latestCallbackValidated = null
         }
         if (cm != null && callbackToUnregister != null) {
             try {
@@ -181,11 +219,5 @@ class AndroidLiveNetworkMonitor(
                 // Ignore if already unregistered by OS
             }
         }
-    }
-
-    private fun notifyCurrentState() {
-        val validatedNow = isInternetValidated()
-        val listenerSnapshot = synchronized(lock) { activeListener }
-        listenerSnapshot?.invoke(validatedNow)
     }
 }

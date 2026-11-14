@@ -240,6 +240,17 @@ class AndroidAudioHardwareDriver(
                         )
                     )
                 }
+            } finally {
+                try {
+                    if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        recorder.stop()
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    recorder.release()
+                } catch (_: Throwable) {
+                }
             }
         }
 
@@ -250,28 +261,56 @@ class AndroidAudioHardwareDriver(
         captureLoopRunning.set(false)
         val recorder = activeRecorder
         activeRecorder = null
-        if (recorder != null) {
-            try {
-                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    recorder.stop()
-                }
-            } catch (_: Throwable) {
-            }
-            try {
-                recorder.release()
-            } catch (_: Throwable) {
-            }
+        val worker = captureThread
+        captureThread = null
+        worker?.interrupt()
+
+        val isMainThread = try {
+            android.os.Looper.getMainLooper()?.thread === Thread.currentThread()
+        } catch (_: Throwable) {
+            false
         }
-        captureThread?.let { worker ->
-            if (worker != Thread.currentThread()) {
+
+        if (isMainThread) {
+            // Never block the Android UI thread with AudioRecord.stop/release or Thread.join
+            if (recorder != null) {
+                thread(start = true, name = "OmniVoice-AudioCleanup") {
+                    try {
+                        if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                            recorder.stop()
+                        }
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        recorder.release()
+                    } catch (_: Throwable) {
+                    }
+                    abandonAudioFocus()
+                }
+            } else {
+                abandonAudioFocus()
+            }
+        } else {
+            if (recorder != null) {
                 try {
-                    worker.join(150L)
+                    if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        recorder.stop()
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    recorder.release()
+                } catch (_: Throwable) {
+                }
+            }
+            if (worker != null && worker !== Thread.currentThread()) {
+                try {
+                    worker.join(80L)
                 } catch (_: InterruptedException) {
                 }
             }
+            abandonAudioFocus()
         }
-        captureThread = null
-        abandonAudioFocus()
     }
 
     override fun playEphemeralPcm16kHz(
@@ -450,6 +489,10 @@ class AudioCapture(
 
     private val generationSeq = AtomicLong(0L)
 
+    // Generation-bound callback for Phase 04 LIVE_VOICE_TURN 16kHz PCM frame streaming
+    private var liveTurnFrameListenerGen: CaptureGenerationId? = null
+    private var liveTurnFrameListener: ((CaptureGenerationId, ShortArray, Float) -> Unit)? = null
+
     // Bounded in-memory ephemeral PCM buffer (zeroed on deletion/stop)
     private var ephemeralBuffer = ShortArray(MAX_EPHEMERAL_SAMPLES_16KHZ)
     private var ephemeralWriteIndex = 0
@@ -492,11 +535,14 @@ class AudioCapture(
     /**
      * Starts a new capture generation under [owner] and [sessionId].
      * Any previously running capture or ephemeral playback is stopped first.
+     * When [onLiveTurnFrame16kHz] is supplied, each validated 16,000 Hz mono PCM frame for this
+     * exact [CaptureGenerationId] is forwarded to the listener.
      */
     @Synchronized
     fun startCapture(
         owner: AudioOwner,
-        sessionId: SessionId
+        sessionId: SessionId,
+        onLiveTurnFrame16kHz: ((CaptureGenerationId, ShortArray, Float) -> Unit)? = null
     ): CaptureGenerationId {
         require(owner != AudioOwner.NONE) { "AudioOwner must be explicit when starting capture." }
 
@@ -513,6 +559,8 @@ class AudioCapture(
 
         val currentPerm = _state.value.permissionState
         if (currentPerm != MicPermissionState.GRANTED) {
+            liveTurnFrameListenerGen = null
+            liveTurnFrameListener = null
             _state.update {
                 it.copy(
                     owner = AudioOwner.NONE,
@@ -527,6 +575,8 @@ class AudioCapture(
         }
 
         if (!driver.hasMicrophoneDevice()) {
+            liveTurnFrameListenerGen = null
+            liveTurnFrameListener = null
             _state.update {
                 it.copy(
                     hasMicrophoneHardware = false,
@@ -546,6 +596,9 @@ class AudioCapture(
         ephemeralWriteIndex = 0
         deleteEphemeralTempFile()
 
+        liveTurnFrameListenerGen = if (onLiveTurnFrame16kHz != null) newGen else null
+        liveTurnFrameListener = onLiveTurnFrame16kHz
+
         // Activate generation before driver start so synchronous callbacks are recognized
         _state.update {
             it.copy(
@@ -557,8 +610,11 @@ class AudioCapture(
                 capturedFrameCount = 0L,
                 capturedSampleCount = 0L,
                 capturedDurationMs = 0L,
+                nonSilentFrameCount = 0L,
                 currentRmsLinear = 0f,
                 peakRmsLinear = 0f,
+                lastCaptureRmsLinear = 0f,
+                lastCapturePeakRmsLinear = 0f,
                 currentRmsDbfs = -96.0f,
                 consecutiveSilentFrames = 0,
                 anomaly = AudioAnomaly.NONE,
@@ -586,6 +642,8 @@ class AudioCapture(
                 }
             }
             is HardwareStartResult.Failed -> {
+                liveTurnFrameListenerGen = null
+                liveTurnFrameListener = null
                 driver.stopHardwareCapture()
                 _state.update {
                     it.copy(
@@ -629,9 +687,13 @@ class AudioCapture(
                 )
                 val (rmsLinear, rmsDbfs) = PcmResampler.computeRmsMetrics(resampled16k)
                 val isFrameSilent = event.osClientSilenced || rmsLinear <= 1e-5f
+                val isNonSilentVoiceFrame = !event.osClientSilenced && rmsLinear >= 0.008f
 
-                // Buffer into ephemeral self-test clip if armed (bounded to 5s, retention OFF)
-                if (_state.value.ephemeralCheckArmed && resampled16k.isNotEmpty()) {
+                // Buffer into ephemeral self-test clip ONLY for MIC_SELF_TEST (bounded to 5s, retention OFF)
+                if (activeGen.owner == AudioOwner.MIC_SELF_TEST &&
+                    _state.value.ephemeralCheckArmed &&
+                    resampled16k.isNotEmpty()
+                ) {
                     val spaceLeft = MAX_EPHEMERAL_SAMPLES_16KHZ - ephemeralWriteIndex
                     if (spaceLeft > 0) {
                         val toCopy = minOf(spaceLeft, resampled16k.size)
@@ -640,10 +702,22 @@ class AudioCapture(
                     }
                 }
 
+                val listenerToNotify = if (liveTurnFrameListenerGen == activeGen) {
+                    liveTurnFrameListener
+                } else {
+                    null
+                }
+
                 _state.update { current ->
                     val newFrames = current.capturedFrameCount + 1L
                     val newSamples = current.capturedSampleCount + resampled16k.size
                     val newDurationMs = (newSamples * 1000L) / PcmResampler.TARGET_SAMPLE_RATE_HZ
+                    val newNonSilentFrames = if (isNonSilentVoiceFrame) {
+                        current.nonSilentFrameCount + 1L
+                    } else {
+                        current.nonSilentFrameCount
+                    }
+                    val newPeakRms = max(current.peakRmsLinear, rmsLinear)
                     val newSilentStreak = if (isFrameSilent) current.consecutiveSilentFrames + 1 else 0
                     val silenceDetected = event.osClientSilenced ||
                         (newSilentStreak >= ANDROID_SILENCE_FRAME_THRESHOLD)
@@ -660,8 +734,11 @@ class AudioCapture(
                         capturedFrameCount = newFrames,
                         capturedSampleCount = newSamples,
                         capturedDurationMs = newDurationMs,
+                        nonSilentFrameCount = newNonSilentFrames,
                         currentRmsLinear = rmsLinear,
-                        peakRmsLinear = max(current.peakRmsLinear, rmsLinear),
+                        peakRmsLinear = newPeakRms,
+                        lastCaptureRmsLinear = rmsLinear,
+                        lastCapturePeakRmsLinear = newPeakRms,
                         currentRmsDbfs = rmsDbfs,
                         consecutiveSilentFrames = newSilentStreak,
                         anomaly = newAnomaly,
@@ -679,9 +756,16 @@ class AudioCapture(
                         }
                     )
                 }
+
+                if (listenerToNotify != null && resampled16k.isNotEmpty()) {
+                    // Defensive copy before async handoff so sender never shares a mutable buffer
+                    listenerToNotify.invoke(activeGen, resampled16k.copyOf(), rmsLinear)
+                }
             }
 
             is CaptureCallbackEvent.RecorderError -> {
+                liveTurnFrameListenerGen = null
+                liveTurnFrameListener = null
                 driver.stopHardwareCapture()
                 wipeEphemeralAudio("Retention OFF — Ephemeral buffer wiped on recorder error (0 bytes)")
                 _state.update {
@@ -700,6 +784,8 @@ class AudioCapture(
             }
 
             is CaptureCallbackEvent.InterruptionDetected -> {
+                liveTurnFrameListenerGen = null
+                liveTurnFrameListener = null
                 driver.stopHardwareCapture()
                 wipeEphemeralAudio("Retention OFF — Ephemeral buffer wiped on interruption (0 bytes)")
                 _state.update {
@@ -751,6 +837,9 @@ class AudioCapture(
         val prevGen = _state.value.activeGeneration
         val wasCapturingOrPlaying = _state.value.isCapturing || _state.value.isPlayingEphemeralCheck
 
+        liveTurnFrameListenerGen = null
+        liveTurnFrameListener = null
+
         driver.stopHardwareCapture()
         driver.stopEphemeralPlayback()
 
@@ -759,14 +848,20 @@ class AudioCapture(
         }
 
         _state.update { current ->
+            val preservedRms = if (current.peakRmsLinear > 0f) {
+                current.peakRmsLinear
+            } else {
+                current.currentRmsLinear
+            }
             current.copy(
                 owner = AudioOwner.NONE,
                 activeGeneration = null,
                 lastCompletedGeneration = prevGen ?: current.lastCompletedGeneration,
                 isCapturing = false,
                 isPlayingEphemeralCheck = false,
-                currentRmsLinear = 0f,
-                currentRmsDbfs = -96.0f,
+                currentRmsLinear = preservedRms,
+                lastCaptureRmsLinear = current.currentRmsLinear,
+                lastCapturePeakRmsLinear = current.peakRmsLinear,
                 hardwareReleaseCount = if (wasCapturingOrPlaying || prevGen != null) {
                     current.hardwareReleaseCount + 1
                 } else {

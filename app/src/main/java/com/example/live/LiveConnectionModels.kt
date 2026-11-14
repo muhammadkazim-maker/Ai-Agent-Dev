@@ -29,6 +29,22 @@ object LiveConfigConstants {
     val ENDPOINT_FAMILY: LiveEndpointFamily = LiveEndpointFamily.FIREBASE_AI_LOGIC_GOOGLE_AI_V1BETA_BIDI
     val AUTH_ROUTE: LiveAuthRoute = LiveAuthRoute.FIREBASE_AI_LOGIC_MANAGED_APP_CHECK
     const val REGISTERED_ACTION_TOOLS_COUNT: Int = 0
+
+    /**
+     * Single authoritative non-leaking Gemini Live session instruction enforcing language, script,
+     * and conversational style mirroring across English, Urdu, Roman Urdu, and mixed Urdu-English turns.
+     * Strictly configuration-only: forbids self-introductions, forbids repeating/paraphrasing instructions,
+     * and requires silence until a real user turn is captured and committed.
+     */
+    const val AUTHORITATIVE_SYSTEM_INSTRUCTION: String =
+        "Detect the language and script of each spoken user turn and answer directly in that same language, script, and conversational style. " +
+            "If the user speaks English, answer in English. " +
+            "If the user speaks Urdu, answer naturally in Urdu. " +
+            "If the user speaks Roman Urdu, answer naturally in Roman Urdu. " +
+            "If the user mixes Urdu and English, respond using a similar natural mixture. " +
+            "Do not switch to English unless the user requests it or an unavoidable technical term requires it. " +
+            "Directly answer the spoken question without introducing yourself on every turn, without stating your name or persona, and without repeating or paraphrasing system instructions. " +
+            "Remain silent until a real user turn has been spoken and committed. Match the user's requested answer length and tone, keep facts accurate, and do not claim actions that were not completed."
 }
 
 /**
@@ -40,6 +56,19 @@ data class LiveSessionGenerationId(
     val sessionId: SessionId,
     val wireId: String
 )
+
+/**
+ * Strongly-typed per-turn generation identity so callbacks from an older voice turn
+ * can never interrupt or overwrite a newer voice turn.
+ */
+data class TurnGenerationId(
+    val turnSeq: Long,
+    val turnIdValue: String,
+    val sessionId: SessionId
+) {
+    val wireId: String
+        get() = "tgen-${turnSeq.toString().padStart(4, '0')}-$turnIdValue"
+}
 
 /**
  * Explicit connection lifecycle phases required for Phase 03.
@@ -193,6 +222,38 @@ sealed interface LiveSocketCallbackEvent {
         override val generationId: LiveSessionGenerationId,
         val reason: String
     ) : LiveSocketCallbackEvent
+
+    data class ServerAudioChunkReceived(
+        override val generationId: LiveSessionGenerationId,
+        val mimeType: String?,
+        val pcmBytes: ByteArray
+    ) : LiveSocketCallbackEvent {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is ServerAudioChunkReceived) return false
+            return generationId == other.generationId &&
+                mimeType == other.mimeType &&
+                pcmBytes.contentEquals(other.pcmBytes)
+        }
+
+        override fun hashCode(): Int {
+            var result = generationId.hashCode()
+            result = 31 * result + (mimeType?.hashCode() ?: 0)
+            result = 31 * result + pcmBytes.contentHashCode()
+            return result
+        }
+    }
+
+    data class ServerTurnCompleted(
+        override val generationId: LiveSessionGenerationId,
+        val interrupted: Boolean = false
+    ) : LiveSocketCallbackEvent
+
+    data class ServerTranscriptionReceived(
+        override val generationId: LiveSessionGenerationId,
+        val inputTranscript: String?,
+        val outputTranscript: String?
+    ) : LiveSocketCallbackEvent
 }
 
 /**
@@ -213,8 +274,10 @@ data class RedactedLiveDiagnostics(
     val lastBackoffDelayMs: Long = 0L,
     val staleCallbacksDropped: Int = 0,
     val handshakeVerified: Boolean = false,
+    val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: Int = LiveConfigConstants.REGISTERED_ACTION_TOOLS_COUNT,
+    val systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
     val redactedSummary: String = "Live adapter initialized. No credentials in APK/logs. Audio playback not claimed in Phase 03."
 )
 
@@ -226,6 +289,7 @@ data class LiveConnectionState(
     val activeGeneration: LiveSessionGenerationId? = null,
     val lastCompletedGeneration: LiveSessionGenerationId? = null,
     val configuredModelId: String = LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID,
+    val systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
     val failureClassification: LiveFailureClassification = LiveFailureClassification.NONE,
     val isInternetValidated: Boolean = true,
     val attemptCount: Int = 0,
@@ -234,6 +298,7 @@ data class LiveConnectionState(
     val lastBackoffDelayMs: Long = 0L,
     val staleSocketCallbacksDropped: Int = 0,
     val handshakeVerified: Boolean = false,
+    val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: BooleanOrIntCount = 0,
     val autoRetryStoppedReason: String? = null,

@@ -203,42 +203,45 @@ private fun MicSetupTopBar(
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
+                IconButton(
+                    onClick = onNavigateBack,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("mic_setup_back_button")
                 ) {
-                    IconButton(
-                        onClick = onNavigateBack,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("mic_setup_back_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Return to Conversation Shell and release hardware",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    Column {
-                        Text(
-                            text = stringResource(R.string.mic_setup_title),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "OWNER: ${audioState.owner.wireLabel} • GEN: ${audioState.activeGeneration?.wireId ?: "NONE"}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.testTag("mic_owner_gen_label")
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Return to Conversation Shell and release hardware",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
                 }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.mic_setup_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        text = "OWNER: ${audioState.owner.wireLabel} • GEN: ${audioState.activeGeneration?.wireId ?: "NONE"}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("mic_owner_gen_label")
+                    )
+                }
+            }
 
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 PermissionStateBadge(permissionState = audioState.permissionState)
             }
 

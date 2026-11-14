@@ -14,7 +14,8 @@ import kotlin.math.sqrt
 enum class AudioOwner(val wireLabel: String) {
     NONE("NONE"),
     SHELL_CONVERSATION("SHELL_CONVERSATION"),
-    MIC_SELF_TEST("MIC_SELF_TEST")
+    MIC_SELF_TEST("MIC_SELF_TEST"),
+    LIVE_VOICE_TURN("LIVE_VOICE_TURN")
 }
 
 /**
@@ -177,6 +178,37 @@ object PcmResampler {
         }
         return rmsLinear to rmsDbfs
     }
+
+    /**
+     * Encodes 16-bit mono PCM samples into little-endian byte array (`audio/pcm;rate=16000`).
+     */
+    fun shortsToLittleEndianBytes(samples: ShortArray): ByteArray {
+        if (samples.isEmpty()) return ByteArray(0)
+        val bytes = ByteArray(samples.size * 2)
+        var byteIndex = 0
+        for (sample in samples) {
+            val v = sample.toInt()
+            bytes[byteIndex++] = (v and 0xFF).toByte()
+            bytes[byteIndex++] = ((v ushr 8) and 0xFF).toByte()
+        }
+        return bytes
+    }
+
+    /**
+     * Decodes little-endian 16-bit mono PCM bytes into [ShortArray].
+     */
+    fun littleEndianBytesToShorts(bytes: ByteArray): ShortArray {
+        val sampleCount = bytes.size / 2
+        if (sampleCount <= 0) return ShortArray(0)
+        val samples = ShortArray(sampleCount)
+        var byteIndex = 0
+        for (i in 0 until sampleCount) {
+            val low = bytes[byteIndex++].toInt() and 0xFF
+            val high = bytes[byteIndex++].toInt()
+            samples[i] = ((high shl 8) or low).toShort()
+        }
+        return samples
+    }
 }
 
 /**
@@ -196,8 +228,11 @@ data class AudioCaptureState(
     val capturedFrameCount: Long = 0L,
     val capturedSampleCount: Long = 0L,
     val capturedDurationMs: Long = 0L,
+    val nonSilentFrameCount: Long = 0L,
     val currentRmsLinear: Float = 0f,
     val peakRmsLinear: Float = 0f,
+    val lastCaptureRmsLinear: Float = 0f,
+    val lastCapturePeakRmsLinear: Float = 0f,
     val currentRmsDbfs: Float = -96.0f,
     val consecutiveSilentFrames: Int = 0,
     val anomaly: AudioAnomaly = AudioAnomaly.NONE,

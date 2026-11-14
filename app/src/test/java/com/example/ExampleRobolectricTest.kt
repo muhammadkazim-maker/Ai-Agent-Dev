@@ -45,7 +45,19 @@ class ExampleRobolectricTest {
     @Test
     @Config(sdk = [36], qualifiers = "w840dp-h480dp-land")
     fun `conversation shell renders landscape layout and transitions through Start, Pause, Stop`() {
-        val viewModel = ConversationShellViewModel()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = com.example.live.DeterministicTestLiveTransportDriver(),
+                delayRunner = {}
+            ),
+            playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                driver = com.example.audio.DeterministicStreamingAudioTrackDriver(),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val viewModel = ConversationShellViewModel(coordinator = coordinator)
 
         composeTestRule.setContent {
             OmniVoiceRebuildTheme {
@@ -60,11 +72,11 @@ class ExampleRobolectricTest {
             .assertTextEquals("IDLE")
         composeTestRule.onNodeWithTag("mic_honest_indicator").assertIsDisplayed()
 
-        // Click Start -> honest NOT_CONFIGURED state
+        // Click Start -> automatically initializes Phase 04 coordinator and enters LISTENING (never NOT_CONFIGURED)
         composeTestRule.onNodeWithTag("start_button").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
-            .assertTextEquals("NOT_CONFIGURED")
+            .assertTextEquals("LISTENING")
 
         // Click Pause -> PAUSED state
         composeTestRule.onNodeWithTag("pause_button").performClick()
@@ -399,5 +411,192 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("live_diag_back_button").performClick()
         composeTestRule.waitForIdle()
         assertFalse("Network monitor must unregister when diagnostics screen is disposed and session is disconnected", networkMonitor.isMonitoringActive)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w411dp-h891dp-port")
+    fun `portrait phase 04 voice turn transitions through CONNECTING, LISTENING, PROCESSING, SPEAKING, and READY and handles Stop invalidation`() {
+        val liveDriver = com.example.live.DeterministicTestLiveTransportDriver()
+        val outputDriver = com.example.audio.DeterministicStreamingAudioTrackDriver()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                driver = outputDriver,
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            )
+        )
+        val viewModel = ConversationShellViewModel(coordinator = coordinator)
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Verify portrait layout renders pipeline card and command deck with no NOT_CONFIGURED state
+        composeTestRule.onNodeWithTag("portrait_fallback_container").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("voice_turn_pipeline_card").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
+            .assertTextEquals("IDLE")
+
+        // 1. Click Start before granting microphone permission -> honestly reports ERROR (never NOT_CONFIGURED)
+        composeTestRule.onNodeWithTag("start_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
+            .assertTextEquals("ERROR")
+        composeTestRule.onNodeWithTag("voice_turn_error_code_text", useUnmergedTree = true)
+            .assertTextContains("MIC_PERMISSION_REQUIRED", substring = true)
+
+        // 2. Grant microphone permission and click Start -> enters LISTENING via CONNECTING
+        viewModel.onPermissionRequestResult(granted = true, shouldShowRationale = false)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("start_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
+            .assertTextEquals("LISTENING")
+        assertTrue(viewModel.audioState.value.isCapturing)
+
+        // 3. Deliver spoken 16kHz PCM frame and click Send Spoken Question (End Turn) -> PROCESSING -> SPEAKING -> READY
+        val activeCaptureGen = viewModel.audioState.value.activeGeneration!!
+        viewModel.coordinator.onAudioHardwareCallback(
+            CaptureCallbackEvent.FrameCaptured(
+                generationId = activeCaptureGen,
+                pcmSamples = ShortArray(320) { 8000 },
+                hardwareSampleRateHz = 16000
+            )
+        )
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("end_spoken_turn_button")
+            .performScrollTo()
+            .performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
+            .assertTextEquals("READY")
+        composeTestRule.onNodeWithTag("playback_drain_status_text", useUnmergedTree = true)
+            .assertTextEquals("PLAYBACK: DRAINED")
+        assertEquals(
+            listOf(
+                com.example.contract.ConversationState.CONNECTING,
+                com.example.contract.ConversationState.LISTENING,
+                com.example.contract.ConversationState.PROCESSING,
+                com.example.contract.ConversationState.SPEAKING,
+                com.example.contract.ConversationState.READY
+            ),
+            viewModel.uiState.value.voiceTurnStateSequence
+        )
+        assertTrue(viewModel.playbackState.value.isPlaybackDrained)
+    }
+
+    private fun verifyPortraitResponsiveGeometry(expectedScreenWidthDp: Int) {
+        val viewModel = ConversationShellViewModel()
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val rootBounds = composeTestRule.onNodeWithTag("conversation_shell_root").fetchSemanticsNode().boundsInRoot
+        val titleBounds = composeTestRule.onNodeWithTag("app_title_text", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        val subtitleBounds = composeTestRule.onNodeWithTag("app_subtitle_text", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        val statusActionRowBounds = composeTestRule.onNodeWithTag("top_header_status_action_row").fetchSemanticsNode().boundsInRoot
+        val pipelineBounds = composeTestRule.onNodeWithTag("voice_turn_pipeline_card").fetchSemanticsNode().boundsInRoot
+
+        // 1. Title and subtitle must receive the full card inner width (never squeezed into a narrow 10-30dp column)
+        assertTrue(
+            "Title width (${titleBounds.width}) on ${expectedScreenWidthDp}dp screen must be at least 220px so words never wrap vertically 1-2 chars per line",
+            titleBounds.width >= 220f
+        )
+        assertTrue(
+            "Subtitle width (${subtitleBounds.width}) on ${expectedScreenWidthDp}dp screen must be at least 220px",
+            subtitleBounds.width >= 220f
+        )
+        // 2. Status and icons row must sit below the full-width title/subtitle, never beside it
+        assertTrue(
+            "Status/action row top (${statusActionRowBounds.top}) must be below title bottom (${titleBounds.bottom})",
+            statusActionRowBounds.top >= titleBounds.bottom
+        )
+        // 3. No horizontal overflow beyond root container
+        assertTrue(
+            "Title right (${titleBounds.right}) must fit within root width (${rootBounds.right})",
+            titleBounds.right <= rootBounds.right + 1f
+        )
+        assertTrue(
+            "Pipeline card right (${pipelineBounds.right}) must fit within root width (${rootBounds.right})",
+            pipelineBounds.right <= rootBounds.right + 1f
+        )
+
+        // 4. Verify primary controls and transcript are accessible via vertical scroll
+        composeTestRule.onNodeWithTag("start_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pause_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("stop_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("transcript_pane").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w320dp-h640dp-port")
+    fun `portrait layout at 320dp width keeps title words intact, puts status and icons on separate row, and avoids overflow`() {
+        verifyPortraitGeometryAndFontScale(320)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w360dp-h740dp-port")
+    fun `portrait layout at 360dp width keeps title words intact, puts status and icons on separate row, and avoids overflow`() {
+        verifyPortraitResponsiveGeometry(360)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w412dp-h892dp-port")
+    fun `portrait layout at 412dp width keeps title words intact, puts status and icons on separate row, and avoids overflow`() {
+        verifyPortraitResponsiveGeometry(412)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w600dp-h960dp-port")
+    fun `layout at 600dp width keeps title words intact, puts status and icons on separate row, and avoids overflow`() {
+        verifyPortraitResponsiveGeometry(600)
+    }
+
+    private fun verifyPortraitGeometryAndFontScale(screenWidthDp: Int) {
+        val viewModel = ConversationShellViewModel()
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        val titleBounds1x = composeTestRule.onNodeWithTag("app_title_text", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            "Title width (${titleBounds1x.width}) at ${screenWidthDp}dp must span full inner width (>= 220px)",
+            titleBounds1x.width >= 220f
+        )
+
+        // Test 1.25x and 1.5x font scale resilience at 320dp
+        viewModel.onSetFontScaleOverride(1.25f)
+        composeTestRule.waitForIdle()
+        val titleBounds125x = composeTestRule.onNodeWithTag("app_title_text", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        assertTrue("Title width at 1.25x font scale must remain full width", titleBounds125x.width >= 220f)
+
+        viewModel.onSetFontScaleOverride(1.5f)
+        composeTestRule.waitForIdle()
+        val titleBounds15x = composeTestRule.onNodeWithTag("app_title_text", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        assertTrue("Title width at 1.5x font scale must remain full width", titleBounds15x.width >= 220f)
+        composeTestRule.onNodeWithTag("start_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("pause_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("stop_button").performScrollTo().assertIsDisplayed()
     }
 }

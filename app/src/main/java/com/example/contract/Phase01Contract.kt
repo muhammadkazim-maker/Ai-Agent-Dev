@@ -62,10 +62,11 @@ class ContractIdGenerator(
 }
 
 /**
- * Real, honest conversation states for Phase 01, Phase 02, and Phase 03.
- * Start transitions to [NOT_CONFIGURED] because full voice-turn streaming and audio playback
- * are intentionally deferred in Phase 03 (Phase 03 verifies the Gemini Live WebSocket
- * handshake and diagnostics only, without claiming audio playback).
+ * Real, honest conversation states for Phase 01 through Phase 04.
+ * When required Phase 02 (`AudioCapture`) and Phase 03 (`GeminiLiveConnectionAdapter`) adapters
+ * are configured, `Start` initializes the Phase 04 one-turn voice pipeline:
+ * `CONNECTING -> LISTENING -> PROCESSING -> SPEAKING -> READY` (or `ERROR` if a real prerequisite fails).
+ * [NOT_CONFIGURED] is only shown if required adapters are explicitly absent.
  */
 enum class ConversationState(
     val wireLabel: String,
@@ -75,22 +76,52 @@ enum class ConversationState(
     IDLE(
         wireLabel = "IDLE",
         badgeTitle = "IDLE",
-        summary = "Coordinator initialized. Awaiting operator command, Microphone Self-Test, or Gemini Live Handshake check."
+        summary = "Coordinator initialized. Press Start to begin a verified Gemini Live native-audio voice turn."
+    ),
+    CONNECTING(
+        wireLabel = "CONNECTING",
+        badgeTitle = "CONNECTING",
+        summary = "Verifying microphone & validated internet and connecting authenticated Gemini Live session..."
+    ),
+    LISTENING(
+        wireLabel = "LISTENING",
+        badgeTitle = "LISTENING",
+        summary = "Capturing one spoken question at 16kHz PCM mono and streaming to Gemini Live..."
+    ),
+    PROCESSING(
+        wireLabel = "PROCESSING",
+        badgeTitle = "PROCESSING",
+        summary = "Spoken question sent with end-of-turn signal. Awaiting Gemini Live native-audio response..."
+    ),
+    SPEAKING(
+        wireLabel = "SPEAKING",
+        badgeTitle = "SPEAKING",
+        summary = "Streaming Gemini native-audio PCM response through Android AudioTrack hardware until playback drains..."
+    ),
+    READY(
+        wireLabel = "READY",
+        badgeTitle = "READY",
+        summary = "Voice turn completed and hardware playback fully drained. Ready for the next spoken turn."
+    ),
+    ERROR(
+        wireLabel = "ERROR",
+        badgeTitle = "ERROR",
+        summary = "Prerequisite or runtime error encountered during voice turn. Inspect exact error classification below."
     ),
     NOT_CONFIGURED(
         wireLabel = "NOT_CONFIGURED",
         badgeTitle = "NOT_CONFIGURED",
-        summary = "Honest state: Voice-turn audio playback & tool execution are not claimed in Phase 03. Use Live Connection & Diagnostics to verify the Gemini Live WebSocket handshake, or Microphone Setup for local PCM check."
+        summary = "Honest state: Voice turn adapters are explicitly unconfigured in this instance."
     ),
     PAUSED(
         wireLabel = "PAUSED",
         badgeTitle = "PAUSED",
-        summary = "Session paused by operator. Active audio capture and live socket released; Pause precedence active."
+        summary = "Session paused by operator. Active audio capture, playback, and live socket released; Pause precedence active."
     ),
     STOPPED(
         wireLabel = "STOPPED",
         badgeTitle = "STOPPED",
-        summary = "Session halted; audio hardware and live socket immediately released. Stop holds highest precedence."
+        summary = "Session halted; microphone capture, model turn, and queued playback immediately cancelled. Stop holds highest precedence."
     )
 }
 
@@ -98,7 +129,7 @@ enum class ConversationState(
  * Operator or system commands dispatched through the single [com.example.coordinator.ConversationCoordinator].
  */
 enum class CoordinatorCommand(val priority: Int) {
-    /** Highest precedence (priority 100): immediately halts any state, closes live socket, releases hardware, and wipes ephemeral buffers. */
+    /** Highest precedence (priority 100): immediately halts any state, cancels mic capture, model turn & queued playback, and closes live socket. */
     STOP(priority = 100),
 
     /** Stops an active local microphone self-test and releases hardware (priority 90). */
@@ -107,8 +138,11 @@ enum class CoordinatorCommand(val priority: Int) {
     /** Disconnects any active or connecting Gemini Live WebSocket session (priority 80). */
     DISCONNECT_LIVE_SESSION(priority = 80),
 
-    /** Second precedence (priority 50): preempts Start/capture/live states unless Stopped, and releases active capture & live socket. */
+    /** Second precedence (priority 50): preempts Start/capture/live states unless Stopped, and releases active capture, playback & live socket. */
     PAUSE(priority = 50),
+
+    /** Signals end of spoken question during LISTENING so the turn transitions to PROCESSING -> SPEAKING -> READY (priority 30). */
+    END_SPOKEN_TURN(priority = 30),
 
     /** Initiates or records a Gemini Live handshake verification attempt (priority 25). */
     CONNECT_LIVE_SESSION(priority = 25),
@@ -119,7 +153,7 @@ enum class CoordinatorCommand(val priority: Int) {
     /** Plays and immediately deletes the ephemeral self-test recording (priority 15). */
     PLAY_EPHEMERAL_CHECK(priority = 15),
 
-    /** Normal precedence (priority 10): requests full voice conversation turn (transitions to NOT_CONFIGURED in Phase 01–03 because audio playback is not claimed yet). */
+    /** Normal precedence (priority 10): automatically initializes and runs a Phase 04 one-turn Gemini Live native-audio conversation turn. */
     START(priority = 10),
 
     /** Resets shell state back to IDLE with a fresh SessionId and releases any held audio hardware and live socket. */
@@ -158,6 +192,30 @@ sealed interface VerifiedOutcome {
     ) : VerifiedOutcome {
         override val code: String = "HONEST_NOT_CONFIGURED"
     }
+
+    data class PrerequisiteFailureOutcome(
+        override val actionId: ActionId,
+        override val sessionId: SessionId,
+        override val turnId: TurnId,
+        override val resultingState: ConversationState = ConversationState.ERROR,
+        val failureCode: String,
+        override val detail: String
+    ) : VerifiedOutcome {
+        override val code: String = failureCode
+    }
+
+    data class VoiceTurnOutcome(
+        override val actionId: ActionId,
+        override val sessionId: SessionId,
+        override val turnId: TurnId,
+        override val resultingState: ConversationState,
+        val stateSequence: List<ConversationState>,
+        val micFramesSent: Long,
+        val playbackFramesDrained: Long,
+        val isPlaybackDrained: Boolean,
+        override val code: String,
+        override val detail: String
+    ) : VerifiedOutcome
 
     data class PreemptedByPrecedence(
         override val actionId: ActionId,
