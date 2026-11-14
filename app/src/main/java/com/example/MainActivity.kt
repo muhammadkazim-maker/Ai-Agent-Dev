@@ -52,6 +52,7 @@ class MainActivity : ComponentActivity() {
                     audioCapture = audioCapture,
                     liveAdapter = liveAdapter,
                     playbackAdapter = playbackAdapter,
+                    preferencesStore = com.example.coordinator.SharedPreferencesConversationPreferencesStore(appContext),
                     backgroundDispatcher = Dispatchers.IO
                 )
                 return ConversationShellViewModel(

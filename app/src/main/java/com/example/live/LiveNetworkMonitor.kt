@@ -120,6 +120,7 @@ class AndroidLiveNetworkMonitor(
 
     override fun startMonitoring(onValidatedChanged: (Boolean) -> Unit) {
         val cm = connectivityManager
+        val initial: Boolean
         synchronized(lock) {
             activeListener = onValidatedChanged
             if (cm == null) {
@@ -133,19 +134,34 @@ class AndroidLiveNetworkMonitor(
                 return
             }
 
+            initial = isInternetValidated()
+            latestCallbackValidated = initial
+
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     val validated = try {
                         val caps = cm.getNetworkCapabilities(network)
-                        caps != null &&
+                        val capsValidated = caps != null &&
                             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                        capsValidated || isInternetValidated()
                     } catch (_: Throwable) {
-                        false
+                        isInternetValidated()
                     }
-                    latestCallbackValidated = validated
-                    val listenerSnapshot = synchronized(lock) { activeListener }
-                    listenerSnapshot?.invoke(validated)
+                    // On initial callback registration while already online, ignore transient false
+                    // before onCapabilitiesChanged settles; rely on onLost / onCapabilitiesChanged for drops.
+                    if (!validated && latestCallbackValidated == true && isInternetValidated()) {
+                        return
+                    }
+                    val changed = synchronized(lock) {
+                        val prev = latestCallbackValidated
+                        latestCallbackValidated = validated
+                        prev != validated
+                    }
+                    if (changed || !validated) {
+                        val listenerSnapshot = synchronized(lock) { activeListener }
+                        listenerSnapshot?.invoke(validated)
+                    }
                 }
 
                 override fun onCapabilitiesChanged(
@@ -198,8 +214,6 @@ class AndroidLiveNetworkMonitor(
                 registeredCallback = null
             }
         }
-        val initial = isInternetValidated()
-        latestCallbackValidated = initial
         onValidatedChanged(initial)
     }
 

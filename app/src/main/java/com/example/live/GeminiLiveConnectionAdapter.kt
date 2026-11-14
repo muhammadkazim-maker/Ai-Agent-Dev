@@ -27,14 +27,19 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.nio.channels.ClosedChannelException
 import java.nio.channels.UnresolvedAddressException
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLException
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -42,10 +47,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 
 /**
  * Typed outcome of a single Gemini Live socket handshake attempt.
@@ -77,6 +87,10 @@ interface LiveTransportDriver {
         systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
     ): LiveHandshakeResult
 
+    suspend fun sendStartOfSpokenTurn(
+        generationId: LiveSessionGenerationId
+    ): Boolean = true
+
     suspend fun sendRealtimeAudioChunk(
         generationId: LiveSessionGenerationId,
         pcm16kHzBytes: ByteArray,
@@ -92,6 +106,10 @@ interface LiveTransportDriver {
     ): Boolean = true
 
     fun closeSocket(generationId: LiveSessionGenerationId?)
+
+    suspend fun closeAndAwaitSocket(generationId: LiveSessionGenerationId?) {
+        closeSocket(generationId)
+    }
 }
 
 /**
@@ -113,10 +131,20 @@ object LiveExceptionClassifier {
         throwable: Throwable,
         isInternetValidated: Boolean = true
     ): LiveFailureClassification {
-        val causeChain = generateSequence(throwable) { it.cause }.take(12).toList()
+        val visited = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+        val allNodes = ArrayList<Throwable>(12)
+        val queue = ArrayDeque<Throwable>()
+        queue.addLast(throwable)
+        while (queue.isNotEmpty() && allNodes.size < 16) {
+            val node = queue.removeFirst()
+            if (!visited.add(node)) continue
+            allNodes.add(node)
+            node.cause?.let { queue.addLast(it) }
+            node.suppressedExceptions.forEach { queue.addLast(it) }
+        }
 
         // 1. Cooperative cancellation (excluding TimeoutCancellationException which is a network/handshake timeout)
-        if (causeChain.any { it is CancellationException && it !is TimeoutCancellationException }) {
+        if (allNodes.any { it is CancellationException && it !is TimeoutCancellationException }) {
             return LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE
         }
 
@@ -125,72 +153,135 @@ object LiveExceptionClassifier {
             return LiveFailureClassification.NETWORK_ERROR
         }
 
-        // 3. Inspect every node in the cause chain for network, DNS, timeout, or socket/IO failures FIRST
-        // so that IOExceptions or UnresolvedAddressExceptions wrapped inside Firebase/AppCheck exceptions
-        // are never mislabeled as BAD_CREDENTIALS_OR_APP_CHECK.
-        if (causeChain.any { isNetworkOrIoThrowable(it) }) {
+        // 3. Hard transport/DNS/timeout/socket errors anywhere in the chain MUST remain NETWORK_ERROR
+        // (even if wrapped inside Firebase/AppCheck exceptions like AppCheck -> UnknownHostException).
+        if (allNodes.any { isDirectDnsTimeoutOrConnectFailure(it) }) {
             return LiveFailureClassification.NETWORK_ERROR
         }
 
-        val combinedLower = causeChain.joinToString(" | ") { node ->
+        val combinedLower = allNodes.joinToString(" | ") { node ->
             "${node::class.simpleName ?: "Exception"}: ${node.message ?: ""}"
         }.lowercase()
 
-        // 4. Check for explicit HTTP 400/404 or unsupported model/endpoint
-        if (hasHttpStatusCode(combinedLower, 404) ||
-            hasHttpStatusCode(combinedLower, 400) ||
-            combinedLower.contains("not_found") ||
-            combinedLower.contains("not found") ||
-            combinedLower.contains("unsupported model") ||
-            combinedLower.contains("model is not supported") ||
-            combinedLower.contains("is not found for api version") ||
-            combinedLower.contains("invalid_argument")
-        ) {
-            return LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT
-        }
-
-        // 5. Check for explicit HTTP 429 or quota exhaustion
-        if (hasHttpStatusCode(combinedLower, 429) ||
-            combinedLower.contains("resource_exhausted") ||
-            combinedLower.contains("quota") ||
-            combinedLower.contains("rate limit") ||
-            combinedLower.contains("too many requests")
-        ) {
-            return LiveFailureClassification.QUOTA_EXHAUSTED
-        }
-
-        // 6. Check for actual HTTP 401/403 or explicit App Check / credential rejection while internet is validated
-        if (hasHttpStatusCode(combinedLower, 401) ||
-            hasHttpStatusCode(combinedLower, 403) ||
-            combinedLower.contains("unauthenticated") ||
-            combinedLower.contains("permission_denied") ||
-            combinedLower.contains("permission denied") ||
-            combinedLower.contains("api_key_invalid") ||
-            combinedLower.contains("invalid api key") ||
-            combinedLower.contains("bad_credentials") ||
-            combinedLower.contains("firebaseapp is not initialized") ||
-            combinedLower.contains("blocked_prerequisite_unconfigured") ||
-            combinedLower.contains("needs_setup") ||
-            combinedLower.contains("app check") ||
-            combinedLower.contains("appcheck") ||
-            combinedLower.contains("attestation")
-        ) {
+        // 4. Explicit HTTP 401/403 or App Check / credential rejection while internet is validated
+        if (hasAuthOrAppCheckIndicator(combinedLower)) {
             return LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK
         }
 
-        // 7. Default unrecognized transport/runtime errors to NETWORK_ERROR (never default to auth failure)
+        // 5. Explicit HTTP 429 or quota exhaustion / WebSocket try-again-later (1013)
+        if (hasQuotaIndicator(combinedLower)) {
+            return LiveFailureClassification.QUOTA_EXHAUSTED
+        }
+
+        // 6. Explicit HTTP 400/404, unsupported model/endpoint, or WebSocket protocol error (1002/1003/1008)
+        if (hasUnsupportedModelOrProtocolIndicator(combinedLower)) {
+            return LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT
+        }
+
+        // 7. Remaining validated-network socket/channel/IO interruptions (e.g. ClosedReceiveChannelException, EOF, 502/503/504)
+        if (allNodes.any { isNetworkOrIoThrowable(it) }) {
+            return LiveFailureClassification.NETWORK_ERROR
+        }
+
+        // 8. Default unrecognized runtime transport failures to NETWORK_ERROR (never default to auth failure)
         return LiveFailureClassification.NETWORK_ERROR
     }
 
-    private fun isNetworkOrIoThrowable(node: Throwable): Boolean {
+    fun classifyCloseReason(
+        reason: String,
+        isInternetValidated: Boolean = true
+    ): LiveFailureClassification {
+        if (!isInternetValidated) {
+            return LiveFailureClassification.NETWORK_ERROR
+        }
+        val lower = reason.lowercase()
+        return when {
+            lower.contains("cancel") || lower.contains("operator_stop") || lower.contains("operator_pause") ->
+                LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE
+            hasAuthOrAppCheckIndicator(lower) ->
+                LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK
+            hasQuotaIndicator(lower) ->
+                LiveFailureClassification.QUOTA_EXHAUSTED
+            hasUnsupportedModelOrProtocolIndicator(lower) ->
+                LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT
+            else ->
+                LiveFailureClassification.NETWORK_ERROR
+        }
+    }
+
+    private fun hasAuthOrAppCheckIndicator(text: String): Boolean {
+        return hasHttpStatusCode(text, 401) ||
+            hasHttpStatusCode(text, 403) ||
+            text.contains("unauthenticated") ||
+            text.contains("permission_denied") ||
+            text.contains("permission denied") ||
+            text.contains("api_key_invalid") ||
+            text.contains("invalid api key") ||
+            text.contains("bad_credentials") ||
+            text.contains("firebaseapp is not initialized") ||
+            text.contains("blocked_prerequisite_unconfigured") ||
+            text.contains("needs_setup") ||
+            text.contains("app check") ||
+            text.contains("appcheck") ||
+            text.contains("attestation")
+    }
+
+    private fun hasQuotaIndicator(text: String): Boolean {
+        return hasHttpStatusCode(text, 429) ||
+            hasWebSocketCloseCode(text, 1013) ||
+            text.contains("resource_exhausted") ||
+            text.contains("quota") ||
+            text.contains("rate limit") ||
+            text.contains("too many requests")
+    }
+
+    private fun hasUnsupportedModelOrProtocolIndicator(text: String): Boolean {
+        return hasHttpStatusCode(text, 404) ||
+            hasHttpStatusCode(text, 400) ||
+            hasWebSocketCloseCode(text, 1002) ||
+            hasWebSocketCloseCode(text, 1003) ||
+            hasWebSocketCloseCode(text, 1008) ||
+            text.contains("not_found") ||
+            text.contains("not found") ||
+            text.contains("unsupported model") ||
+            text.contains("model is not supported") ||
+            text.contains("is not found for api version") ||
+            text.contains("invalid_argument") ||
+            text.contains("protocol error") ||
+            text.contains("unsupported protocol") ||
+            text.contains("policy violation")
+    }
+
+    private fun isDirectDnsTimeoutOrConnectFailure(node: Throwable): Boolean {
         if (node is TimeoutCancellationException ||
             node is UnknownHostException ||
             node is UnresolvedAddressException ||
             node is SocketTimeoutException ||
             node is ConnectException ||
             node is NoRouteToHostException ||
+            node is SSLException
+        ) {
+            return true
+        }
+        val classAndMsg = "${node::class.simpleName ?: ""} ${node.message ?: ""}".lowercase()
+        return classAndMsg.contains("unknownhost") ||
+            classAndMsg.contains("unresolvedaddress") ||
+            classAndMsg.contains("unable to resolve host") ||
+            classAndMsg.contains("no address associated with hostname") ||
+            classAndMsg.contains("eai_nodata") ||
+            classAndMsg.contains("enetunreach") ||
+            classAndMsg.contains("ehostunreach") ||
+            classAndMsg.contains("network is unreachable") ||
+            classAndMsg.contains("httprequesttimeout") ||
+            classAndMsg.contains("connecttimeout") ||
+            classAndMsg.contains("sockettimeout") ||
+            classAndMsg.contains("deadline exceeded") ||
+            classAndMsg.contains("connection refused")
+    }
+
+    private fun isNetworkOrIoThrowable(node: Throwable): Boolean {
+        if (isDirectDnsTimeoutOrConnectFailure(node) ||
             node is SocketException ||
-            node is SSLException ||
             node is EOFException ||
             node is InterruptedIOException ||
             node is ClosedChannelException
@@ -200,28 +291,14 @@ object LiveExceptionClassifier {
 
         val classAndMsg = "${node::class.simpleName ?: ""} ${node.message ?: ""}".lowercase()
 
-        // Explicit network, DNS, Ktor channel, timeout, or socket indicators
-        if (classAndMsg.contains("unknownhost") ||
-            classAndMsg.contains("unresolvedaddress") ||
-            classAndMsg.contains("unable to resolve host") ||
-            classAndMsg.contains("no address associated with hostname") ||
-            classAndMsg.contains("eai_nodata") ||
-            classAndMsg.contains("enetunreach") ||
-            classAndMsg.contains("ehostunreach") ||
-            classAndMsg.contains("network is unreachable") ||
-            classAndMsg.contains("network_error") ||
+        if (classAndMsg.contains("network_error") ||
             classAndMsg.contains("network error") ||
             classAndMsg.contains("network_unavailable") ||
             classAndMsg.contains("no internet") ||
             classAndMsg.contains("offline") ||
             classAndMsg.contains("timed out") ||
             classAndMsg.contains("timeout") ||
-            classAndMsg.contains("httprequesttimeout") ||
-            classAndMsg.contains("connecttimeout") ||
-            classAndMsg.contains("sockettimeout") ||
-            classAndMsg.contains("deadline exceeded") ||
             classAndMsg.contains("connection reset") ||
-            classAndMsg.contains("connection refused") ||
             classAndMsg.contains("connection abort") ||
             classAndMsg.contains("software caused connection abort") ||
             classAndMsg.contains("broken pipe") ||
@@ -230,6 +307,8 @@ object LiveExceptionClassifier {
             classAndMsg.contains("closedsendchannel") ||
             classAndMsg.contains("unexpected end of stream") ||
             classAndMsg.contains("websocket eof") ||
+            hasWebSocketCloseCode(classAndMsg, 1006) ||
+            hasWebSocketCloseCode(classAndMsg, 1011) ||
             hasHttpStatusCode(classAndMsg, 502) ||
             hasHttpStatusCode(classAndMsg, 503) ||
             hasHttpStatusCode(classAndMsg, 504)
@@ -256,6 +335,13 @@ object LiveExceptionClassifier {
     private fun hasHttpStatusCode(text: String, code: Int): Boolean {
         val pattern = Regex(
             """(?i)(?:\bhttp(?:/\d(?:\.\d)?)?\s+$code\b|\b(?:status|code|error|response)(?:\s+code)?[\s:=]+$code\b|\bfailed\s+with\s+$code\b|\bwebsocket\s+$code\b|\b$code\s+(?:unauthorized|forbidden|bad\s+request|not\s+found|too\s+many\s+requests|bad\s+gateway|service\s+unavailable|gateway\s+timeout)\b|[\(\[]$code[\)\]])"""
+        )
+        return pattern.containsMatchIn(text)
+    }
+
+    private fun hasWebSocketCloseCode(text: String, code: Int): Boolean {
+        val pattern = Regex(
+            """(?i)(?:\bclose(?:\s+code|\s+reason)?[\s:=]+$code\b|\bwebsocket[\s:=]+$code\b|\bcode[\s:=]+$code\b|[\(\[]$code[\)\]])"""
         )
         return pattern.containsMatchIn(text)
     }
@@ -290,19 +376,89 @@ object LiveExceptionClassifier {
 @OptIn(PublicPreviewAPI::class)
 class FirebaseAiLiveTransportDriver(
     private val networkMonitor: LiveNetworkMonitor? = null,
-    private val handshakeTimeoutMs: Long = 25_000L
+    private val handshakeTimeoutMs: Long = 25_000L,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : LiveTransportDriver {
 
+    private sealed interface CollectorAttachOutcome {
+        data object Attached : CollectorAttachOutcome
+        data class Failed(val throwable: Throwable) : CollectorAttachOutcome
+    }
+
     private val lock = Any()
+    private val driverLifecycleMutex = Mutex()
     private var activeGenerationId: LiveSessionGenerationId? = null
     private var receiverCollectorAttachedGen: LiveSessionGenerationId? = null
     private var activeLiveSession: com.google.firebase.ai.type.LiveSession? = null
     private var activeReceiveJob: Job? = null
-    private val driverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val closingGenerations = LinkedHashSet<LiveSessionGenerationId>()
+    private val closedSessions = Collections.newSetFromMap(IdentityHashMap<com.google.firebase.ai.type.LiveSession, Boolean>())
+    private val driverScope = CoroutineScope(SupervisorJob() + ioDispatcher)
+
+    private fun logDriver(message: String) {
+        try {
+            android.util.Log.i("OmniVoiceLive", DiagnosticRedactor.redact(message))
+        } catch (_: Throwable) {
+        }
+    }
+
+    private suspend fun closeSessionOnce(session: com.google.firebase.ai.type.LiveSession?) {
+        if (session == null) return
+        val shouldClose = synchronized(lock) {
+            closedSessions.add(session)
+        }
+        if (!shouldClose) return
+        try {
+            session.stopReceiving()
+        } catch (_: Throwable) {
+        }
+        try {
+            session.close()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun markGenerationClosingLocked(genId: LiveSessionGenerationId?) {
+        if (genId == null) return
+        if (closingGenerations.size >= 64) {
+            val first = closingGenerations.iterator().next()
+            closingGenerations.remove(first)
+        }
+        closingGenerations.add(genId)
+    }
 
     override fun isReceiverCollectorAttached(generationId: LiveSessionGenerationId): Boolean {
         return synchronized(lock) {
             activeGenerationId == generationId && receiverCollectorAttachedGen == generationId
+        }
+    }
+
+    override suspend fun closeAndAwaitSocket(generationId: LiveSessionGenerationId?) {
+        val sessionToClose: com.google.firebase.ai.type.LiveSession?
+        val jobToCancel: Job?
+        synchronized(lock) {
+            if (generationId != null && activeGenerationId != null && activeGenerationId != generationId) {
+                markGenerationClosingLocked(generationId)
+                return
+            }
+            markGenerationClosingLocked(generationId ?: activeGenerationId)
+            sessionToClose = activeLiveSession
+            jobToCancel = activeReceiveJob
+            activeGenerationId = null
+            receiverCollectorAttachedGen = null
+            activeLiveSession = null
+            activeReceiveJob = null
+        }
+        if (jobToCancel == null && sessionToClose == null) {
+            return
+        }
+        withContext(ioDispatcher + NonCancellable) {
+            jobToCancel?.cancel()
+            try {
+                jobToCancel?.join()
+            } catch (_: Throwable) {
+            }
+            closeSessionOnce(sessionToClose)
         }
     }
 
@@ -312,193 +468,294 @@ class FirebaseAiLiveTransportDriver(
         onSocketEvent: (LiveSocketCallbackEvent) -> Unit,
         systemInstruction: String
     ): LiveHandshakeResult {
-        closeSocket(null)
+        return driverLifecycleMutex.withLock {
+            // Invalidate, cancel/join old collector, and close any prior LiveSession once off-main FIRST.
+            closeAndAwaitSocket(null)
 
-        // Requirement 4 & 5: If no validated network exists, do NOT call Firebase AI Logic or request App Check token.
-        if (networkMonitor != null && !networkMonitor.isInternetValidated()) {
-            return LiveHandshakeResult.Failed(
-                generationId = generationId,
-                classification = LiveFailureClassification.NETWORK_UNAVAILABLE,
-                rawDetail = "NETWORK_UNAVAILABLE: Active network lacks NET_CAPABILITY_INTERNET and NET_CAPABILITY_VALIDATED. Firebase AI Logic and App Check were not called."
-            )
-        }
-
-        return try {
-            // Verify prerequisite before attempting network handshake: never fake success when
-            // FirebaseApp is uninitialized in JVM tests or unconfigured builds.
-            val initializedApps = try {
-                com.google.firebase.FirebaseApp.getApps(
-                    com.google.firebase.FirebaseApp.getInstance().applicationContext
-                )
-            } catch (_: Throwable) {
-                emptyList()
-            }
-            if (initializedApps.isEmpty()) {
-                return LiveHandshakeResult.Failed(
+            // Requirement 4 & 5: If no validated network exists, do NOT call Firebase AI Logic or request App Check token.
+            if (networkMonitor != null && !networkMonitor.isInternetValidated()) {
+                return@withLock LiveHandshakeResult.Failed(
                     generationId = generationId,
-                    classification = LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK,
-                    rawDetail = "NEEDS_SETUP / CONFIG_ERROR (BLOCKED_PREREQUISITE_UNCONFIGURED): FirebaseApp is not initialized. See docs/token-broker-setup.md."
+                    classification = LiveFailureClassification.NETWORK_UNAVAILABLE,
+                    rawDetail = "NETWORK_UNAVAILABLE: Active network lacks NET_CAPABILITY_INTERNET and NET_CAPABILITY_VALIDATED. Firebase AI Logic and App Check were not called."
                 )
             }
 
-            val liveConfig = liveGenerationConfig {
-                responseModality = ResponseModality.AUDIO
-                inputAudioTranscription = AudioTranscriptionConfig()
-                outputAudioTranscription = AudioTranscriptionConfig()
-                realtimeInputConfig = RealtimeInputConfig.builder()
-                    .setActivityHandling(RealtimeInputConfig.ActivityHandling.NO_INTERRUPT)
-                    .setAutomaticActivityDetection(
-                        ActivityDetectionConfig.builder()
-                            .setSilenceDurationMs(700)
-                            .build()
+            try {
+                // Verify prerequisite before attempting network handshake: never fake success when
+                // FirebaseApp is uninitialized in JVM tests or unconfigured builds.
+                val initializedApps = try {
+                    com.google.firebase.FirebaseApp.getApps(
+                        com.google.firebase.FirebaseApp.getInstance().applicationContext
                     )
-                    .build()
-            }
-            val sysInstructionContent = content {
-                text(systemInstruction)
-            }
-            val liveModel = Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
-                modelName = modelId,
-                generationConfig = liveConfig,
-                tools = emptyList(), // Phase 03/04: zero action tools registered
-                systemInstruction = sysInstructionContent
-            )
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+                if (initializedApps.isEmpty()) {
+                    return@withLock LiveHandshakeResult.Failed(
+                        generationId = generationId,
+                        classification = LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK,
+                        rawDetail = "NEEDS_SETUP / CONFIG_ERROR (BLOCKED_PREREQUISITE_UNCONFIGURED): FirebaseApp is not initialized. See docs/token-broker-setup.md."
+                    )
+                }
 
-            val session = withTimeout(handshakeTimeoutMs) {
-                liveModel.connect()
-            }
+                val liveConfig = liveGenerationConfig {
+                    responseModality = ResponseModality.AUDIO
+                    inputAudioTranscription = AudioTranscriptionConfig()
+                    outputAudioTranscription = AudioTranscriptionConfig()
+                    realtimeInputConfig = RealtimeInputConfig.builder()
+                        .setActivityHandling(RealtimeInputConfig.ActivityHandling.NO_INTERRUPT)
+                        .setAutomaticActivityDetection(ActivityDetectionConfig.disabled())
+                        .build()
+                }
+                val sysInstructionContent = content {
+                    text(systemInstruction)
+                }
+                val liveModel = Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
+                    modelName = modelId,
+                    generationConfig = liveConfig,
+                    tools = emptyList(), // Phase 03/04/05: zero action tools registered
+                    systemInstruction = sysInstructionContent
+                )
 
-            val collectorReady = CompletableDeferred<Unit>()
-            synchronized(lock) {
-                activeGenerationId = generationId
-                receiverCollectorAttachedGen = null
-                activeLiveSession = session
-                activeReceiveJob = driverScope.launch {
-                    session.receive()
-                        .onStart {
-                            synchronized(lock) {
-                                if (activeGenerationId == generationId) {
-                                    receiverCollectorAttachedGen = generationId
+                val session = withContext(ioDispatcher) {
+                    withTimeout(handshakeTimeoutMs) {
+                        liveModel.connect()
+                    }
+                }
+
+                val collectorAttach = CompletableDeferred<CollectorAttachOutcome>()
+                val immediateFailure = AtomicReference<Throwable?>(null)
+                var handshakeReturnedAccepted = false
+
+                val receiveJob: Job
+                synchronized(lock) {
+                    activeGenerationId = generationId
+                    receiverCollectorAttachedGen = null
+                    activeLiveSession = session
+                    receiveJob = driverScope.launch {
+                        session.receive()
+                            .onStart {
+                                val attached = synchronized(lock) {
+                                    if (activeGenerationId == generationId && !closingGenerations.contains(generationId)) {
+                                        receiverCollectorAttachedGen = generationId
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                if (attached) {
+                                    collectorAttach.complete(CollectorAttachOutcome.Attached)
+                                } else {
+                                    collectorAttach.complete(
+                                        CollectorAttachOutcome.Failed(CancellationException("STALE_CALLBACK_DROPPED: generation superseded before collector start"))
+                                    )
                                 }
                             }
-                            collectorReady.complete(Unit)
-                        }
-                        .catch { err ->
-                            collectorReady.complete(Unit)
-                            val validatedNow = networkMonitor?.isInternetValidated() ?: true
-                            val classification = LiveExceptionClassifier.classify(
-                                throwable = err,
-                                isInternetValidated = validatedNow
-                            )
-                            onSocketEvent(
-                                LiveSocketCallbackEvent.HandshakeFailed(
-                                    generationId = generationId,
-                                    classification = classification,
-                                    rawErrorMessage = LiveExceptionClassifier.formatRedactedChain(err)
-                                )
-                            )
-                        }
-                        .collect { message ->
-                            when (message) {
-                                is LiveServerSetupComplete -> {
+                            .catch { err ->
+                                immediateFailure.compareAndSet(null, err)
+                                val isLocalOrStale = synchronized(lock) {
+                                    if (activeGenerationId == generationId) {
+                                        receiverCollectorAttachedGen = null
+                                    }
+                                    activeGenerationId != generationId || closingGenerations.contains(generationId)
+                                } || (err is CancellationException && err !is TimeoutCancellationException)
+                                collectorAttach.complete(CollectorAttachOutcome.Failed(err))
+                                if (isLocalOrStale) {
+                                    logDriver("STALE_CALLBACK_DROPPED: Ignored closed/cancelled receive channel for ${generationId.wireId}")
+                                    return@catch
+                                }
+                                if (handshakeReturnedAccepted) {
+                                    val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                                    val classification = LiveExceptionClassifier.classify(
+                                        throwable = err,
+                                        isInternetValidated = validatedNow
+                                    )
                                     onSocketEvent(
-                                        LiveSocketCallbackEvent.SetupAccepted(
+                                        LiveSocketCallbackEvent.HandshakeFailed(
                                             generationId = generationId,
-                                            serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}"
+                                            classification = classification,
+                                            rawErrorMessage = LiveExceptionClassifier.formatRedactedChain(err)
                                         )
                                     )
                                 }
-                                is LiveServerGoAway -> {
+                            }
+                            .onCompletion { cause ->
+                                val isLocalOrStale = synchronized(lock) {
+                                    if (activeGenerationId == generationId) {
+                                        receiverCollectorAttachedGen = null
+                                    }
+                                    activeGenerationId != generationId || closingGenerations.contains(generationId)
+                                }
+                                if (cause == null && immediateFailure.get() == null && !isLocalOrStale && handshakeReturnedAccepted) {
                                     onSocketEvent(
                                         LiveSocketCallbackEvent.SocketClosedRemotely(
                                             generationId = generationId,
-                                            reason = "LiveServerGoAway received from Gemini Live endpoint"
+                                            reason = "Gemini Live receive stream completed/closed by server"
                                         )
                                     )
                                 }
-                                is LiveServerContent -> {
-                                    val inTranscript = message.inputTranscription?.text?.takeIf { it.isNotBlank() }
-                                    val textParts = message.content?.parts
-                                        ?.filterIsInstance<TextPart>()
-                                        ?.mapNotNull { it.text.takeIf { t -> t.isNotBlank() } }
-                                        ?.joinToString(" ")
-                                        ?.takeIf { it.isNotBlank() }
-                                    val outTranscript = message.outputTranscription?.text?.takeIf { it.isNotBlank() } ?: textParts
-                                    if (inTranscript != null || outTranscript != null) {
+                            }
+                            .collect { message ->
+                                val stillActive = synchronized(lock) {
+                                    activeGenerationId == generationId && !closingGenerations.contains(generationId)
+                                }
+                                if (!stillActive) {
+                                    logDriver("STALE_CALLBACK_DROPPED: Dropped server frame for superseded ${generationId.wireId}")
+                                    return@collect
+                                }
+                                when (message) {
+                                    is LiveServerSetupComplete -> {
                                         onSocketEvent(
-                                            LiveSocketCallbackEvent.ServerTranscriptionReceived(
+                                            LiveSocketCallbackEvent.SetupAccepted(
                                                 generationId = generationId,
-                                                inputTranscript = inTranscript,
-                                                outputTranscript = outTranscript
+                                                serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}"
                                             )
                                         )
                                     }
-
-                                    val parts = message.content?.parts.orEmpty()
-                                    for (part in parts) {
-                                        if (part is InlineDataPart && part.inlineData.isNotEmpty()) {
-                                            val lowerMime = part.mimeType.lowercase()
-                                            if (lowerMime.startsWith("audio/")) {
-                                                onSocketEvent(
-                                                    LiveSocketCallbackEvent.ServerAudioChunkReceived(
-                                                        generationId = generationId,
-                                                        mimeType = part.mimeType,
-                                                        pcmBytes = part.inlineData
-                                                    )
+                                    is LiveServerGoAway -> {
+                                        onSocketEvent(
+                                            LiveSocketCallbackEvent.SocketClosedRemotely(
+                                                generationId = generationId,
+                                                reason = "LiveServerGoAway received from Gemini Live endpoint (timeLeft=${message.timeLeft})"
+                                            )
+                                        )
+                                    }
+                                    is LiveServerContent -> {
+                                        val inTranscript = message.inputTranscription?.text?.takeIf { it.isNotBlank() }
+                                        val textParts = message.content?.parts
+                                            ?.filterIsInstance<TextPart>()
+                                            ?.mapNotNull { it.text.takeIf { t -> t.isNotBlank() } }
+                                            ?.joinToString(" ")
+                                            ?.takeIf { it.isNotBlank() }
+                                        val outTranscript = message.outputTranscription?.text?.takeIf { it.isNotBlank() } ?: textParts
+                                        if (inTranscript != null || outTranscript != null) {
+                                            onSocketEvent(
+                                                LiveSocketCallbackEvent.ServerTranscriptionReceived(
+                                                    generationId = generationId,
+                                                    inputTranscript = inTranscript,
+                                                    outputTranscript = outTranscript
                                                 )
+                                            )
+                                        }
+
+                                        val parts = message.content?.parts.orEmpty()
+                                        for (part in parts) {
+                                            if (part is InlineDataPart && part.inlineData.isNotEmpty()) {
+                                                val lowerMime = part.mimeType.lowercase()
+                                                if (lowerMime.startsWith("audio/")) {
+                                                    onSocketEvent(
+                                                        LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                                                            generationId = generationId,
+                                                            mimeType = part.mimeType,
+                                                            pcmBytes = part.inlineData
+                                                        )
+                                                    )
+                                                }
                                             }
                                         }
-                                    }
 
-                                    // Wait specifically for turnComplete (or interrupted) — never treat generationComplete alone as turnComplete
-                                    // because final audio InlineDataPart frames can arrive after generationComplete until turnComplete = true.
-                                    if (message.turnComplete || message.interrupted) {
-                                        onSocketEvent(
-                                            LiveSocketCallbackEvent.ServerTurnCompleted(
-                                                generationId = generationId,
-                                                interrupted = message.interrupted
+                                        if (message.turnComplete || message.interrupted) {
+                                            onSocketEvent(
+                                                LiveSocketCallbackEvent.ServerTurnCompleted(
+                                                    generationId = generationId,
+                                                    interrupted = message.interrupted
+                                                )
                                             )
-                                        )
+                                        }
                                     }
-                                }
-                                else -> {
-                                    // Ignore unrecognized frame types; zero action tools are registered in Phase 04.
+                                    else -> Unit
                                 }
                             }
-                        }
+                    }
+                    activeReceiveJob = receiveJob
                 }
-            }
 
-            // Guarantee the session.receive() collector is actively attached BEFORE SETUP_ACCEPTED
-            // and BEFORE the first microphone frame can ever be transmitted on a cold launch!
-            withTimeout(handshakeTimeoutMs) {
-                collectorReady.await()
-            }
+                // Wait for collector attachment or immediate receive channel error
+                val attachOutcome = withTimeout(handshakeTimeoutMs) {
+                    collectorAttach.await()
+                }
+                yield()
 
-            val acceptedNote =
-                "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent (${modelId}, tools=0, collector=ATTACHED)"
-            onSocketEvent(
-                LiveSocketCallbackEvent.SetupAccepted(
+                val earlyError = (attachOutcome as? CollectorAttachOutcome.Failed)?.throwable
+                    ?: immediateFailure.get()
+                if (earlyError != null) {
+                    closeAndAwaitSocket(generationId)
+                    val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                    val classification = LiveExceptionClassifier.classify(
+                        throwable = earlyError,
+                        isInternetValidated = validatedNow
+                    )
+                    return@withLock LiveHandshakeResult.Failed(
+                        generationId = generationId,
+                        classification = classification,
+                        rawDetail = LiveExceptionClassifier.formatRedactedChain(earlyError)
+                    )
+                }
+
+                val isStillCurrent = synchronized(lock) {
+                    activeGenerationId == generationId &&
+                        receiverCollectorAttachedGen == generationId &&
+                        !closingGenerations.contains(generationId)
+                }
+                if (!isStillCurrent) {
+                    closeAndAwaitSocket(generationId)
+                    return@withLock LiveHandshakeResult.Failed(
+                        generationId = generationId,
+                        classification = LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE,
+                        rawDetail = "Superseded or cancelled before SETUP_ACCEPTED (${generationId.wireId})"
+                    )
+                }
+
+                handshakeReturnedAccepted = true
+                val acceptedNote =
+                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent (${modelId}, tools=0, collector=ATTACHED)"
+                onSocketEvent(
+                    LiveSocketCallbackEvent.SetupAccepted(
+                        generationId = generationId,
+                        serverNote = acceptedNote
+                    )
+                )
+                LiveHandshakeResult.Accepted(
                     generationId = generationId,
                     serverNote = acceptedNote
                 )
-            )
-            LiveHandshakeResult.Accepted(
-                generationId = generationId,
-                serverNote = acceptedNote
-            )
-        } catch (t: Throwable) {
-            val validatedNow = networkMonitor?.isInternetValidated() ?: true
-            val classification = LiveExceptionClassifier.classify(
-                throwable = t,
-                isInternetValidated = validatedNow
-            )
-            val detail = LiveExceptionClassifier.formatRedactedChain(t)
-            LiveHandshakeResult.Failed(
-                generationId = generationId,
-                classification = classification,
-                rawDetail = detail
-            )
+            } catch (t: Throwable) {
+                closeAndAwaitSocket(generationId)
+                val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                val classification = LiveExceptionClassifier.classify(
+                    throwable = t,
+                    isInternetValidated = validatedNow
+                )
+                val detail = LiveExceptionClassifier.formatRedactedChain(t)
+                LiveHandshakeResult.Failed(
+                    generationId = generationId,
+                    classification = classification,
+                    rawDetail = detail
+                )
+            }
+        }
+    }
+
+    override suspend fun sendStartOfSpokenTurn(
+        generationId: LiveSessionGenerationId
+    ): Boolean {
+        if (networkMonitor != null && !networkMonitor.isInternetValidated()) return false
+        val session = synchronized(lock) {
+            if (activeGenerationId == generationId && receiverCollectorAttachedGen == generationId) {
+                activeLiveSession
+            } else {
+                null
+            }
+        } ?: return false
+        return try {
+            withContext(ioDispatcher) {
+                session.sendStartActivityRealtime()
+            }
+            logDriver("USER_ACTIVITY_START (activityStart) sent on ${generationId.wireId}")
+            true
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -517,7 +774,9 @@ class FirebaseAiLiveTransportDriver(
             }
         } ?: return false
         return try {
-            session.sendAudioRealtime(InlineData(pcm16kHzBytes, mimeType))
+            withContext(ioDispatcher) {
+                session.sendAudioRealtime(InlineData(pcm16kHzBytes, mimeType))
+            }
             true
         } catch (_: Throwable) {
             false
@@ -536,19 +795,10 @@ class FirebaseAiLiveTransportDriver(
             }
         } ?: return false
         return try {
-            // Use the single documented realtimeInput VAD mechanism: stream 960ms of paced 16kHz PCM
-            // trailing silence (6 x 160ms chunks, exceeding the configured 700ms silenceDurationMs)
-            // so server VAD deterministically commits the first spoken user turn without sending a
-            // conflicting clientContent empty user turn.
-            val silenceChunk160Ms = ByteArray(5120)
-            repeat(6) { idx ->
-                val stillActive = synchronized(lock) { activeGenerationId == generationId }
-                if (!stillActive) return false
-                session.sendAudioRealtime(InlineData(silenceChunk160Ms, "audio/pcm;rate=16000"))
-                if (idx < 5) {
-                    delay(20L)
-                }
+            withContext(ioDispatcher) {
+                session.sendStopActivityRealtime()
             }
+            logDriver("USER_ACTIVITY_END (activityEnd) sent on ${generationId.wireId}")
             true
         } catch (_: Throwable) {
             false
@@ -560,8 +810,10 @@ class FirebaseAiLiveTransportDriver(
         val jobToCancel: Job?
         synchronized(lock) {
             if (generationId != null && activeGenerationId != null && activeGenerationId != generationId) {
+                markGenerationClosingLocked(generationId)
                 return
             }
+            markGenerationClosingLocked(generationId ?: activeGenerationId)
             sessionToClose = activeLiveSession
             jobToCancel = activeReceiveJob
             activeGenerationId = null
@@ -573,13 +825,10 @@ class FirebaseAiLiveTransportDriver(
         if (sessionToClose != null) {
             driverScope.launch {
                 try {
-                    sessionToClose.stopReceiving()
+                    jobToCancel?.join()
                 } catch (_: Throwable) {
                 }
-                try {
-                    sessionToClose.close()
-                } catch (_: Throwable) {
-                }
+                closeSessionOnce(sessionToClose)
             }
         }
     }
@@ -641,6 +890,8 @@ class DeterministicTestLiveTransportDriver(
     var lastReceivedSystemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
         private set
     val prependedFakeUserSpeechMessages = mutableListOf<String>()
+    var startOfTurnSignalCount: Int = 0
+        private set
     var endOfTurnSignalCount: Int = 0
         private set
 
@@ -687,6 +938,16 @@ class DeterministicTestLiveTransportDriver(
             isSetupAcceptedForCurrentGen = true
         }
         return result
+    }
+
+    override suspend fun sendStartOfSpokenTurn(
+        generationId: LiveSessionGenerationId
+    ): Boolean {
+        if (lastConnectedGenId != generationId || !isCollectorAttachedForCurrentGen || !isSetupAcceptedForCurrentGen) {
+            return false
+        }
+        startOfTurnSignalCount += 1
+        return true
     }
 
     override suspend fun sendRealtimeAudioChunk(
@@ -768,6 +1029,9 @@ class GeminiLiveConnectionAdapter(
         driver ?: FirebaseAiLiveTransportDriver(networkMonitor = networkMonitor)
 
     private val lock = Any()
+    private val connectMutex = Mutex()
+    private var inFlightConnectDeferred: CompletableDeferred<LiveConnectionState>? = null
+    private var inFlightConnectIsAutoReconnectOnly: Boolean = false
     private val generationSeq = AtomicLong(0L)
     private val connectRequestSeq = AtomicLong(0L)
     private var activeGenerationId: LiveSessionGenerationId? = null
@@ -781,6 +1045,13 @@ class GeminiLiveConnectionAdapter(
     private var operatorHalted: Boolean = false
 
     private val adapterScope = CoroutineScope(SupervisorJob() + backgroundDispatcher)
+
+    private fun logAdapter(message: String) {
+        try {
+            android.util.Log.i("OmniVoiceLive", DiagnosticRedactor.redact(message))
+        } catch (_: Throwable) {
+        }
+    }
 
     private val _state = MutableStateFlow(
         LiveConnectionState(
@@ -837,11 +1108,12 @@ class GeminiLiveConnectionAdapter(
      * Handles real-time connectivity transitions from [LiveNetworkMonitor].
      *
      * - When `isValidated == false`:
-     *   Immediately invalidates any stale `SETUP_ACCEPTED` or active connection, cancels scheduled retries,
+     *   Immediately invalidates any stale `SETUP_ACCEPTED` or `ACTIVE` connection, cancels scheduled retries,
      *   closes the socket cleanly, and transitions to `NETWORK_UNAVAILABLE`.
      * - When `isValidated == true`:
      *   Transitions from offline state to `NETWORK_RESTORED` (`READY_TO_RECONNECT`), and performs at most
-     *   one controlled automatic reconnect if an active/requested session was interrupted by the outage.
+     *   one controlled automatic reconnect if an active/requested session was interrupted by the outage
+     *   and no connect is already in flight.
      */
     fun onNetworkValidatedChanged(isValidated: Boolean) {
         if (!isValidated) {
@@ -853,7 +1125,9 @@ class GeminiLiveConnectionAdapter(
                     eligibleForSingleAutoReconnect ||
                         activeGenerationId != null ||
                         prev.phase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                        prev.phase == LiveConnectionPhase.ACTIVE ||
                         prev.phase == LiveConnectionPhase.CONNECTING ||
+                        prev.phase == LiveConnectionPhase.RECONNECTING ||
                         prev.phase == LiveConnectionPhase.RETRY_BACKOFF_WAITING ||
                         prev.handshakeVerified
 
@@ -927,6 +1201,11 @@ class GeminiLiveConnectionAdapter(
                 return
             }
 
+            // Never clobber an active in-flight handshake or healthy session
+            if (inFlightConnectDeferred?.isActive == true || isHealthyEstablishedSessionLocked()) {
+                return
+            }
+
             shouldTriggerSingleReconnect =
                 autoReconnectOnNetworkRestore &&
                     eligibleForSingleAutoReconnect &&
@@ -971,11 +1250,12 @@ class GeminiLiveConnectionAdapter(
                 executeHandshakeWithPolicy(
                     sessionId = reconnectSessionId,
                     maxAttemptsLimit = 1,
-                    isControlledAutoReconnect = true
+                    isControlledAutoReconnect = true,
+                    reuseIfHealthy = true
                 )
             }
             synchronized(lock) {
-                if (activeConnectJob == null) {
+                if (activeConnectJob == null && job.isActive) {
                     activeConnectJob = job
                 }
             }
@@ -998,7 +1278,8 @@ class GeminiLiveConnectionAdapter(
     /**
      * Processes a socket/session callback event only if its [LiveSessionGenerationId] matches
      * the currently active socket generation AND validated internet is available.
-     * Stale callbacks from superseded or closed sockets are deterministically rejected and counted.
+     * Stale callbacks from superseded or closed sockets are deterministically rejected, logged as
+     * `STALE_CALLBACK_DROPPED`, and counted.
      */
     fun onSocketCallback(event: LiveSocketCallbackEvent): Boolean {
         val closeGenAfterCallback: LiveSessionGenerationId?
@@ -1006,6 +1287,10 @@ class GeminiLiveConnectionAdapter(
         synchronized(lock) {
             val currentActive = activeGenerationId
             if (currentActive == null || currentActive != event.generationId) {
+                logAdapter(
+                    "STALE_CALLBACK_DROPPED: Dropped ${event::class.simpleName} for ${event.generationId.wireId} " +
+                        "(activeGeneration=${currentActive?.wireId ?: "NONE"})"
+                )
                 updateStateAndNotify { prev ->
                     val newDropped = prev.staleSocketCallbacksDropped + 1
                     prev.copy(
@@ -1064,12 +1349,23 @@ class GeminiLiveConnectionAdapter(
                             effectiveDriver.isReceiverCollectorAttached(currentActive) &&
                                 onServerEventListener != null
                         updateStateAndNotify { prev ->
+                            val preservedPhase = if (
+                                prev.phase == LiveConnectionPhase.ACTIVE &&
+                                prev.activeGeneration == currentActive
+                            ) {
+                                LiveConnectionPhase.ACTIVE
+                            } else {
+                                LiveConnectionPhase.SETUP_ACCEPTED
+                            }
                             prev.copy(
-                                phase = LiveConnectionPhase.SETUP_ACCEPTED,
+                                phase = preservedPhase,
                                 activeGeneration = currentActive,
                                 lastCompletedGeneration = currentActive,
                                 failureClassification = LiveFailureClassification.NONE,
                                 isInternetValidated = true,
+                                retryCount = 0,
+                                lastBackoffDelayMs = 0L,
+                                autoRetryStoppedReason = null,
                                 handshakeVerified = true,
                                 isReceiverCollectorAttached = collectorAttached,
                                 audioPlaybackClaimed = prev.audioPlaybackClaimed,
@@ -1079,9 +1375,11 @@ class GeminiLiveConnectionAdapter(
                                 diagnostics = prev.diagnostics.copy(
                                     modelId = configuredModelId,
                                     sessionGenerationWireId = currentActive.wireId,
-                                    phaseWireCode = LiveConnectionPhase.SETUP_ACCEPTED.wireCode,
+                                    phaseWireCode = preservedPhase.wireCode,
                                     failureCode = LiveFailureClassification.NONE.wireCode,
                                     isInternetValidated = true,
+                                    retryCount = 0,
+                                    lastBackoffDelayMs = 0L,
                                     handshakeVerified = true,
                                     isReceiverCollectorAttached = collectorAttached,
                                     audioPlaybackClaimed = prev.audioPlaybackClaimed,
@@ -1095,10 +1393,9 @@ class GeminiLiveConnectionAdapter(
                     is LiveSocketCallbackEvent.HandshakeFailed -> {
                         val wasEstablished =
                             _state.value.phase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                                _state.value.phase == LiveConnectionPhase.ACTIVE ||
                                 _state.value.handshakeVerified
                         if (wasEstablished) {
-                            // If an active SETUP_ACCEPTED socket drops with a transport error milliseconds before
-                            // NetworkCallback.onLost fires, invalidate activeGenerationId and preserve reconnect eligibility.
                             activeGenerationId = null
                             closeGenAfterCallback = currentActive
                             if (!operatorHalted && event.classification.retryable) {
@@ -1140,29 +1437,67 @@ class GeminiLiveConnectionAdapter(
 
                     is LiveSocketCallbackEvent.SocketClosedRemotely -> {
                         val safeReason = DiagnosticRedactor.redact(event.reason)
+                        val closeClassification = LiveExceptionClassifier.classifyCloseReason(
+                            reason = safeReason,
+                            isInternetValidated = validatedNow
+                        )
                         activeGenerationId = null
                         closeGenAfterCallback = currentActive
-                        if (!operatorHalted) {
-                            eligibleForSingleAutoReconnect = true
-                            autoReconnectPerformedForOutage = false
-                        }
-                        updateStateAndNotify { prev ->
-                            prev.copy(
-                                phase = LiveConnectionPhase.DISCONNECTED,
-                                activeGeneration = null,
-                                lastCompletedGeneration = currentActive,
-                                handshakeVerified = false,
-                                isReceiverCollectorAttached = false,
-                                statusHeadline = "LIVE SOCKET CLOSED REMOTELY",
-                                statusDetail = safeReason,
-                                diagnostics = prev.diagnostics.copy(
-                                    sessionGenerationWireId = currentActive.wireId,
-                                    phaseWireCode = LiveConnectionPhase.DISCONNECTED.wireCode,
+                        if (closeClassification == LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE) {
+                            logAdapter("STALE_CALLBACK_DROPPED: Ignored local close/cancel callback for ${currentActive.wireId}")
+                            updateStateAndNotify { prev ->
+                                prev.copy(
+                                    phase = LiveConnectionPhase.DISCONNECTED,
+                                    activeGeneration = null,
+                                    lastCompletedGeneration = currentActive,
+                                    failureClassification = LiveFailureClassification.NONE,
                                     handshakeVerified = false,
                                     isReceiverCollectorAttached = false,
-                                    redactedSummary = "Remote socket closed (${currentActive.wireId}): $safeReason"
+                                    statusHeadline = "LIVE SOCKET DISCONNECTED",
+                                    statusDetail = safeReason,
+                                    diagnostics = prev.diagnostics.copy(
+                                        sessionGenerationWireId = currentActive.wireId,
+                                        phaseWireCode = LiveConnectionPhase.DISCONNECTED.wireCode,
+                                        failureCode = LiveFailureClassification.NONE.wireCode,
+                                        handshakeVerified = false,
+                                        isReceiverCollectorAttached = false,
+                                        redactedSummary = "Socket closed (${currentActive.wireId}): $safeReason"
+                                    )
                                 )
-                            )
+                            }
+                        } else {
+                            if (!operatorHalted && closeClassification.retryable) {
+                                eligibleForSingleAutoReconnect = true
+                                autoReconnectPerformedForOutage = false
+                            } else {
+                                eligibleForSingleAutoReconnect = false
+                            }
+                            val stopReason = if (!closeClassification.retryable) {
+                                "AUTO_RETRY_STOPPED_${closeClassification.wireCode}"
+                            } else {
+                                null
+                            }
+                            updateStateAndNotify { prev ->
+                                prev.copy(
+                                    phase = LiveConnectionPhase.FAILED,
+                                    activeGeneration = null,
+                                    lastCompletedGeneration = currentActive,
+                                    failureClassification = closeClassification,
+                                    handshakeVerified = false,
+                                    isReceiverCollectorAttached = false,
+                                    autoRetryStoppedReason = stopReason ?: prev.autoRetryStoppedReason,
+                                    statusHeadline = "LIVE SOCKET CLOSED [${closeClassification.wireCode}]",
+                                    statusDetail = safeReason,
+                                    diagnostics = prev.diagnostics.copy(
+                                        sessionGenerationWireId = currentActive.wireId,
+                                        phaseWireCode = LiveConnectionPhase.FAILED.wireCode,
+                                        failureCode = closeClassification.wireCode,
+                                        handshakeVerified = false,
+                                        isReceiverCollectorAttached = false,
+                                        redactedSummary = "Remote socket closed (${currentActive.wireId}) [${closeClassification.wireCode}]: $safeReason"
+                                    )
+                                )
+                            }
                         }
                     }
 
@@ -1189,8 +1524,18 @@ class GeminiLiveConnectionAdapter(
         return true
     }
 
+    private fun isHealthyEstablishedSessionLocked(): Boolean {
+        if (!networkMonitor.isInternetValidated()) return false
+        val snap = _state.value
+        val gen = activeGenerationId ?: return false
+        return (snap.phase == LiveConnectionPhase.SETUP_ACCEPTED || snap.phase == LiveConnectionPhase.ACTIVE) &&
+            snap.handshakeVerified &&
+            snap.activeGeneration == gen &&
+            effectiveDriver.isReceiverCollectorAttached(gen)
+    }
+
     /**
-     * Returns true only if the Gemini Live session is currently `SETUP_ACCEPTED`, validated
+     * Returns true only if the Gemini Live session is currently `SETUP_ACCEPTED` or `ACTIVE`, validated
      * internet is available, the coordinator's server-event collector (`onServerEventListener`)
      * is attached, and the transport driver's `session.receive()` collector is actively attached
      * for the active [LiveSessionGenerationId].
@@ -1198,14 +1543,7 @@ class GeminiLiveConnectionAdapter(
     fun isSessionReadyForAudio(): Boolean {
         if (!networkMonitor.isInternetValidated()) return false
         return synchronized(lock) {
-            val snap = _state.value
-            val gen = activeGenerationId
-            gen != null &&
-                snap.phase == LiveConnectionPhase.SETUP_ACCEPTED &&
-                snap.handshakeVerified &&
-                snap.activeGeneration == gen &&
-                onServerEventListener != null &&
-                effectiveDriver.isReceiverCollectorAttached(gen)
+            isHealthyEstablishedSessionLocked() && onServerEventListener != null
         }
     }
 
@@ -1226,7 +1564,32 @@ class GeminiLiveConnectionAdapter(
     }
 
     /**
+     * Transitions a verified `SETUP_ACCEPTED` session to [LiveConnectionPhase.ACTIVE] when realtime
+     * audio streaming for a turn begins, without opening a new socket connection.
+     */
+    fun markSessionActive(): Boolean {
+        return synchronized(lock) {
+            val gen = activeGenerationId ?: return@synchronized false
+            val snap = _state.value
+            if (!snap.handshakeVerified || snap.activeGeneration != gen) return@synchronized false
+            if (snap.phase == LiveConnectionPhase.ACTIVE) return@synchronized true
+            if (snap.phase != LiveConnectionPhase.SETUP_ACCEPTED) return@synchronized false
+            updateStateAndNotify { prev ->
+                prev.copy(
+                    phase = LiveConnectionPhase.ACTIVE,
+                    statusHeadline = "LIVE SESSION ACTIVE (${gen.wireId})",
+                    diagnostics = prev.diagnostics.copy(
+                        phaseWireCode = LiveConnectionPhase.ACTIVE.wireCode
+                    )
+                )
+            }
+            true
+        }
+    }
+
+    /**
      * Streams a 16kHz 16-bit mono PCM audio chunk to the currently verified active Gemini Live session.
+     * Transitions `SETUP_ACCEPTED -> ACTIVE` when the first chunk streams.
      * Returns `false` if no verified session is active, if the receiver collector is not attached,
      * or if validated internet was lost.
      */
@@ -1240,12 +1603,24 @@ class GeminiLiveConnectionAdapter(
         }
         val activeGen = synchronized(lock) {
             val gen = activeGenerationId
+            val snap = _state.value
             if (gen != null &&
-                _state.value.phase == LiveConnectionPhase.SETUP_ACCEPTED &&
-                _state.value.handshakeVerified &&
+                (snap.phase == LiveConnectionPhase.SETUP_ACCEPTED || snap.phase == LiveConnectionPhase.ACTIVE) &&
+                snap.handshakeVerified &&
                 onServerEventListener != null &&
                 effectiveDriver.isReceiverCollectorAttached(gen)
             ) {
+                if (snap.phase == LiveConnectionPhase.SETUP_ACCEPTED) {
+                    updateStateAndNotify { prev ->
+                        prev.copy(
+                            phase = LiveConnectionPhase.ACTIVE,
+                            statusHeadline = "LIVE SESSION ACTIVE (${gen.wireId})",
+                            diagnostics = prev.diagnostics.copy(
+                                phaseWireCode = LiveConnectionPhase.ACTIVE.wireCode
+                            )
+                        )
+                    }
+                }
                 gen
             } else {
                 null
@@ -1259,6 +1634,31 @@ class GeminiLiveConnectionAdapter(
     }
 
     /**
+     * Signals explicit start-of-spoken-turn (`activityStart`) to the currently verified active Gemini Live session.
+     */
+    suspend fun signalStartOfSpokenTurn(): Boolean {
+        if (!networkMonitor.isInternetValidated()) {
+            onNetworkValidatedChanged(false)
+            return false
+        }
+        val activeGen = synchronized(lock) {
+            val snap = _state.value
+            val gen = activeGenerationId
+            if (gen != null &&
+                (snap.phase == LiveConnectionPhase.SETUP_ACCEPTED || snap.phase == LiveConnectionPhase.ACTIVE) &&
+                snap.handshakeVerified &&
+                onServerEventListener != null &&
+                effectiveDriver.isReceiverCollectorAttached(gen)
+            ) {
+                gen
+            } else {
+                null
+            }
+        } ?: return false
+        return effectiveDriver.sendStartOfSpokenTurn(activeGen)
+    }
+
+    /**
      * Signals end-of-spoken-turn to the currently verified active Gemini Live session.
      * Returns `false` if no verified session is active or if validated internet was lost.
      */
@@ -1268,7 +1668,10 @@ class GeminiLiveConnectionAdapter(
             return false
         }
         val activeGen = synchronized(lock) {
-            if (_state.value.phase == LiveConnectionPhase.SETUP_ACCEPTED && _state.value.handshakeVerified) {
+            val snap = _state.value
+            if ((snap.phase == LiveConnectionPhase.SETUP_ACCEPTED || snap.phase == LiveConnectionPhase.ACTIVE) &&
+                snap.handshakeVerified
+            ) {
                 activeGenerationId
             } else {
                 null
@@ -1277,339 +1680,460 @@ class GeminiLiveConnectionAdapter(
         return effectiveDriver.sendEndOfSpokenTurn(activeGen)
     }
 
+    fun getActiveGenerationCountForDiagnostics(): Int {
+        return synchronized(lock) {
+            if (activeGenerationId != null) 1 else 0
+        }
+    }
+
+    /**
+     * Authoritative single-flight entry point for Start / voice turns:
+     * - Reuses an already healthy `SETUP_ACCEPTED` or `ACTIVE` session across sequential turns without reconnecting.
+     * - Joins any already in-flight handshake via single-flight `CompletableDeferred` without starting duplicate sockets.
+     * - Connects once if disconnected or recovers cleanly after `FAILED` / exhausted retries without restarting the app.
+     */
+    suspend fun ensureConnectedSession(sessionId: SessionId): LiveConnectionState {
+        return executeHandshakeWithPolicy(
+            sessionId = sessionId,
+            maxAttemptsLimit = backoffPolicy.maxAttempts,
+            isControlledAutoReconnect = false,
+            reuseIfHealthy = true
+        )
+    }
+
     /**
      * Initiates a real Gemini Live handshake with bounded exponential backoff (up to 3 attempts)
      * for transient network/socket errors while online.
      *
-     * Invariants:
-     * - Verifies `networkMonitor.isInternetValidated()` before every attempt. If false, does NOT
-     *   call Firebase AI Logic or App Check and immediately returns `NETWORK_UNAVAILABLE`.
-     * - Never switches silently to a guessed model on failure; strictly uses [configuredModelId].
-     * - Immediately stops automatic retries on [LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK],
-     *   [LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT], [LiveFailureClassification.QUOTA_EXHAUSTED],
-     *   and [LiveFailureClassification.NETWORK_UNAVAILABLE].
-     * - Retries [LiveFailureClassification.NETWORK_ERROR] / [LiveFailureClassification.TRANSIENT_NETWORK_OR_SOCKET]
-     *   up to [BoundedBackoffPolicy.maxAttempts] (3 attempts) while online.
+     * Set [reuseIfHealthy] to `true` (or call [ensureConnectedSession]) to reuse an existing
+     * healthy `SETUP_ACCEPTED`/`ACTIVE` session instead of opening a replacement socket.
+     * Overlapping concurrent calls are always single-flight deduplicated behind [connectMutex].
      */
-    suspend fun connectWithBoundedRetry(sessionId: SessionId): LiveConnectionState {
+    suspend fun connectWithBoundedRetry(
+        sessionId: SessionId,
+        reuseIfHealthy: Boolean = false
+    ): LiveConnectionState {
         return executeHandshakeWithPolicy(
             sessionId = sessionId,
             maxAttemptsLimit = backoffPolicy.maxAttempts,
-            isControlledAutoReconnect = false
+            isControlledAutoReconnect = false,
+            reuseIfHealthy = reuseIfHealthy
         )
     }
 
     private suspend fun executeHandshakeWithPolicy(
         sessionId: SessionId,
         maxAttemptsLimit: Int,
-        isControlledAutoReconnect: Boolean
+        isControlledAutoReconnect: Boolean,
+        reuseIfHealthy: Boolean = false
     ): LiveConnectionState {
-        val requestId: Long
-        val priorJobToCancel: Job?
+        // Single-flight gate: either reuse healthy session or join an already in-flight connection
+        val myDeferred: CompletableDeferred<LiveConnectionState>
+        var existingToAwait: CompletableDeferred<LiveConnectionState>? = null
+        var joinedWasAutoOnly = false
+
         synchronized(lock) {
             lastSessionId = sessionId
             operatorHalted = false
-            requestId = connectRequestSeq.incrementAndGet()
-            activeConnectRequestId = requestId
-            priorJobToCancel = if (!isControlledAutoReconnect) activeConnectJob else null
-            if (!isControlledAutoReconnect) {
-                activeConnectJob = null
-            }
-        }
-        priorJobToCancel?.cancel()
 
-        // Requirement 4 & 5: Pre-handshake check for NET_CAPABILITY_INTERNET + NET_CAPABILITY_VALIDATED
-        if (!networkMonitor.isInternetValidated()) {
-            synchronized(lock) {
-                lastKnownValidated = false
-                eligibleForSingleAutoReconnect = true
-                autoReconnectPerformedForOutage = false
-                activeGenerationId = null
-                val offlineDetail =
-                    "NETWORK_UNAVAILABLE: Active network lacks NET_CAPABILITY_INTERNET and NET_CAPABILITY_VALIDATED. Firebase AI Logic and App Check were not called."
-                updateStateAndNotify { prev ->
-                    prev.copy(
-                        phase = LiveConnectionPhase.NETWORK_UNAVAILABLE,
-                        activeGeneration = null,
-                        failureClassification = LiveFailureClassification.NETWORK_UNAVAILABLE,
-                        isInternetValidated = false,
-                        attemptCount = 0,
-                        retryCount = 0,
-                        handshakeVerified = false,
-                        audioPlaybackClaimed = false,
-                        autoRetryStoppedReason = "OFFLINE_PRECHECK_BLOCKED_NETWORK_UNAVAILABLE",
-                        statusHeadline = "NETWORK_UNAVAILABLE — NO VALIDATED INTERNET",
-                        statusDetail = offlineDetail,
-                        diagnostics = prev.diagnostics.copy(
-                            modelId = configuredModelId,
-                            phaseWireCode = LiveConnectionPhase.NETWORK_UNAVAILABLE.wireCode,
-                            failureCode = LiveFailureClassification.NETWORK_UNAVAILABLE.wireCode,
-                            isInternetValidated = false,
-                            attemptCount = 0,
-                            retryCount = 0,
-                            handshakeVerified = false,
-                            audioPlaybackClaimed = false,
-                            redactedSummary = offlineDetail
-                        )
-                    )
-                }
-            }
-            effectiveDriver.closeSocket(null)
-            return _state.value
-        }
-
-        var attempt = 1
-        var retryCount = 0
-        val effectiveMaxAttempts = maxAttemptsLimit.coerceAtLeast(1)
-
-        while (attempt <= effectiveMaxAttempts) {
-            // Re-verify validated internet before every attempt in the loop
-            if (!networkMonitor.isInternetValidated()) {
-                onNetworkValidatedChanged(false)
+            if (reuseIfHealthy && isHealthyEstablishedSessionLocked()) {
                 return _state.value
             }
 
-            val genId = synchronized(lock) {
-                if (activeConnectRequestId != requestId) {
-                    return _state.value
-                }
-                val created = nextGenerationId(sessionId, attempt)
-                activeGenerationId = created
-                lastKnownValidated = true
-                val newAutoReconnectCount = if (isControlledAutoReconnect && attempt == 1) {
-                    _state.value.autoReconnectCount + 1
-                } else {
-                    _state.value.autoReconnectCount
-                }
-                val prefix = if (isControlledAutoReconnect) {
-                    "NETWORK_RESTORED -> AUTO_RECONNECT"
-                } else {
-                    "CONNECTING"
-                }
-                val connectingSummary =
-                    "$prefix attempt $attempt/$effectiveMaxAttempts to $configuredModelId (${LiveConfigConstants.ENDPOINT_FAMILY.wireCode}) as ${created.wireId}."
-                updateStateAndNotify { prev ->
-                    prev.copy(
-                        phase = LiveConnectionPhase.CONNECTING,
-                        activeGeneration = created,
-                        configuredModelId = configuredModelId,
-                        failureClassification = LiveFailureClassification.NONE,
-                        isInternetValidated = true,
-                        attemptCount = attempt,
-                        retryCount = retryCount,
-                        autoReconnectCount = newAutoReconnectCount,
-                        handshakeVerified = false,
-                        audioPlaybackClaimed = false,
-                        registeredActionToolsCount = 0,
-                        autoRetryStoppedReason = null,
-                        statusHeadline = "CONNECTING TO GEMINI LIVE (ATTEMPT $attempt/$effectiveMaxAttempts)",
-                        statusDetail = connectingSummary,
-                        diagnostics = prev.diagnostics.copy(
-                            modelId = configuredModelId,
-                            sessionGenerationWireId = created.wireId,
-                            phaseWireCode = LiveConnectionPhase.CONNECTING.wireCode,
-                            failureCode = LiveFailureClassification.NONE.wireCode,
-                            isInternetValidated = true,
-                            attemptCount = attempt,
-                            retryCount = retryCount,
-                            autoReconnectCount = newAutoReconnectCount,
-                            handshakeVerified = false,
-                            audioPlaybackClaimed = false,
-                            registeredActionToolsCount = 0,
-                            redactedSummary = connectingSummary
-                        )
-                    )
-                }
-                created
+            val currentInFlight = inFlightConnectDeferred
+            if (currentInFlight != null && currentInFlight.isActive) {
+                existingToAwait = currentInFlight
+                joinedWasAutoOnly = inFlightConnectIsAutoReconnectOnly
+                myDeferred = currentInFlight
+            } else {
+                val created = CompletableDeferred<LiveConnectionState>()
+                inFlightConnectDeferred = created
+                inFlightConnectIsAutoReconnectOnly = isControlledAutoReconnect
+                myDeferred = created
             }
+        }
 
-            val result = effectiveDriver.connectAndHandshake(
-                generationId = genId,
-                modelId = configuredModelId,
-                onSocketEvent = ::onSocketCallback,
-                systemInstruction = systemInstruction
+        if (existingToAwait != null) {
+            logAdapter("LIVE_HANDSHAKE_DEDUPLICATED: Joining existing single-flight handshake for ${sessionId.value}.")
+            val joinedState = existingToAwait!!.await()
+            val shouldFallbackRetryFromAuto =
+                joinedWasAutoOnly &&
+                    !isControlledAutoReconnect &&
+                    (joinedState.phase == LiveConnectionPhase.FAILED || joinedState.phase == LiveConnectionPhase.DISCONNECTED) &&
+                    networkMonitor.isInternetValidated()
+            if (!shouldFallbackRetryFromAuto) {
+                return joinedState
+            }
+            // Only if a single-attempt background auto-reconnect failed, fall through once for full manual recovery
+            return executeHandshakeWithPolicy(
+                sessionId = sessionId,
+                maxAttemptsLimit = maxAttemptsLimit,
+                isControlledAutoReconnect = false,
+                reuseIfHealthy = reuseIfHealthy
             )
+        }
 
-            // Verify this generation wasn't preempted by STOP/PAUSE/disconnect, a newer request, or offline loss
-            val validatedAfterCall = networkMonitor.isInternetValidated()
-            val stillCurrent = synchronized(lock) {
-                activeConnectRequestId == requestId && activeGenerationId == genId
-            }
-            if (!stillCurrent) {
-                effectiveDriver.closeSocket(genId)
-                return _state.value
-            }
-            if (!validatedAfterCall) {
-                effectiveDriver.closeSocket(genId)
-                onNetworkValidatedChanged(false)
-                return _state.value
-            }
+        try {
+            return connectMutex.withLock {
+                if (reuseIfHealthy && synchronized(lock) { isHealthyEstablishedSessionLocked() }) {
+                    return@withLock _state.value
+                }
 
-            when (result) {
-                is LiveHandshakeResult.Accepted -> {
+                // Pre-handshake check for NET_CAPABILITY_INTERNET + NET_CAPABILITY_VALIDATED
+                if (!networkMonitor.isInternetValidated()) {
                     synchronized(lock) {
+                        lastKnownValidated = false
                         eligibleForSingleAutoReconnect = true
                         autoReconnectPerformedForOutage = false
-                    }
-                    onSocketCallback(
-                        LiveSocketCallbackEvent.SetupAccepted(
-                            generationId = genId,
-                            serverNote = result.serverNote
-                        )
-                    )
-                    return _state.value
-                }
-
-                is LiveHandshakeResult.Failed -> {
-                    effectiveDriver.closeSocket(genId)
-                    val classification = result.classification
-                    val redactedError = DiagnosticRedactor.redact(result.rawDetail)
-
-                    if (classification == LiveFailureClassification.NETWORK_UNAVAILABLE ||
-                        !networkMonitor.isInternetValidated()
-                    ) {
-                        onNetworkValidatedChanged(false)
-                        return _state.value
-                    }
-
-                    // Non-retryable failure classes MUST stop automatic retries immediately!
-                    if (!classification.retryable) {
-                        val stopReason =
-                            "AUTO_RETRY_HALTED_${classification.wireCode} (Non-retryable on model $configuredModelId; silent model fallback prohibited)"
-                        synchronized(lock) {
-                            if (activeConnectRequestId == requestId) {
-                                activeGenerationId = null
-                                updateStateAndNotify { prev ->
-                                    prev.copy(
-                                        phase = LiveConnectionPhase.FAILED,
-                                        activeGeneration = null,
-                                        lastCompletedGeneration = genId,
-                                        failureClassification = classification,
-                                        attemptCount = attempt,
-                                        retryCount = retryCount,
-                                        handshakeVerified = false,
-                                        autoRetryStoppedReason = stopReason,
-                                        statusHeadline = "FAILED (${classification.wireCode}) — AUTO-RETRY STOPPED",
-                                        statusDetail = "${classification.guidance} | Detail: $redactedError",
-                                        diagnostics = prev.diagnostics.copy(
-                                            modelId = configuredModelId,
-                                            sessionGenerationWireId = genId.wireId,
-                                            phaseWireCode = LiveConnectionPhase.FAILED.wireCode,
-                                            failureCode = classification.wireCode,
-                                            attemptCount = attempt,
-                                            retryCount = retryCount,
-                                            handshakeVerified = false,
-                                            redactedSummary = "$stopReason | $redactedError"
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                        return _state.value
-                    }
-
-                    // Transient network/socket failure: check bounded backoff policy & effectiveMaxAttempts
-                    val nextDelayMs = if (attempt >= effectiveMaxAttempts) {
-                        null
-                    } else {
-                        backoffPolicy.nextDelayMs(attemptIndex = attempt - 1)
-                    }
-
-                    if (nextDelayMs == null) {
-                        val exhaustedReason = if (isControlledAutoReconnect) {
-                            "CONTROLLED_AUTO_RECONNECT_COMPLETED_SINGLE_ATTEMPT (${classification.wireCode})"
-                        } else {
-                            "BOUNDED_BACKOFF_EXHAUSTED_AFTER_${attempt}_ATTEMPTS (${classification.wireCode})"
-                        }
-                        synchronized(lock) {
-                            if (activeConnectRequestId == requestId) {
-                                activeGenerationId = null
-                                updateStateAndNotify { prev ->
-                                    prev.copy(
-                                        phase = LiveConnectionPhase.FAILED,
-                                        activeGeneration = null,
-                                        lastCompletedGeneration = genId,
-                                        failureClassification = classification,
-                                        attemptCount = attempt,
-                                        retryCount = retryCount,
-                                        handshakeVerified = false,
-                                        autoRetryStoppedReason = exhaustedReason,
-                                        statusHeadline = "FAILED AFTER $attempt BOUNDED ATTEMPTS (${classification.wireCode})",
-                                        statusDetail = "$exhaustedReason | Last error: $redactedError",
-                                        diagnostics = prev.diagnostics.copy(
-                                            modelId = configuredModelId,
-                                            sessionGenerationWireId = genId.wireId,
-                                            phaseWireCode = LiveConnectionPhase.FAILED.wireCode,
-                                            failureCode = classification.wireCode,
-                                            attemptCount = attempt,
-                                            retryCount = retryCount,
-                                            handshakeVerified = false,
-                                            redactedSummary = "$exhaustedReason | $redactedError"
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                        return _state.value
-                    }
-
-                    // Wait bounded backoff before next attempt
-                    retryCount += 1
-                    synchronized(lock) {
-                        if (activeConnectRequestId != requestId) {
-                            return _state.value
-                        }
-                        val backoffMsg =
-                            "Transient failure (${classification.wireCode}) on ${genId.wireId}. Waiting ${nextDelayMs}ms before retry ${attempt + 1}/$effectiveMaxAttempts. Detail: $redactedError"
+                        activeGenerationId = null
+                        val offlineDetail =
+                            "NETWORK_UNAVAILABLE: Active network lacks NET_CAPABILITY_INTERNET and NET_CAPABILITY_VALIDATED. Firebase AI Logic and App Check were not called."
                         updateStateAndNotify { prev ->
                             prev.copy(
-                                phase = LiveConnectionPhase.RETRY_BACKOFF_WAITING,
-                                failureClassification = classification,
-                                attemptCount = attempt,
-                                retryCount = retryCount,
-                                lastBackoffDelayMs = nextDelayMs,
+                                phase = LiveConnectionPhase.NETWORK_UNAVAILABLE,
+                                activeGeneration = null,
+                                failureClassification = LiveFailureClassification.NETWORK_UNAVAILABLE,
+                                isInternetValidated = false,
+                                attemptCount = 0,
+                                retryCount = 0,
                                 handshakeVerified = false,
-                                statusHeadline = "TRANSIENT FAILURE — BACKOFF ${nextDelayMs}ms (RETRY $retryCount)",
-                                statusDetail = backoffMsg,
+                                audioPlaybackClaimed = false,
+                                autoRetryStoppedReason = "OFFLINE_PRECHECK_BLOCKED_NETWORK_UNAVAILABLE",
+                                statusHeadline = "NETWORK_UNAVAILABLE — NO VALIDATED INTERNET",
+                                statusDetail = offlineDetail,
                                 diagnostics = prev.diagnostics.copy(
                                     modelId = configuredModelId,
-                                    sessionGenerationWireId = genId.wireId,
-                                    phaseWireCode = LiveConnectionPhase.RETRY_BACKOFF_WAITING.wireCode,
-                                    failureCode = classification.wireCode,
-                                    attemptCount = attempt,
-                                    retryCount = retryCount,
-                                    lastBackoffDelayMs = nextDelayMs,
+                                    phaseWireCode = LiveConnectionPhase.NETWORK_UNAVAILABLE.wireCode,
+                                    failureCode = LiveFailureClassification.NETWORK_UNAVAILABLE.wireCode,
+                                    isInternetValidated = false,
+                                    attemptCount = 0,
+                                    retryCount = 0,
                                     handshakeVerified = false,
-                                    redactedSummary = backoffMsg
+                                    audioPlaybackClaimed = false,
+                                    redactedSummary = offlineDetail
                                 )
                             )
                         }
                     }
+                    withContext(backgroundDispatcher + NonCancellable) {
+                        effectiveDriver.closeAndAwaitSocket(null)
+                    }
+                    return@withLock _state.value
+                }
 
-                    delayRunner(nextDelayMs)
+                // Before creating a fresh generation: invalidate old generation, cancel collector/retry job,
+                // close old session once, and wait for cleanup off the main thread.
+                val hadPriorSessionOrFailure: Boolean
+                val requestId: Long
+                val priorJobToCancel: Job?
+                synchronized(lock) {
+                    requestId = connectRequestSeq.incrementAndGet()
+                    activeConnectRequestId = requestId
+                    val prevGen = activeGenerationId
+                    val prevPhase = _state.value.phase
+                    hadPriorSessionOrFailure = prevGen != null ||
+                        prevPhase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                        prevPhase == LiveConnectionPhase.ACTIVE ||
+                        prevPhase == LiveConnectionPhase.RECONNECTING ||
+                        prevPhase == LiveConnectionPhase.FAILED ||
+                        prevPhase == LiveConnectionPhase.NETWORK_RESTORED ||
+                        prevPhase == LiveConnectionPhase.RETRY_BACKOFF_WAITING
+                    activeGenerationId = null
+                    priorJobToCancel = if (!isControlledAutoReconnect) activeConnectJob else null
+                    if (!isControlledAutoReconnect) {
+                        activeConnectJob = null
+                    }
+                }
+                priorJobToCancel?.cancel()
+                if (hadPriorSessionOrFailure || priorJobToCancel != null) {
+                    withContext(backgroundDispatcher + NonCancellable) {
+                        effectiveDriver.closeAndAwaitSocket(null)
+                    }
+                } else {
+                    effectiveDriver.closeAndAwaitSocket(null)
+                }
 
-                    // Check if disconnected, preempted by newer request, or went offline during backoff delay
+                var attempt = 1
+                var retryCount = 0
+                val effectiveMaxAttempts = maxAttemptsLimit.coerceAtLeast(1)
+
+                while (attempt <= effectiveMaxAttempts) {
                     if (!networkMonitor.isInternetValidated()) {
                         onNetworkValidatedChanged(false)
-                        return _state.value
+                        return@withLock _state.value
                     }
-                    val stillWaiting = synchronized(lock) {
+
+                    val connectingPhase = if (attempt > 1 || isControlledAutoReconnect || hadPriorSessionOrFailure) {
+                        LiveConnectionPhase.RECONNECTING
+                    } else {
+                        LiveConnectionPhase.CONNECTING
+                    }
+
+                    val genId = synchronized(lock) {
+                        if (activeConnectRequestId != requestId) {
+                            return@withLock _state.value
+                        }
+                        val created = nextGenerationId(sessionId, attempt)
+                        activeGenerationId = created
+                        lastKnownValidated = true
+                        val newAutoReconnectCount = if (isControlledAutoReconnect && attempt == 1) {
+                            _state.value.autoReconnectCount + 1
+                        } else {
+                            _state.value.autoReconnectCount
+                        }
+                        val prefix = when {
+                            isControlledAutoReconnect -> "NETWORK_RESTORED -> AUTO_RECONNECT"
+                            connectingPhase == LiveConnectionPhase.RECONNECTING -> "RECONNECTING"
+                            else -> "CONNECTING"
+                        }
+                        val connectingSummary =
+                            "$prefix attempt $attempt/$effectiveMaxAttempts to $configuredModelId (${LiveConfigConstants.ENDPOINT_FAMILY.wireCode}) as ${created.wireId}."
+                        updateStateAndNotify { prev ->
+                            prev.copy(
+                                phase = connectingPhase,
+                                activeGeneration = created,
+                                configuredModelId = configuredModelId,
+                                failureClassification = LiveFailureClassification.NONE,
+                                isInternetValidated = true,
+                                attemptCount = attempt,
+                                retryCount = retryCount,
+                                autoReconnectCount = newAutoReconnectCount,
+                                handshakeVerified = false,
+                                audioPlaybackClaimed = false,
+                                registeredActionToolsCount = 0,
+                                autoRetryStoppedReason = null,
+                                statusHeadline = "${connectingPhase.wireCode} TO GEMINI LIVE (ATTEMPT $attempt/$effectiveMaxAttempts)",
+                                statusDetail = connectingSummary,
+                                diagnostics = prev.diagnostics.copy(
+                                    modelId = configuredModelId,
+                                    sessionGenerationWireId = created.wireId,
+                                    phaseWireCode = connectingPhase.wireCode,
+                                    failureCode = LiveFailureClassification.NONE.wireCode,
+                                    isInternetValidated = true,
+                                    attemptCount = attempt,
+                                    retryCount = retryCount,
+                                    autoReconnectCount = newAutoReconnectCount,
+                                    handshakeVerified = false,
+                                    audioPlaybackClaimed = false,
+                                    registeredActionToolsCount = 0,
+                                    redactedSummary = connectingSummary
+                                )
+                            )
+                        }
+                        created
+                    }
+
+                    val result = try {
+                        effectiveDriver.connectAndHandshake(
+                            generationId = genId,
+                            modelId = configuredModelId,
+                            onSocketEvent = ::onSocketCallback,
+                            systemInstruction = systemInstruction
+                        )
+                    } catch (ce: CancellationException) {
+                        withContext(backgroundDispatcher + NonCancellable) {
+                            effectiveDriver.closeAndAwaitSocket(genId)
+                        }
+                        throw ce
+                    }
+
+                    // Verify this generation wasn't preempted by STOP/PAUSE/disconnect, a newer request, or offline loss
+                    val validatedAfterCall = networkMonitor.isInternetValidated()
+                    val stillCurrent = synchronized(lock) {
                         activeConnectRequestId == requestId && activeGenerationId == genId
                     }
-                    if (!stillWaiting) {
-                        return _state.value
+                    if (!stillCurrent) {
+                        withContext(backgroundDispatcher + NonCancellable) {
+                            effectiveDriver.closeAndAwaitSocket(genId)
+                        }
+                        return@withLock _state.value
                     }
-                    attempt += 1
+                    if (!validatedAfterCall) {
+                        withContext(backgroundDispatcher + NonCancellable) {
+                            effectiveDriver.closeAndAwaitSocket(genId)
+                        }
+                        onNetworkValidatedChanged(false)
+                        return@withLock _state.value
+                    }
+
+                    when (result) {
+                        is LiveHandshakeResult.Accepted -> {
+                            synchronized(lock) {
+                                eligibleForSingleAutoReconnect = true
+                                autoReconnectPerformedForOutage = false
+                            }
+                            onSocketCallback(
+                                LiveSocketCallbackEvent.SetupAccepted(
+                                    generationId = genId,
+                                    serverNote = result.serverNote
+                                )
+                            )
+                            return@withLock _state.value
+                        }
+
+                        is LiveHandshakeResult.Failed -> {
+                            withContext(backgroundDispatcher + NonCancellable) {
+                                effectiveDriver.closeAndAwaitSocket(genId)
+                            }
+                            val classification = result.classification
+                            val redactedError = DiagnosticRedactor.redact(result.rawDetail)
+
+                            if (classification == LiveFailureClassification.NETWORK_UNAVAILABLE ||
+                                !networkMonitor.isInternetValidated()
+                            ) {
+                                onNetworkValidatedChanged(false)
+                                return@withLock _state.value
+                            }
+
+                            // Non-retryable failure classes MUST stop automatic retries immediately!
+                            if (!classification.retryable) {
+                                val stopReason =
+                                    "AUTO_RETRY_HALTED_${classification.wireCode} (Non-retryable on model $configuredModelId; silent model fallback prohibited)"
+                                synchronized(lock) {
+                                    if (activeConnectRequestId == requestId) {
+                                        activeGenerationId = null
+                                        updateStateAndNotify { prev ->
+                                            prev.copy(
+                                                phase = LiveConnectionPhase.FAILED,
+                                                activeGeneration = null,
+                                                lastCompletedGeneration = genId,
+                                                failureClassification = classification,
+                                                attemptCount = attempt,
+                                                retryCount = retryCount,
+                                                handshakeVerified = false,
+                                                autoRetryStoppedReason = stopReason,
+                                                statusHeadline = "FAILED (${classification.wireCode}) — AUTO-RETRY STOPPED",
+                                                statusDetail = "${classification.guidance} | Detail: $redactedError",
+                                                diagnostics = prev.diagnostics.copy(
+                                                    modelId = configuredModelId,
+                                                    sessionGenerationWireId = genId.wireId,
+                                                    phaseWireCode = LiveConnectionPhase.FAILED.wireCode,
+                                                    failureCode = classification.wireCode,
+                                                    attemptCount = attempt,
+                                                    retryCount = retryCount,
+                                                    handshakeVerified = false,
+                                                    redactedSummary = "$stopReason | $redactedError"
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                                return@withLock _state.value
+                            }
+
+                            // Transient network/socket failure: check bounded backoff policy & effectiveMaxAttempts
+                            val nextDelayMs = if (attempt >= effectiveMaxAttempts) {
+                                null
+                            } else {
+                                backoffPolicy.nextDelayMs(attemptIndex = attempt - 1)
+                            }
+
+                            if (nextDelayMs == null) {
+                                val exhaustedReason = if (isControlledAutoReconnect) {
+                                    "CONTROLLED_AUTO_RECONNECT_COMPLETED_SINGLE_ATTEMPT (${classification.wireCode})"
+                                } else {
+                                    "BOUNDED_BACKOFF_EXHAUSTED_AFTER_${attempt}_ATTEMPTS (${classification.wireCode})"
+                                }
+                                synchronized(lock) {
+                                    if (activeConnectRequestId == requestId) {
+                                        activeGenerationId = null
+                                        updateStateAndNotify { prev ->
+                                            prev.copy(
+                                                phase = LiveConnectionPhase.FAILED,
+                                                activeGeneration = null,
+                                                lastCompletedGeneration = genId,
+                                                failureClassification = classification,
+                                                attemptCount = attempt,
+                                                retryCount = retryCount,
+                                                handshakeVerified = false,
+                                                autoRetryStoppedReason = exhaustedReason,
+                                                statusHeadline = "FAILED AFTER $attempt BOUNDED ATTEMPTS (${classification.wireCode})",
+                                                statusDetail = "$exhaustedReason | Last error: $redactedError",
+                                                diagnostics = prev.diagnostics.copy(
+                                                    modelId = configuredModelId,
+                                                    sessionGenerationWireId = genId.wireId,
+                                                    phaseWireCode = LiveConnectionPhase.FAILED.wireCode,
+                                                    failureCode = classification.wireCode,
+                                                    attemptCount = attempt,
+                                                    retryCount = retryCount,
+                                                    handshakeVerified = false,
+                                                    redactedSummary = "$exhaustedReason | $redactedError"
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                                return@withLock _state.value
+                            }
+
+                            // Wait bounded backoff before next attempt
+                            retryCount += 1
+                            synchronized(lock) {
+                                if (activeConnectRequestId != requestId) {
+                                    return@withLock _state.value
+                                }
+                                val backoffMsg =
+                                    "Transient failure (${classification.wireCode}) on ${genId.wireId}. Waiting ${nextDelayMs}ms before retry ${attempt + 1}/$effectiveMaxAttempts. Detail: $redactedError"
+                                updateStateAndNotify { prev ->
+                                    prev.copy(
+                                        phase = LiveConnectionPhase.RETRY_BACKOFF_WAITING,
+                                        failureClassification = classification,
+                                        attemptCount = attempt,
+                                        retryCount = retryCount,
+                                        lastBackoffDelayMs = nextDelayMs,
+                                        handshakeVerified = false,
+                                        statusHeadline = "TRANSIENT FAILURE — BACKOFF ${nextDelayMs}ms (RETRY $retryCount)",
+                                        statusDetail = backoffMsg,
+                                        diagnostics = prev.diagnostics.copy(
+                                            modelId = configuredModelId,
+                                            sessionGenerationWireId = genId.wireId,
+                                            phaseWireCode = LiveConnectionPhase.RETRY_BACKOFF_WAITING.wireCode,
+                                            failureCode = classification.wireCode,
+                                            attemptCount = attempt,
+                                            retryCount = retryCount,
+                                            lastBackoffDelayMs = nextDelayMs,
+                                            handshakeVerified = false,
+                                            redactedSummary = backoffMsg
+                                        )
+                                    )
+                                }
+                            }
+
+                            delayRunner(nextDelayMs)
+
+                            // Check if disconnected, preempted by newer request, or went offline during backoff delay
+                            if (!networkMonitor.isInternetValidated()) {
+                                onNetworkValidatedChanged(false)
+                                return@withLock _state.value
+                            }
+                            val stillWaiting = synchronized(lock) {
+                                activeConnectRequestId == requestId && activeGenerationId == genId
+                            }
+                            if (!stillWaiting) {
+                                return@withLock _state.value
+                            }
+                            attempt += 1
+                        }
+                    }
+                }
+
+                _state.value
+            }
+        } finally {
+            val finalState = _state.value
+            synchronized(lock) {
+                if (inFlightConnectDeferred === myDeferred) {
+                    inFlightConnectDeferred = null
+                    inFlightConnectIsAutoReconnectOnly = false
                 }
             }
+            myDeferred.complete(finalState)
         }
-
-        return _state.value
     }
 
     /**
      * Cancels any scheduled retry backoff or in-flight connection attempt when the diagnostics
-     * screen is disposed, without destroying an already-verified `SETUP_ACCEPTED` session.
+     * screen is disposed, without destroying an already-verified `SETUP_ACCEPTED` or `ACTIVE` session.
      */
     fun cancelScheduledRetries(reason: String) {
         val jobToCancel: Job?
@@ -1618,7 +2142,8 @@ class GeminiLiveConnectionAdapter(
         synchronized(lock) {
             val currentPhase = _state.value.phase
             if (currentPhase == LiveConnectionPhase.RETRY_BACKOFF_WAITING ||
-                currentPhase == LiveConnectionPhase.CONNECTING
+                currentPhase == LiveConnectionPhase.CONNECTING ||
+                currentPhase == LiveConnectionPhase.RECONNECTING
             ) {
                 activeConnectRequestId = connectRequestSeq.incrementAndGet()
                 genToClose = activeGenerationId
@@ -1698,6 +2223,17 @@ class GeminiLiveConnectionAdapter(
     }
 
     /**
+     * Suspends until the old receive collector is cancelled/joined and the underlying LiveSession
+     * is closed once off the main thread.
+     */
+    suspend fun disconnectAndReleaseAsync(reason: String) {
+        disconnectAndRelease(reason)
+        withContext(backgroundDispatcher + NonCancellable) {
+            effectiveDriver.closeAndAwaitSocket(null)
+        }
+    }
+
+    /**
      * Recreates only the Gemini Live session (never the Activity/app) after an unexpected server
      * turn interruption so the next turn starts with a clean session state.
      */
@@ -1705,7 +2241,7 @@ class GeminiLiveConnectionAdapter(
         sessionId: SessionId,
         reason: String
     ): LiveConnectionState {
-        disconnectAndRelease("Session recreated after server turn interruption ($reason)")
-        return connectWithBoundedRetry(sessionId)
+        disconnectAndReleaseAsync("Session recreated after server turn interruption ($reason)")
+        return connectWithBoundedRetry(sessionId, reuseIfHealthy = false)
     }
 }

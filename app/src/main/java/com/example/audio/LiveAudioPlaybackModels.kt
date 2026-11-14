@@ -179,8 +179,43 @@ sealed interface PlaybackCallbackEvent {
 
     data class PlaybackFailed(
         override val generationId: PlaybackGenerationId,
-        val reason: String
+        val reason: String,
+        val errorCode: String = "AUDIO_TRACK_WRITE_FAILED"
     ) : PlaybackCallbackEvent
+}
+
+/**
+ * Snapshot of Android AudioTrack state, playState, write status, and track instance identity
+ * for diagnostics and honest error classification.
+ */
+data class AudioTrackDiagnostics(
+    val trackState: Int = 0,
+    val playState: Int = 0,
+    val sampleRateHz: Int = 0,
+    val channelCount: Int = 1,
+    val bufferSizeInFrames: Int = 0,
+    val trackInstanceId: Long = 0L,
+    val lastWriteCode: Int = 0,
+    val diagnostic: String = "NONE"
+)
+
+/**
+ * Maps real Android AudioTrack negative write/status error codes to human-readable labels
+ * without losing the raw integer code.
+ */
+object AudioTrackErrorMapper {
+    private const val ERR_GENERIC = -1
+    private const val ERR_BAD_VALUE = -2
+    private const val ERR_INVALID_OPERATION = -3
+    private const val ERR_DEAD_OBJECT = -6
+
+    fun mapCode(code: Int): String = when (code) {
+        ERR_GENERIC -> "ERROR(-1)"
+        ERR_BAD_VALUE -> "ERROR_BAD_VALUE(-2)"
+        ERR_INVALID_OPERATION -> "ERROR_INVALID_OPERATION(-3)"
+        ERR_DEAD_OBJECT -> "ERROR_DEAD_OBJECT(-6)"
+        else -> if (code < 0) "AUDIOTRACK_ERROR($code)" else "OK($code)"
+    }
 }
 
 /**
@@ -207,6 +242,14 @@ data class LiveAudioPlaybackState(
     val zeroWriteRetryCount: Int = 0,
     val stalePlaybackCallbacksDropped: Int = 0,
     val hardwareReleaseCount: Int = 0,
+    val trackState: Int = 0,
+    val playState: Int = 0,
+    val lastWriteResultCode: Int = 0,
+    val lastWriteErrorName: String = "NONE",
+    val trackCreationCount: Int = 0,
+    val trackRecreationCount: Int = 0,
+    val activeTrackInstanceId: Long = 0L,
+    val drainDeadlineMs: Long = 0L,
     val lastError: String? = null,
     val statusDetail: String = "Streaming playback adapter idle."
 )

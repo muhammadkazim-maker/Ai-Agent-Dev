@@ -666,19 +666,23 @@ class AudioCapture(
      * Processes a hardware callback event ONLY if its [CaptureGenerationId] matches the
      * currently active generation. Stale callbacks are counted and dropped.
      */
-    @Synchronized
     fun onHardwareCallback(event: CaptureCallbackEvent): Boolean {
-        val activeGen = _state.value.activeGeneration
-        if (activeGen == null || event.generationId != activeGen) {
-            _state.update {
-                it.copy(
-                    staleCallbacksDropped = it.staleCallbacksDropped + 1
-                )
-            }
-            return false
-        }
+        var postLockListener: ((CaptureGenerationId, ShortArray, Float) -> Unit)? = null
+        var postLockSamples: ShortArray? = null
+        var postLockRms = 0f
+        var listenerGen: CaptureGenerationId? = null
 
-        when (event) {
+        val accepted = synchronized(this) {
+            val activeGen = _state.value.activeGeneration
+            if (activeGen == null || event.generationId != activeGen) {
+                _state.update {
+                    it.copy(
+                        staleCallbacksDropped = it.staleCallbacksDropped + 1
+                    )
+                }
+                false
+            } else {
+                when (event) {
             is CaptureCallbackEvent.FrameCaptured -> {
                 val resampled16k = PcmResampler.resampleMono16Bit(
                     input = event.pcmSamples,
@@ -758,8 +762,11 @@ class AudioCapture(
                 }
 
                 if (listenerToNotify != null && resampled16k.isNotEmpty()) {
-                    // Defensive copy before async handoff so sender never shares a mutable buffer
-                    listenerToNotify.invoke(activeGen, resampled16k.copyOf(), rmsLinear)
+                    // Defensive copy queued for invocation right after lock release
+                    listenerGen = activeGen
+                    postLockListener = listenerToNotify
+                    postLockSamples = resampled16k.copyOf()
+                    postLockRms = rmsLinear
                 }
             }
 
@@ -819,8 +826,17 @@ class AudioCapture(
                     )
                 }
             }
+                }
+                true
+            }
         }
-        return true
+        val listener = postLockListener
+        val samples = postLockSamples
+        val genForListener = listenerGen
+        if (accepted && listener != null && samples != null && genForListener != null) {
+            listener.invoke(genForListener, samples, postLockRms)
+        }
+        return accepted
     }
 
     /**

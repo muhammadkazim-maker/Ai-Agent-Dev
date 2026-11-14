@@ -53,6 +53,7 @@ class ConversationShellViewModel(
     private val _hasRequestedPermissionOnce = MutableStateFlow(false)
     val hasRequestedPermissionOnce: StateFlow<Boolean> = _hasRequestedPermissionOnce.asStateFlow()
 
+    private val jobLock = Any()
     private var activeLiveConnectJob: Job? = null
     private var activeVoiceTurnJob: Job? = null
     private var activeFinishTurnJob: Job? = null
@@ -75,72 +76,118 @@ class ConversationShellViewModel(
         }
     }
 
-    fun onStartClicked() {
+    private fun isCoordinatorTurnInFlight(): Boolean {
         val currentState = coordinator.uiState.value.state
-        val isTurnInFlight = currentState == com.example.contract.ConversationState.CONNECTING ||
+        return currentState == com.example.contract.ConversationState.PREPARING ||
+            currentState == com.example.contract.ConversationState.CONNECTING ||
             currentState == com.example.contract.ConversationState.LISTENING ||
+            currentState == com.example.contract.ConversationState.THINKING ||
             currentState == com.example.contract.ConversationState.PROCESSING ||
-            currentState == com.example.contract.ConversationState.SPEAKING
-        if (isTurnInFlight || coordinator.isVoiceTurnInProgress()) {
-            viewModelScope.launch(workDispatcher) {
+            currentState == com.example.contract.ConversationState.SPEAKING ||
+            coordinator.isVoiceTurnInProgress()
+    }
+
+    fun onStartClicked() {
+        synchronized(jobLock) {
+            if (isCoordinatorTurnInFlight() || activeVoiceTurnJob?.isActive == true) {
+                viewModelScope.launch(workDispatcher) {
+                    coordinator.startVoiceTurn()
+                }
+                return
+            }
+            activeFinishTurnJob?.cancel()
+            activeFinishTurnJob = null
+            activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
                 coordinator.startVoiceTurn()
             }
-            return
         }
-        activeFinishTurnJob?.cancel()
-        activeFinishTurnJob = null
-        activeVoiceTurnJob?.cancel()
-        activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
-            coordinator.startVoiceTurn()
+    }
+
+    fun onResumeClicked() {
+        synchronized(jobLock) {
+            if (isCoordinatorTurnInFlight() || activeVoiceTurnJob?.isActive == true) {
+                return
+            }
+            activeFinishTurnJob?.cancel()
+            activeFinishTurnJob = null
+            activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
+                coordinator.resumeActiveConversation()
+            }
+        }
+    }
+
+    fun onToggleActiveConversationMode(enabled: Boolean) {
+        coordinator.setActiveConversationEnabled(enabled)
+    }
+
+    fun onToggleAutoResumeOnReopen(enabled: Boolean) {
+        coordinator.setAutoResumeOnScreenReopen(enabled)
+    }
+
+    fun onSelectInactivityTimeout(option: com.example.contract.InactivityTimeoutOption) {
+        coordinator.setInactivityTimeoutOption(option)
+    }
+
+    fun onConversationScreenVisible() {
+        if (_activeScreen.value != ActiveScreen.CONVERSATION_SHELL) return
+        synchronized(jobLock) {
+            if (isCoordinatorTurnInFlight() ||
+                activeVoiceTurnJob?.isActive == true ||
+                activeLiveConnectJob?.isActive == true
+            ) {
+                return
+            }
+            activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
+                coordinator.onConversationScreenVisible()
+            }
         }
     }
 
     fun onFinishSpokenTurnClicked() {
-        activeFinishTurnJob?.cancel()
-        activeFinishTurnJob = viewModelScope.launch(workDispatcher) {
-            coordinator.finishSpokenTurnAndAwaitResponse(
-                reason = "Operator tapped Send Spoken Question"
-            )
+        synchronized(jobLock) {
+            activeFinishTurnJob?.cancel()
+            activeFinishTurnJob = viewModelScope.launch(workDispatcher) {
+                coordinator.finishSpokenTurnAndAwaitResponse(
+                    reason = "Operator tapped Send Spoken Question"
+                )
+            }
         }
     }
 
-    fun onPauseClicked(): VerifiedOutcome {
+    private fun cancelAllJobsLocked() {
         activeFinishTurnJob?.cancel()
         activeFinishTurnJob = null
         activeVoiceTurnJob?.cancel()
         activeVoiceTurnJob = null
         activeLiveConnectJob?.cancel()
         activeLiveConnectJob = null
+    }
+
+    fun onPauseClicked(): VerifiedOutcome {
+        synchronized(jobLock) {
+            cancelAllJobsLocked()
+        }
         return coordinator.dispatch(CoordinatorCommand.PAUSE)
     }
 
     fun onStopClicked(): VerifiedOutcome {
-        activeFinishTurnJob?.cancel()
-        activeFinishTurnJob = null
-        activeVoiceTurnJob?.cancel()
-        activeVoiceTurnJob = null
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            cancelAllJobsLocked()
+        }
         return coordinator.dispatch(CoordinatorCommand.STOP)
     }
 
     fun onResetIdleClicked(): VerifiedOutcome {
-        activeFinishTurnJob?.cancel()
-        activeFinishTurnJob = null
-        activeVoiceTurnJob?.cancel()
-        activeVoiceTurnJob = null
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            cancelAllJobsLocked()
+        }
         return coordinator.dispatch(CoordinatorCommand.RESET_IDLE)
     }
 
     fun onVerifyStopPausePrecedenceClicked(): VerifiedOutcome {
-        activeFinishTurnJob?.cancel()
-        activeFinishTurnJob = null
-        activeVoiceTurnJob?.cancel()
-        activeVoiceTurnJob = null
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            cancelAllJobsLocked()
+        }
         return coordinator.dispatchWithPrecedence(
             listOf(CoordinatorCommand.START, CoordinatorCommand.PAUSE, CoordinatorCommand.STOP)
         )
@@ -168,15 +215,21 @@ class ConversationShellViewModel(
     }
 
     fun onConnectLiveHandshakeClicked() {
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = viewModelScope.launch(workDispatcher) {
-            coordinator.connectLiveSessionWithHandshake()
+        synchronized(jobLock) {
+            if (activeLiveConnectJob?.isActive == true) {
+                return
+            }
+            activeLiveConnectJob = viewModelScope.launch(workDispatcher) {
+                coordinator.connectLiveSessionWithHandshake()
+            }
         }
     }
 
     fun onDisconnectLiveSessionClicked(): VerifiedOutcome {
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            activeLiveConnectJob?.cancel()
+            activeLiveConnectJob = null
+        }
         return coordinator.dispatch(CoordinatorCommand.DISCONNECT_LIVE_SESSION)
     }
 
@@ -194,15 +247,18 @@ class ConversationShellViewModel(
     }
 
     fun onLiveDiagnosticsScreenDisposed() {
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            activeLiveConnectJob?.cancel()
+            activeLiveConnectJob = null
+        }
         coordinator.onLiveDiagnosticsDisposed("Live Diagnostics screen disposed")
     }
 
     /**
      * Navigating away from the Microphone Setup screen follows explicit lifecycle rules:
      * any active self-test capture or playback is immediately stopped, hardware is released,
-     * and any temporary recording is wiped.
+     * and any temporary recording is wiped. Reopening the visible conversation screen may
+     * auto-resume according to remembered user preference (never overriding Pause or Stop).
      */
     fun onNavigateBackFromMicSetup() {
         coordinator.onLifecycleReleaseHardware(
@@ -210,32 +266,38 @@ class ConversationShellViewModel(
             disconnectLive = false
         )
         _activeScreen.update { ActiveScreen.CONVERSATION_SHELL }
+        onConversationScreenVisible()
     }
 
     /**
      * Navigating away from the Live Diagnostics screen cancels any scheduled retries,
-     * unregisters network monitoring if no session is active, and returns to the Conversation Shell.
+     * unregisters network monitoring if no session is active, returns to the Conversation Shell,
+     * and checks remembered auto-resume preference (never overriding Pause or Stop).
      */
     fun onNavigateBackFromLiveDiagnostics() {
-        activeLiveConnectJob?.cancel()
-        activeLiveConnectJob = null
+        synchronized(jobLock) {
+            activeLiveConnectJob?.cancel()
+            activeLiveConnectJob = null
+        }
         coordinator.onLiveDiagnosticsDisposed("Navigated back from Live Diagnostics screen")
         _activeScreen.update { ActiveScreen.CONVERSATION_SHELL }
+        onConversationScreenVisible()
     }
 
     /**
      * Called from Activity/Composable lifecycle when Activity stops.
+     * If [isChangingConfigurations] is true (e.g., orientation rotation), preserves the single
+     * ViewModel-scoped coordinator and active session without releasing hardware or duplicating state.
      * If [isChangingConfigurations] is false (user backgrounded app or navigated away),
      * promptly releases hardware, wipes ephemeral self-test data, and disconnects live sockets.
      */
     fun onActivityStopped(isChangingConfigurations: Boolean) {
-        if (!isChangingConfigurations) {
-            activeFinishTurnJob?.cancel()
-            activeFinishTurnJob = null
-            activeVoiceTurnJob?.cancel()
-            activeVoiceTurnJob = null
-            activeLiveConnectJob?.cancel()
-            activeLiveConnectJob = null
+        if (isChangingConfigurations) {
+            coordinator.onConfigurationChangePreserved()
+        } else {
+            synchronized(jobLock) {
+                cancelAllJobsLocked()
+            }
             coordinator.onLifecycleReleaseHardware(
                 reason = "Activity stopped (backgrounded / navigated away)",
                 disconnectLive = true
@@ -286,9 +348,9 @@ class ConversationShellViewModel(
     }
 
     override fun onCleared() {
-        activeFinishTurnJob?.cancel()
-        activeVoiceTurnJob?.cancel()
-        activeLiveConnectJob?.cancel()
+        synchronized(jobLock) {
+            cancelAllJobsLocked()
+        }
         coordinator.onLifecycleReleaseHardware(
             reason = "ViewModel cleared",
             disconnectLive = true

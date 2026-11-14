@@ -237,12 +237,14 @@ private fun LiveDiagnosticsTopBar(
 @Composable
 private fun LivePhaseBadge(phase: LiveConnectionPhase) {
     val (bgColor, borderColor, textColor) = when (phase) {
-        LiveConnectionPhase.SETUP_ACCEPTED -> Triple(
+        LiveConnectionPhase.SETUP_ACCEPTED,
+        LiveConnectionPhase.ACTIVE -> Triple(
             MaterialTheme.colorScheme.tertiaryContainer,
             MaterialTheme.colorScheme.tertiary,
             MaterialTheme.colorScheme.onTertiaryContainer
         )
         LiveConnectionPhase.CONNECTING,
+        LiveConnectionPhase.RECONNECTING,
         LiveConnectionPhase.RETRY_BACKOFF_WAITING,
         LiveConnectionPhase.NETWORK_RESTORED -> Triple(
             MaterialTheme.colorScheme.primaryContainer,
@@ -527,6 +529,7 @@ private fun LiveConnectionControlsPane(
 ) {
     val isConnectingOrBackoff =
         liveState.phase == LiveConnectionPhase.CONNECTING ||
+            liveState.phase == LiveConnectionPhase.RECONNECTING ||
             liveState.phase == LiveConnectionPhase.RETRY_BACKOFF_WAITING
 
     Card(

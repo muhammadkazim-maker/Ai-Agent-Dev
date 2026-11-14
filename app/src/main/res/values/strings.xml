@@ -1,12 +1,13 @@
 <resources>
     <string name="app_name">OmniVoice Rebuild</string>
-    <string name="shell_subtitle">PHASE 04 // ONE-TURN GEMINI LIVE NATIVE-AUDIO COORDINATOR</string>
+    <string name="shell_subtitle">PHASE 05 // FOREGROUND ACTIVE CONVERSATION COORDINATOR</string>
     <string name="state_idle">IDLE</string>
     <string name="state_not_configured">NOT_CONFIGURED</string>
     <string name="state_paused">PAUSED</string>
     <string name="state_stopped">STOPPED</string>
     <string name="mic_status_honest">MIC: READY FOR GEMINI LIVE VOICE TURN</string>
     <string name="action_start">Start</string>
+    <string name="action_resume">Resume</string>
     <string name="action_end_spoken_turn">Send Spoken Question (End Turn)</string>
     <string name="action_pause">Pause</string>
     <string name="action_stop">Stop</string>
@@ -14,16 +15,17 @@
     <string name="action_verify_precedence">Test Stop/Pause Precedence</string>
     <string name="action_open_mic_setup">Microphone Setup &amp; Self-Test</string>
     <string name="action_open_live_diagnostics">Gemini Live Handshake &amp; Diagnostics</string>
-    <string name="settings_placeholder_title">Settings (Phase 04 Diagnostics)</string>
-    <string name="settings_placeholder_desc">Phase 04 connects the Phase 02 16kHz PCM AudioCapture adapter, Phase 03 GeminiLiveConnectionAdapter (gemini-3.1-flash-live-preview, v1beta), and Phase 04 streaming LiveAudioPlaybackAdapter into a single one-turn voice coordinator.</string>
+    <string name="settings_placeholder_title">Settings (Phase 05 Active Conversation)</string>
+    <string name="settings_placeholder_desc">Phase 05 extends the verified single-turn path into a serialized foreground active conversation (Preparing, Listening, Thinking, Speaking, Paused, Error) with generation-stamped events, automatic capture restoration after speech drain, inactivity session closure, and explicit half-duplex policy.</string>
     <string name="transcript_header">CONVERSATION TRANSCRIPT &amp; VERIFIED OUTCOMES</string>
-    <string name="transcript_empty_hint">Press Start to verify microphone &amp; internet, connect Gemini Live, speak one question, and hear the streaming native-audio response.</string>
-    <string name="controls_header">COMMAND DECK (ONE-TURN VOICE COORDINATOR)</string>
+    <string name="transcript_empty_hint">Press Start to verify microphone &amp; internet, connect Gemini Live, and hold an active multi-turn voice conversation.</string>
+    <string name="controls_header">COMMAND DECK (ACTIVE CONVERSATION COORDINATOR)</string>
     <string name="telemetry_header">COORDINATOR TELEMETRY</string>
-    <string name="cd_settings_button">Open Phase 04 Settings and Diagnostics</string>
+    <string name="cd_settings_button">Open Phase 05 Settings and Diagnostics</string>
     <string name="cd_mic_setup_button">Open Microphone Setup and Self-Test Screen</string>
     <string name="cd_live_diag_button">Open Gemini Live Connection and Diagnostics Screen</string>
     <string name="cd_start_button">Start conversation session</string>
+    <string name="cd_resume_button">Resume paused conversation session</string>
     <string name="cd_pause_button">Pause conversation session</string>
     <string name="cd_stop_button">Stop conversation session and release hardware immediately</string>
     <string name="mic_setup_title">Microphone Setup &amp; Local Capture Self-Test</string>

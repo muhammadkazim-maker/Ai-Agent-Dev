@@ -84,7 +84,15 @@ enum class LiveConnectionPhase(val wireCode: String, val userSummary: String) {
     ),
     SETUP_ACCEPTED(
         wireCode = "SETUP_ACCEPTED",
-        userSummary = "Live handshake verified & BidiGenerateContent setup accepted. Audio playback deferred (Phase 03)."
+        userSummary = "Live handshake verified & BidiGenerateContent setup accepted."
+    ),
+    ACTIVE(
+        wireCode = "ACTIVE",
+        userSummary = "Gemini Live session active and streaming realtime conversation turns."
+    ),
+    RECONNECTING(
+        wireCode = "RECONNECTING",
+        userSummary = "Closing previous generation cleanly and reconnecting Gemini Live session..."
     ),
     RETRY_BACKOFF_WAITING(
         wireCode = "RETRY_BACKOFF_WAITING",

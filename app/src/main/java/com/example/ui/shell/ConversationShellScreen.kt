@@ -98,7 +98,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.BuildConfig
 import com.example.R
 import com.example.audio.MicPermissionState
+import com.example.contract.ActiveConversationPhase
 import com.example.contract.ConversationState
+import com.example.contract.InactivityTimeoutOption
 import com.example.contract.TranscriptEntry
 import com.example.coordinator.ConversationUiState
 import com.example.ui.live.LiveDiagnosticsScreen
@@ -151,7 +153,8 @@ fun ConversationShellRoute(
         }
     }
 
-    // Re-check RECORD_AUDIO permission on ON_RESUME (after returning from Settings)
+    // Re-check RECORD_AUDIO permission on ON_RESUME (after returning from Settings),
+    // trigger screen-reopen auto-resume if configured (never overriding Pause or Stop),
     // and release hardware on ON_STOP when not rotating.
     DisposableEffect(lifecycleOwner, context) {
         val observer = LifecycleEventObserver { _, event ->
@@ -175,6 +178,7 @@ fun ConversationShellRoute(
                             shouldShowRationale = rationale
                         )
                     }
+                    viewModel.onConversationScreenVisible()
                 }
                 Lifecycle.Event.ON_STOP -> {
                     val changingConfigs = activity?.isChangingConfigurations == true
@@ -274,11 +278,15 @@ fun ConversationShellRoute(
                     isSettingsOpen = isSettingsOpen,
                     fontScaleOverride = fontScaleOverride,
                     onStartClick = handleMainStartClick,
+                    onResumeClick = viewModel::onResumeClicked,
                     onFinishSpokenTurnClick = viewModel::onFinishSpokenTurnClicked,
                     onPauseClick = { viewModel.onPauseClicked() },
                     onStopClick = { viewModel.onStopClicked() },
                     onResetIdleClick = { viewModel.onResetIdleClicked() },
                     onVerifyPrecedenceClick = { viewModel.onVerifyStopPausePrecedenceClicked() },
+                    onToggleActiveConversationMode = viewModel::onToggleActiveConversationMode,
+                    onToggleAutoResumeOnReopen = viewModel::onToggleAutoResumeOnReopen,
+                    onSelectInactivityTimeout = viewModel::onSelectInactivityTimeout,
                     onOpenMicSetup = viewModel::onOpenMicSetup,
                     onOpenLiveDiagnostics = viewModel::onOpenLiveDiagnostics,
                     onOpenSettings = viewModel::onOpenSettings,
@@ -297,11 +305,15 @@ fun ConversationShellScreen(
     isSettingsOpen: Boolean,
     fontScaleOverride: Float?,
     onStartClick: () -> Unit,
+    onResumeClick: () -> Unit = {},
     onFinishSpokenTurnClick: () -> Unit = {},
     onPauseClick: () -> Unit,
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
+    onToggleActiveConversationMode: (Boolean) -> Unit = {},
+    onToggleAutoResumeOnReopen: (Boolean) -> Unit = {},
+    onSelectInactivityTimeout: (InactivityTimeoutOption) -> Unit = {},
     onOpenMicSetup: () -> Unit = {},
     onOpenLiveDiagnostics: () -> Unit = {},
     onOpenSettings: () -> Unit,
@@ -371,11 +383,15 @@ fun ConversationShellScreen(
                         CommandDeckPane(
                             uiState = uiState,
                             onStartClick = onStartClick,
+                            onResumeClick = onResumeClick,
                             onFinishSpokenTurnClick = onFinishSpokenTurnClick,
                             onPauseClick = onPauseClick,
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
+                            onToggleActiveConversationMode = onToggleActiveConversationMode,
+                            onToggleAutoResumeOnReopen = onToggleAutoResumeOnReopen,
+                            onSelectInactivityTimeout = onSelectInactivityTimeout,
                             onOpenMicSetup = onOpenMicSetup,
                             onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                             modifier = Modifier
@@ -401,11 +417,15 @@ fun ConversationShellScreen(
                         CommandDeckPane(
                             uiState = uiState,
                             onStartClick = onStartClick,
+                            onResumeClick = onResumeClick,
                             onFinishSpokenTurnClick = onFinishSpokenTurnClick,
                             onPauseClick = onPauseClick,
                             onStopClick = onStopClick,
                             onResetIdleClick = onResetIdleClick,
                             onVerifyPrecedenceClick = onVerifyPrecedenceClick,
+                            onToggleActiveConversationMode = onToggleActiveConversationMode,
+                            onToggleAutoResumeOnReopen = onToggleAutoResumeOnReopen,
+                            onSelectInactivityTimeout = onSelectInactivityTimeout,
                             onOpenMicSetup = onOpenMicSetup,
                             onOpenLiveDiagnostics = onOpenLiveDiagnostics,
                             isPortraitEmbedded = true,
@@ -426,6 +446,9 @@ fun ConversationShellScreen(
                 uiState = uiState,
                 fontScaleOverride = fontScaleOverride,
                 onSelectFontScale = onSelectFontScale,
+                onToggleActiveConversationMode = onToggleActiveConversationMode,
+                onToggleAutoResumeOnReopen = onToggleAutoResumeOnReopen,
+                onSelectInactivityTimeout = onSelectInactivityTimeout,
                 onOpenMicSetup = {
                     onDismissSettings()
                     onOpenMicSetup()
@@ -584,7 +607,9 @@ private fun RealStateBadge(state: ConversationState) {
             MaterialTheme.colorScheme.outline,
             MaterialTheme.colorScheme.onSurface
         )
+        ConversationState.PREPARING,
         ConversationState.CONNECTING,
+        ConversationState.THINKING,
         ConversationState.PROCESSING -> Triple(
             MaterialTheme.colorScheme.primaryContainer,
             MaterialTheme.colorScheme.primary,
@@ -648,7 +673,9 @@ private fun RealStateBadge(state: ConversationState) {
 @Composable
 private fun TelemetryChip(label: String, tag: String) {
     Surface(
-        modifier = Modifier.testTag(tag),
+        modifier = Modifier
+            .testTag(tag)
+            .semantics(mergeDescendants = true) {},
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(8.dp),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
@@ -705,10 +732,7 @@ private fun HonestMicrophoneBadge(
 }
 
 /**
- * Phase 04 Voice Turn Pipeline & Streaming Audio Telemetry Card.
- * Replaces the old blank space in portrait mode with live visual feedback of
- * `CONNECTING -> LISTENING -> PROCESSING -> SPEAKING -> READY`, microphone frames sent,
- * native-audio playback drain progress, language mirroring status, and honest error classification.
+ * Phase 04/05 Voice Turn Pipeline, Active Conversation State Machine & Streaming Audio Telemetry Card.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -723,6 +747,14 @@ private fun VoiceTurnPipelineCard(
         ConversationState.PROCESSING,
         ConversationState.SPEAKING,
         ConversationState.READY
+    )
+    val activeConversationStages = listOf(
+        ActiveConversationPhase.PREPARING,
+        ActiveConversationPhase.LISTENING,
+        ActiveConversationPhase.THINKING,
+        ActiveConversationPhase.SPEAKING,
+        ActiveConversationPhase.PAUSED,
+        ActiveConversationPhase.ERROR
     )
     val playSnap = uiState.playbackState
 
@@ -744,7 +776,7 @@ private fun VoiceTurnPipelineCard(
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
-                    text = "PHASE 04 VOICE TURN PIPELINE & AUDIO HARDWARE",
+                    text = "PHASE 05 ACTIVE CONVERSATION & AUDIO PIPELINE",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.testTag("pipeline_card_header_text")
@@ -765,6 +797,49 @@ private fun VoiceTurnPipelineCard(
                     },
                     modifier = Modifier.testTag("playback_drain_status_text")
                 )
+            }
+
+            // Phase 05 Active Conversation State Machine Row: Preparing, Listening, Thinking, Speaking, Paused, Error
+            FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("active_conversation_phase_row"),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                activeConversationStages.forEach { phase ->
+                    val isCurrent = uiState.activeConversationPhase == phase
+                    val isVisited = uiState.activeConversationPhaseSequence.contains(phase)
+                    val chipBg = when {
+                        isCurrent -> MaterialTheme.colorScheme.primaryContainer
+                        isVisited -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f)
+                        else -> MaterialTheme.colorScheme.surfaceVariant
+                    }
+                    val chipBorder = when {
+                        isCurrent -> MaterialTheme.colorScheme.primary
+                        isVisited -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.outline
+                    }
+                    val chipText = when {
+                        isCurrent -> MaterialTheme.colorScheme.onPrimaryContainer
+                        isVisited -> MaterialTheme.colorScheme.onTertiaryContainer
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Surface(
+                        color = chipBg,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(if (isCurrent) 1.5.dp else 1.dp, chipBorder),
+                        modifier = Modifier.testTag("active_phase_${phase.wireLabel.lowercase()}")
+                    ) {
+                        Text(
+                            text = phase.wireLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (isCurrent || isVisited) FontWeight.Bold else FontWeight.Normal,
+                            color = chipText,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
             }
 
             // 5-stage visual pipeline: CONNECTING -> LISTENING -> PROCESSING -> SPEAKING -> READY
@@ -851,7 +926,7 @@ private fun VoiceTurnPipelineCard(
                     )
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "STATE: ${uiState.state.wireLabel}",
+                            text = "STATE: ${uiState.state.wireLabel} (PHASE: ${uiState.activeConversationPhase.wireLabel})",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
@@ -906,7 +981,7 @@ private fun VoiceTurnPipelineCard(
                 }
             }
 
-            // Live Mic, AudioTrack & Language Policy Telemetry Chips
+            // Live Mic, AudioTrack, Half-Duplex & Language Policy Telemetry Chips
             val displayedMicRms = maxOf(
                 uiState.voiceTurnPeakRmsLinear,
                 uiState.audioCaptureState.currentRmsLinear,
@@ -922,8 +997,16 @@ private fun VoiceTurnPipelineCard(
                     tag = "voice_turn_mic_metrics"
                 )
                 TelemetryChip(
-                    label = "AUDIOTRACK: ${playSnap.hardwarePlaybackHeadFrames}/${playSnap.totalFramesWrittenToHardware} frames (recv=${playSnap.framesReceivedFromServer}, ${playSnap.chunksReceived} chunks)",
+                    label = "AUDIOTRACK: played=${playSnap.hardwarePlaybackHeadFrames}/${playSnap.totalFramesWrittenToHardware} accepted (recv=${playSnap.framesReceivedFromServer}, ${playSnap.chunksReceived} chunks • s=${playSnap.trackState}/p=${playSnap.playState})",
                     tag = "voice_turn_playback_metrics"
+                )
+                TelemetryChip(
+                    label = "TURNS COMPLETED: ${uiState.completedTurnsInSession} • STALE DROPPED: ${uiState.staleTurnCallbacksDropped}",
+                    tag = "active_conversation_turns_chip"
+                )
+                TelemetryChip(
+                    label = uiState.duplexPolicyLabel,
+                    tag = "duplex_policy_chip"
                 )
                 TelemetryChip(
                     label = "LANGUAGE: MIRROR SPOKEN TURN (EN / UR / ROMAN-UR)",
@@ -965,6 +1048,39 @@ private fun VoiceTurnPipelineCard(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .testTag("voice_turn_model_transcript_text")
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (uiState.sessionDialogueHistory.isNotEmpty()) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("session_dialogue_history_box"),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "BOUNDED SESSION DIALOGUE (${uiState.sessionDialogueHistory.size}/${uiState.maxSessionDialogueTurns} TURNS)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        uiState.sessionDialogueHistory.takeLast(3).forEach { dTurn ->
+                            Text(
+                                text = "#${dTurn.turnNumberInSession} (${dTurn.turnId.value}): ${dTurn.userTranscript} → ${dTurn.modelTranscript}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }
@@ -1033,7 +1149,7 @@ private fun TranscriptAndTelemetryPane(
                     color = MaterialTheme.colorScheme.primary
                 )
                 Text(
-                    text = "ENTRIES: ${uiState.transcript.size}",
+                    text = "ENTRIES: ${uiState.transcript.size}/${uiState.maxTranscriptEntries}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1120,11 +1236,15 @@ private fun TranscriptEntryCard(entry: TranscriptEntry) {
 private fun CommandDeckPane(
     uiState: ConversationUiState,
     onStartClick: () -> Unit,
+    onResumeClick: () -> Unit,
     onFinishSpokenTurnClick: () -> Unit,
     onPauseClick: () -> Unit,
     onStopClick: () -> Unit,
     onResetIdleClick: () -> Unit,
     onVerifyPrecedenceClick: () -> Unit,
+    onToggleActiveConversationMode: (Boolean) -> Unit,
+    onToggleAutoResumeOnReopen: (Boolean) -> Unit,
+    onSelectInactivityTimeout: (InactivityTimeoutOption) -> Unit,
     onOpenMicSetup: () -> Unit,
     onOpenLiveDiagnostics: () -> Unit,
     isPortraitEmbedded: Boolean = false,
@@ -1181,7 +1301,11 @@ private fun CommandDeckPane(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "One-Turn Gemini Live Voice (CONNECTING → LISTENING → SPEAKING → READY)",
+                        text = if (uiState.isActiveConversationEnabled) {
+                            "Active Conversation (Auto-Restore Capture After Speech)"
+                        } else {
+                            "One-Turn Gemini Live Voice (CONNECTING → LISTENING → SPEAKING → READY)"
+                        },
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
@@ -1219,10 +1343,10 @@ private fun CommandDeckPane(
                 )
             }
 
-            // Large Pause & Stop Buttons
+            // Large Pause, Resume & Stop Controls
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
                     onClick = onPauseClick,
@@ -1233,7 +1357,7 @@ private fun CommandDeckPane(
                         .testTag("pause_button")
                         .semantics { contentDescription = "Pause conversation session" },
                     shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.secondary,
                         contentColor = MaterialTheme.colorScheme.onSecondary
@@ -1242,11 +1366,39 @@ private fun CommandDeckPane(
                     Icon(
                         imageVector = Icons.Filled.Pause,
                         contentDescription = null,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = stringResource(R.string.action_pause),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+
+                Button(
+                    onClick = onResumeClick,
+                    enabled = uiState.state != ConversationState.STOPPED && !uiState.isDeliberatelyStopped,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 64.dp)
+                        .minimumInteractiveComponentSize()
+                        .testTag("resume_button")
+                        .semantics { contentDescription = "Resume paused conversation session" },
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary,
+                        contentColor = MaterialTheme.colorScheme.onTertiary
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = stringResource(R.string.action_resume),
                         style = MaterialTheme.typography.labelLarge
                     )
                 }
@@ -1260,7 +1412,7 @@ private fun CommandDeckPane(
                         .testTag("stop_button")
                         .semantics { contentDescription = "Stop conversation session immediately" },
                     shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError
@@ -1269,13 +1421,101 @@ private fun CommandDeckPane(
                     Icon(
                         imageVector = Icons.Filled.Stop,
                         contentDescription = null,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = stringResource(R.string.action_stop),
                         style = MaterialTheme.typography.labelLarge
                     )
+                }
+            }
+
+            // Phase 05 Active Conversation & Inactivity Session Closure Visible Controls
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("active_conversation_settings_card"),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "ACTIVE CONVERSATION & INACTIVITY SESSION CLOSURE",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        FilterChip(
+                            selected = uiState.isActiveConversationEnabled,
+                            onClick = { onToggleActiveConversationMode(!uiState.isActiveConversationEnabled) },
+                            label = {
+                                Text(
+                                    text = if (uiState.isActiveConversationEnabled) {
+                                        "Auto-Continue Turns: ON"
+                                    } else {
+                                        "Auto-Continue Turns: OFF"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            modifier = Modifier.testTag("active_conversation_mode_chip")
+                        )
+
+                        FilterChip(
+                            selected = uiState.autoResumeOnScreenReopen,
+                            onClick = { onToggleAutoResumeOnReopen(!uiState.autoResumeOnScreenReopen) },
+                            label = {
+                                Text(
+                                    text = if (uiState.autoResumeOnScreenReopen) {
+                                        "Auto-Resume on Reopen: ON"
+                                    } else {
+                                        "Auto-Resume on Reopen: OFF"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            modifier = Modifier.testTag("auto_resume_reopen_chip")
+                        )
+                    }
+
+                    Text(
+                        text = "Inactivity Session Timeout (closes idle session; no arbitrary 6-turn limit):",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FlowRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("inactivity_timeout_selector_row"),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        InactivityTimeoutOption.entries.forEach { option ->
+                            FilterChip(
+                                selected = uiState.inactivityTimeoutOption == option,
+                                onClick = { onSelectInactivityTimeout(option) },
+                                label = {
+                                    Text(
+                                        text = option.shortChipLabel,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                },
+                                modifier = Modifier.testTag("inactivity_timeout_chip_${option.shortChipLabel.lowercase()}")
+                            )
+                        }
+                    }
                 }
             }
 
@@ -1414,6 +1654,9 @@ private fun SettingsPlaceholderDialog(
     uiState: ConversationUiState,
     fontScaleOverride: Float?,
     onSelectFontScale: (Float?) -> Unit,
+    onToggleActiveConversationMode: (Boolean) -> Unit,
+    onToggleAutoResumeOnReopen: (Boolean) -> Unit,
+    onSelectInactivityTimeout: (InactivityTimeoutOption) -> Unit,
     onOpenMicSetup: () -> Unit,
     onOpenLiveDiagnostics: () -> Unit,
     onDismiss: () -> Unit
@@ -1477,7 +1720,64 @@ private fun SettingsPlaceholderDialog(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
                 Text(
-                    text = "PHASE 04 ENVIRONMENT & CONTRACT TELEMETRY",
+                    text = "PHASE 05 ACTIVE CONVERSATION PREFERENCES",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = uiState.isActiveConversationEnabled,
+                        onClick = { onToggleActiveConversationMode(!uiState.isActiveConversationEnabled) },
+                        label = {
+                            Text(
+                                text = "Auto-Continue Turns: ${if (uiState.isActiveConversationEnabled) "ON" else "OFF"}",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        },
+                        modifier = Modifier.testTag("settings_active_conversation_chip")
+                    )
+
+                    FilterChip(
+                        selected = uiState.autoResumeOnScreenReopen,
+                        onClick = { onToggleAutoResumeOnReopen(!uiState.autoResumeOnScreenReopen) },
+                        label = {
+                            Text(
+                                text = "Auto-Resume on Screen Reopen: ${if (uiState.autoResumeOnScreenReopen) "ON" else "OFF"}",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        },
+                        modifier = Modifier.testTag("settings_auto_resume_reopen_chip")
+                    )
+                }
+
+                Text(
+                    text = "Inactivity Session Timeout (${uiState.inactivityTimeoutOption.shortChipLabel}):",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    InactivityTimeoutOption.entries.forEach { option ->
+                        FilterChip(
+                            selected = uiState.inactivityTimeoutOption == option,
+                            onClick = { onSelectInactivityTimeout(option) },
+                            label = { Text(option.shortChipLabel, style = MaterialTheme.typography.labelSmall) },
+                            modifier = Modifier.testTag("settings_inactivity_chip_${option.shortChipLabel.lowercase()}")
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+                Text(
+                    text = "PHASE 05 ENVIRONMENT & CONTRACT TELEMETRY",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -1487,10 +1787,14 @@ private fun SettingsPlaceholderDialog(
                         "• Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
                         "• Source/Build ID: ${BuildConfig.SOURCE_BUILD_ID}\n" +
                         "• Model Config: ${BuildConfig.MODEL_CONFIG_STATUS}\n" +
+                        "• Duplex Policy: ${uiState.duplexPolicyLabel} (Barge-In Claimed: ${uiState.isSpokenBargeInClaimed})\n" +
+                        "• Active Phase: ${uiState.activeConversationPhase.wireLabel} (Completed Turns: ${uiState.completedTurnsInSession})\n" +
+                        "• Resource Releases Before Capture: ${uiState.resourceReleaseBeforeCaptureCount}\n" +
+                        "• Inactivity Closures: ${uiState.inactivityClosedCount}\n" +
                         "• Live Model ID: ${uiState.liveConnectionState.configuredModelId} (${uiState.liveConnectionState.phase.wireCode})\n" +
                         "• Live Session Gen: ${uiState.liveConnectionState.diagnostics.sessionGenerationWireId}\n" +
                         "• Audio Owner: ${uiState.audioCaptureState.owner.wireLabel} (Gen: ${uiState.audioCaptureState.activeGeneration?.wireId ?: "NONE"})\n" +
-                        "• Playback Gen: ${uiState.playbackState.activeGeneration?.wireId ?: "NONE"} (Drained: ${uiState.playbackState.isPlaybackDrained})\n" +
+                        "• Playback Gen: ${uiState.playbackState.activeGeneration?.wireId ?: "NONE"} (Drained: ${uiState.playbackState.isPlaybackDrained}, State=${uiState.playbackState.trackState}, Play=${uiState.playbackState.playState}, Write=${uiState.playbackState.lastWriteErrorName}, Recreated=${uiState.playbackState.trackRecreationCount})\n" +
                         "• Mic Permission: ${uiState.audioCaptureState.permissionState.wireLabel}\n" +
                         "• Runtime API Level: Android SDK ${Build.VERSION.SDK_INT} (minSdk 24, targetSdk 36)\n" +
                         "• Coordinator Actions Executed: ${uiState.executedActionCount}\n" +

@@ -280,6 +280,9 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("connect_live_button")
             .performScrollTo()
             .performClick()
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+            viewModel.liveState.value.phase == LiveConnectionPhase.FAILED
+        }
         composeTestRule.waitForIdle()
 
         assertEquals(LiveConnectionPhase.FAILED, viewModel.liveState.value.phase)
@@ -330,6 +333,9 @@ class ExampleRobolectricTest {
                 composeTestRule.onNodeWithTag("connect_live_button")
                     .performScrollTo()
                     .performClick()
+                composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+                    viewModel.liveState.value.phase == LiveConnectionPhase.FAILED
+                }
                 composeTestRule.waitForIdle()
                 composeTestRule.onNodeWithTag("live_diag_phase_text", useUnmergedTree = true)
                     .assertTextEquals("FAILED")
@@ -427,7 +433,8 @@ class ExampleRobolectricTest {
             playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
                 driver = outputDriver,
                 writeRetryDelayRunner = {},
-                drainPollDelayRunner = {}
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
             )
         )
         val viewModel = ConversationShellViewModel(coordinator = coordinator)
@@ -599,4 +606,151 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("pause_button").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("stop_button").performScrollTo().assertIsDisplayed()
     }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w412dp-h892dp-port")
+    fun `phase 05 active conversation UI displays Preparing Listening Thinking Speaking Paused Error stages, large Pause Resume Stop controls, inactivity timeout setting, and explicit half-duplex policy`() {
+        val liveDriver = com.example.live.DeterministicTestLiveTransportDriver()
+        val outputDriver = com.example.audio.DeterministicStreamingAudioTrackDriver()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                driver = outputDriver,
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            )
+        )
+        val viewModel = ConversationShellViewModel(coordinator = coordinator)
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+        viewModel.onPermissionRequestResult(granted = true, shouldShowRationale = false)
+        composeTestRule.waitForIdle()
+
+        // 1. Verify Phase 05 Active Conversation stages and explicit half-duplex policy indicator
+        composeTestRule.onNodeWithTag("active_conversation_phase_row").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_preparing").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_listening").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_thinking").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_speaking").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_paused").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("active_phase_error").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("duplex_policy_chip")
+            .assertTextContains("HALF-DUPLEX", substring = true)
+
+        // 2. Verify large Pause, Resume, and Stop controls and visible inactivity timeout setting
+        composeTestRule.onNodeWithTag("pause_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("resume_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("stop_button").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("inactivity_timeout_selector_row").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("inactivity_timeout_chip_30s").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(30_000L, viewModel.uiState.value.inactivityTimeoutMs)
+
+        // 3. Click Start -> enters LISTENING; complete Turn 1 -> auto-restores LISTENING for Turn 2
+        composeTestRule.onNodeWithTag("start_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(com.example.contract.ConversationState.LISTENING, viewModel.uiState.value.state)
+
+        val capGen1 = viewModel.audioState.value.activeGeneration!!
+        viewModel.coordinator.onAudioHardwareCallback(
+            CaptureCallbackEvent.FrameCaptured(
+                generationId = capGen1,
+                pcmSamples = ShortArray(320) { 7500 },
+                hardwareSampleRateHz = 16000
+            )
+        )
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("end_spoken_turn_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        // After Turn 1 completes, active conversation automatically restores capture for Turn 2!
+        assertEquals(1, viewModel.uiState.value.completedTurnsInSession)
+        assertEquals(com.example.contract.ConversationState.LISTENING, viewModel.uiState.value.state)
+        assertTrue(viewModel.audioState.value.isCapturing)
+
+        // 4. Click Pause -> enters PAUSED; click Resume -> restores LISTENING; click Stop -> enters STOPPED
+        composeTestRule.onNodeWithTag("pause_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(com.example.contract.ConversationState.PAUSED, viewModel.uiState.value.state)
+
+        composeTestRule.onNodeWithTag("resume_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(com.example.contract.ConversationState.LISTENING, viewModel.uiState.value.state)
+
+        composeTestRule.onNodeWithTag("stop_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(com.example.contract.ConversationState.STOPPED, viewModel.uiState.value.state)
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w412dp-h892dp-port")
+    fun `phase 05 recomposition, repeated screen visible callbacks, and rapid Start do not create duplicate handshakes`() {
+        val liveDriver = com.example.live.DeterministicTestLiveTransportDriver()
+        val outputDriver = com.example.audio.DeterministicStreamingAudioTrackDriver()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                driver = outputDriver,
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true,
+                hasCompletedFirstUseConsentAndConfig = true,
+                autoResumeOnScreenReopen = true
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val viewModel = ConversationShellViewModel(
+            coordinator = coordinator,
+            workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        )
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Rapid double Start on initial launch -> only 1 Live handshake
+        composeTestRule.onNodeWithTag("start_button").performScrollTo().performClick()
+        composeTestRule.onNodeWithTag("start_button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(1, liveDriver.invocationCount)
+        assertEquals(com.example.contract.ConversationState.LISTENING, viewModel.uiState.value.state)
+
+        // Trigger multiple state updates/recompositions + repeated onConversationScreenVisible + orientation config change
+        viewModel.onSetFontScaleOverride(1.1f)
+        composeTestRule.waitForIdle()
+        viewModel.onSetFontScaleOverride(null)
+        composeTestRule.waitForIdle()
+        viewModel.onConversationScreenVisible()
+        viewModel.onConversationScreenVisible()
+        viewModel.onActivityStopped(isChangingConfigurations = true)
+        composeTestRule.waitForIdle()
+
+        assertEquals("Recomposition and ON_RESUME must never recreate the Live handshake", 1, liveDriver.invocationCount)
+        assertEquals(1, viewModel.uiState.value.configurationChangePreservedCount)
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, viewModel.liveState.value.phase)
+    }
 }
+
