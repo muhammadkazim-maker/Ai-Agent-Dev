@@ -429,6 +429,23 @@ private fun RedactedDiagnosticsPane(
                     label = "STALE DROPPED: ${diag.staleCallbacksDropped}",
                     tag = "live_diag_stale_callbacks_label"
                 )
+                val vadStatus = when {
+                    uiState.vadModelLoaded -> "LOADED"
+                    !uiState.vadModelLoadError.isNullOrBlank() -> "LOAD_FAILED"
+                    else -> "NOT_LOADED"
+                }
+                DiagnosticChip(
+                    label = "VAD: ${uiState.vadDetectorName} v${uiState.vadDetectorVersion} ($vadStatus)",
+                    tag = "live_diag_vad_model_label"
+                )
+                DiagnosticChip(
+                    label = "GATE: ${uiState.speechGateState.wireCode} • ${if (uiState.vadSpeechDecision) "SPEECH" else "NOISE"} (p=${"%.2f".format(uiState.vadSpeechProbability)})",
+                    tag = "live_diag_vad_gate_label"
+                )
+                DiagnosticChip(
+                    label = "CAND: ${uiState.consecutiveSpeechDurationMs}ms (${uiState.vadCandidateConfirmationCount}w) • ACT_START: ${uiState.activityStartCount}",
+                    tag = "live_diag_vad_candidate_label"
+                )
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)

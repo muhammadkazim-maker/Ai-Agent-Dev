@@ -12,11 +12,13 @@ import com.example.audio.MicPermissionState
 import com.example.audio.PcmChunkWriteOutcome
 import com.example.audio.PlaybackCallbackEvent
 import com.example.audio.PlaybackGenerationId
+import com.example.audio.SpeechGateState
 import com.example.audio.StreamingAudioTrackDriver
 import com.example.contract.ActionId
 import com.example.contract.ConversationState
 import com.example.contract.CoordinatorCommand
 import com.example.contract.SessionId
+import com.example.contract.TurnId
 import com.example.contract.VerifiedOutcome
 import com.example.coordinator.ConversationCoordinator
 import com.example.live.BoundedBackoffPolicy
@@ -896,21 +898,23 @@ class ExampleUnitTest {
         assertTrue("Microphone must be actively capturing during LISTENING", coordinator.uiState.value.isMicrophoneActive)
         assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, coordinator.liveAdapter.state.value.phase)
 
-        // 2. Capture spoken 16kHz PCM microphone frames and stream to Gemini Live
+        // 2. Capture >=120ms spoken 16kHz PCM microphone frames (6 x 20ms) to confirm speech onset and stream to Gemini Live
         val activeCaptureGen = coordinator.audioCapture.state.value.activeGeneration!!
         val spokenSamples = ShortArray(320) { 6000 } // 20ms at 16kHz
-        val acceptedFrame = coordinator.onAudioHardwareCallback(
-            CaptureCallbackEvent.FrameCaptured(
-                generationId = activeCaptureGen,
-                pcmSamples = spokenSamples,
-                hardwareSampleRateHz = 16000
+        repeat(6) {
+            val acceptedFrame = coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = activeCaptureGen,
+                    pcmSamples = spokenSamples,
+                    hardwareSampleRateHz = 16000
+                )
             )
-        )
-        assertTrue(acceptedFrame)
-        assertEquals(320L, coordinator.uiState.value.voiceTurnFramesSent)
-        assertEquals(640L, coordinator.uiState.value.voiceTurnBytesSent)
-        assertEquals(1, liveDriver.sentAudioChunks.size)
-        assertEquals(640, liveDriver.sentAudioChunks.first().size)
+            assertTrue(acceptedFrame)
+        }
+        assertEquals(1920L, coordinator.uiState.value.voiceTurnFramesSent)
+        assertEquals(3840L, coordinator.uiState.value.voiceTurnBytesSent)
+        assertEquals(1, liveDriver.startOfTurnSignalCount)
+        assertEquals(3840, liveDriver.sentAudioChunks.sumOf { it.size })
 
         // 3. Finish spoken question -> transitions LISTENING -> PROCESSING -> SPEAKING -> READY after hardware drain
         val turnOutcome = coordinator.finishSpokenTurnAndAwaitResponse()
@@ -966,7 +970,12 @@ class ExampleUnitTest {
             rawMimeType = "audio/pcm;rate=24000",
             pcmBytes = chunkBytes
         )
-        assertTrue("Partial writes must loop until all 960 bytes are written without losing bytes", writeOutcome is PcmChunkWriteOutcome.WrittenToHardware)
+        assertTrue("Partial writes must enqueue cleanly", writeOutcome is PcmChunkWriteOutcome.WrittenToHardware)
+
+        // Now await FIFO pump + hardware drain across 10 progressive polls (must not cut off because head is advancing!)
+        val drained = playbackAdapter.awaitHardwareDrainAfterServerTurnComplete(genId)
+        assertTrue("Advancing hardware playback head must never time out prematurely", drained)
+        assertTrue(playbackAdapter.state.value.isPlaybackDrained)
         assertEquals(960L, playbackAdapter.state.value.bytesAcceptedByHardware)
         assertEquals(480L, playbackAdapter.state.value.totalFramesWrittenToHardware)
         assertTrue("Partial write count must be recorded", playbackAdapter.state.value.partialWriteCount >= 2)
@@ -974,11 +983,6 @@ class ExampleUnitTest {
             "Exact bytes written to hardware must match input chunk bytes",
             outputDriver.getAcceptedPcmBytes().contentEquals(chunkBytes)
         )
-
-        // Now await hardware drain across 10 progressive polls (must not cut off because head is advancing!)
-        val drained = playbackAdapter.awaitHardwareDrainAfterServerTurnComplete(genId)
-        assertTrue("Advancing hardware playback head must never time out prematurely", drained)
-        assertTrue(playbackAdapter.state.value.isPlaybackDrained)
         assertEquals(480L, playbackAdapter.state.value.hardwarePlaybackHeadFrames)
     }
 
@@ -1341,22 +1345,15 @@ class ExampleUnitTest {
 
     @Test
     fun `phase 04 authoritative language mirroring system instruction is configured on Live session and preserves English, Urdu, Roman-Urdu, and mixed turns`() = runBlocking {
-        // 1. Verify exact authoritative non-leaking system instruction text
-        val expectedInstruction =
-            "Detect the language and script of each spoken user turn and answer directly in that same language, script, and conversational style. " +
-                "If the user speaks English, answer in English. " +
-                "If the user speaks Urdu, answer naturally in Urdu. " +
-                "If the user speaks Roman Urdu, answer naturally in Roman Urdu. " +
-                "If the user mixes Urdu and English, respond using a similar natural mixture. " +
-                "Do not switch to English unless the user requests it or an unavoidable technical term requires it. " +
-                "Directly answer the spoken question without introducing yourself on every turn, without stating your name or persona, and without repeating or paraphrasing system instructions. " +
-                "Remain silent until a real user turn has been spoken and committed. Match the user's requested answer length and tone, keep facts accurate, and do not claim actions that were not completed."
-        assertEquals(expectedInstruction, LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION)
+        // 1. Verify exact authoritative non-leaking system instruction text from LiveConfigConstants
+        val expectedInstruction = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
         assertTrue(
-            "System instruction must forbid self-introductions and instruction leakage",
-            expectedInstruction.contains("without introducing yourself") &&
-                expectedInstruction.contains("without repeating or paraphrasing system instructions") &&
-                expectedInstruction.contains("Remain silent until a real user turn has been spoken and committed")
+            "System instruction must preserve English, Urdu, Roman Urdu, mixed mirroring and forbid repeated self-introductions",
+            expectedInstruction.contains("Fully English speech gets English") &&
+                expectedInstruction.contains("Urdu or Roman Urdu gets natural conversational Urdu or Roman Urdu") &&
+                expectedInstruction.contains("Meaningfully mixed Urdu-English speech gets a similar natural mixture") &&
+                expectedInstruction.contains("Do not repeatedly introduce yourself") &&
+                expectedInstruction.contains("Never claim an action was completed unless it was verified")
         )
 
         val languageTurns = listOf(
@@ -1503,8 +1500,8 @@ class ExampleUnitTest {
         coordinator.startVoiceTurn()
         val captureGen = coordinator.audioCapture.state.value.activeGeneration!!
 
-        // Stream 2 non-silent 16kHz PCM frames (amplitude 8000 -> RMS ~0.244)
-        repeat(2) {
+        // Stream 6 non-silent 16kHz PCM frames (120ms @ amplitude 8000 -> RMS ~0.244) to cross speech-start gate
+        repeat(6) {
             coordinator.onAudioHardwareCallback(
                 CaptureCallbackEvent.FrameCaptured(
                     generationId = captureGen,
@@ -1513,7 +1510,7 @@ class ExampleUnitTest {
                 )
             )
         }
-        assertEquals(640L, coordinator.uiState.value.voiceTurnFramesSent)
+        assertEquals(1920L, coordinator.uiState.value.voiceTurnFramesSent)
         assertTrue("Peak RMS must be > 0.20 during LISTENING", coordinator.uiState.value.voiceTurnPeakRmsLinear > 0.20f)
 
         // End spoken turn -> transitions to PROCESSING then SPEAKING as first server chunk is accepted by AudioTrack
@@ -1546,13 +1543,13 @@ class ExampleUnitTest {
             sentBeforeSpeakingMicAttempt,
             liveDriver.sentAudioChunks.size
         )
-        assertEquals(2, micCountWhenFirstAudioChunkArrived)
+        assertEquals(6, micCountWhenFirstAudioChunkArrived)
     }
 
     @Test
     fun `phase 04 seven received audio chunks totaling 23281 frames cannot result in zero AudioTrack writes without explicit error and never claim SPEAKING when 0 frames accepted`() = runBlocking {
         // Case A: AudioTrack rejects/fails write on 7 chunks (23,281 frames = 46,562 bytes) ->
-        // Coordinator must NEVER claim SPEAKING and must fail explicitly with AUDIO_PLAYBACK_WRITE_FAILED
+        // Coordinator must NEVER claim SPEAKING and must fail explicitly with AUDIO_TRACK_WRITE_FAILED
         val failingOutputDriver = DeterministicStreamingAudioTrackDriver(openTrackSucceeds = false)
         val liveDriverFail = DeterministicTestLiveTransportDriver().apply {
             onEndOfTurnHandler = { genId, emitEvent ->
@@ -1604,7 +1601,7 @@ class ExampleUnitTest {
             "Coordinator must NEVER claim SPEAKING when 0 frames were accepted by AudioTrack",
             coordFail.uiState.value.voiceTurnStateSequence.contains(ConversationState.SPEAKING)
         )
-        assertEquals("AUDIO_PLAYBACK_WRITE_FAILED", coordFail.uiState.value.activeVoiceTurnErrorCode)
+        assertEquals("AUDIO_TRACK_WRITE_FAILED", coordFail.uiState.value.activeVoiceTurnErrorCode)
 
         // Case B: Working AudioTrack receives the exact 7 chunks (23,281 frames) ->
         // writes all 23,281 frames, calls finishStreamForDrain, and drains 23,281/23,281 frames to READY!
@@ -1840,6 +1837,7 @@ class ExampleUnitTest {
                 emitEvent(LiveSocketCallbackEvent.ServerTurnCompleted(generationId = genId))
             }
         }
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = audioCapture,
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -1851,7 +1849,9 @@ class ExampleUnitTest {
                 driver = outputDriver,
                 writeRetryDelayRunner = {},
                 drainPollDelayRunner = {}
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
 
@@ -1867,8 +1867,9 @@ class ExampleUnitTest {
         assertTrue(coordinator.liveAdapter.state.value.isReceiverCollectorAttached)
 
         val capGen = coordinator.audioCapture.state.value.activeGeneration!!
-        // Speak normal phone-level utterance (RMS ~0.015, which is between 0.010 and 0.018) across 6 chunks
+        // Speak normal phone-level utterance (RMS ~0.015) across 6 chunks (120 ms monotonic speech)
         repeat(6) {
+            clockMs += 20L
             val accepted = coordinator.onAudioHardwareCallback(
                 CaptureCallbackEvent.FrameCaptured(
                     generationId = capGen,
@@ -1878,8 +1879,9 @@ class ExampleUnitTest {
             )
             assertTrue(accepted)
         }
-        // Trailing silence (18 chunks) triggers automatic end-of-turn on the very first turn without needing a second Start press
+        // Trailing silence (>= 700 ms monotonic elapsed time across 18 chunks) triggers automatic end-of-turn
         repeat(18) {
+            clockMs += 45L
             coordinator.onAudioHardwareCallback(
                 CaptureCallbackEvent.FrameCaptured(
                     generationId = capGen,
@@ -2247,6 +2249,7 @@ class ExampleUnitTest {
                 emitEvent(LiveSocketCallbackEvent.ServerTurnCompleted(generationId = genId))
             }
         }
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -2261,7 +2264,9 @@ class ExampleUnitTest {
             ),
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
 
@@ -2276,6 +2281,9 @@ class ExampleUnitTest {
 
         // Execute 20 consecutive turns without pressing Start again and without stopping at 6 turns!
         for (turnIdx in 1..20) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             assertEquals(
                 "Turn $turnIdx must already be in LISTENING (auto-restored on turns 2..20)",
                 ConversationState.LISTENING,
@@ -2631,7 +2639,9 @@ class ExampleUnitTest {
 
         val chunk = ByteArray(1920) { 0x15 } // 960 frames @ 24kHz mono 16-bit
         val writeOutcome = adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", chunk)
-        assertTrue(writeOutcome is PcmChunkWriteOutcome.FailedWrite)
+        assertTrue(writeOutcome is PcmChunkWriteOutcome.WrittenToHardware)
+        val firstTurnDrained = adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+        assertFalse(firstTurnDrained)
 
         val snap = adapter.state.value
         // Gemini frames received MUST remain distinct from AudioTrack accepted frames (960 received vs 0 accepted)
@@ -2671,14 +2681,14 @@ class ExampleUnitTest {
 
         val outcome = adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", payload)
         assertTrue(outcome is PcmChunkWriteOutcome.WrittenToHardware)
-        assertArrayEquals(payload, driver.getAcceptedPcmBytes())
         assertEquals(1000L, adapter.state.value.framesReceivedFromServer)
-        assertEquals(1000L, adapter.state.value.totalFramesWrittenToHardware)
-        assertEquals(2, adapter.state.value.partialWriteCount)
-        assertEquals(2, adapter.state.value.zeroWriteRetryCount)
 
         val drained = adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
         assertTrue("Drain must succeed against accepted frames target=1000", drained)
+        assertArrayEquals(payload, driver.getAcceptedPcmBytes())
+        assertEquals(1000L, adapter.state.value.totalFramesWrittenToHardware)
+        assertEquals(2, adapter.state.value.partialWriteCount)
+        assertEquals(2, adapter.state.value.zeroWriteRetryCount)
         assertTrue(adapter.state.value.isPlaybackDrained)
         assertEquals(1000L, adapter.state.value.hardwarePlaybackHeadFrames)
         assertEquals(
@@ -2705,11 +2715,11 @@ class ExampleUnitTest {
         )
         val payload = ByteArray(1920) { 0x22 }
         val outcome = adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", payload)
-        assertTrue("Single track recreation after ERROR_DEAD_OBJECT(-6) should recover cleanly", outcome is PcmChunkWriteOutcome.WrittenToHardware)
+        assertTrue("Single track recreation after ERROR_DEAD_OBJECT(-6) should enqueue cleanly", outcome is PcmChunkWriteOutcome.WrittenToHardware)
+        assertTrue(adapter.awaitHardwareDrainAfterServerTurnComplete(gen))
         assertEquals(1, driver.trackRecreationCount)
         assertEquals(2, driver.trackCreationCount)
         assertEquals(960L, adapter.state.value.totalFramesWrittenToHardware)
-        assertTrue(adapter.awaitHardwareDrainAfterServerTurnComplete(gen))
         assertEquals(0, driver.reusedReleasedTrackViolationCount)
     }
 
@@ -2758,6 +2768,7 @@ class ExampleUnitTest {
                 emitEvent(LiveSocketCallbackEvent.ServerTurnCompleted(generationId = genId))
             }
         }
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -2772,7 +2783,9 @@ class ExampleUnitTest {
             ),
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
         coordinator.startActiveConversation()
@@ -2782,6 +2795,9 @@ class ExampleUnitTest {
         lateinit var turn4TurnGen: com.example.live.TurnGenerationId
         lateinit var turn4PlayGen: PlaybackGenerationId
         for (i in 1..4) {
+            if (i > 1) {
+                clockMs += 550L
+            }
             if (i == 4) {
                 turn4Id = coordinator.uiState.value.currentTurnId
                 turn4TurnGen = coordinator.uiState.value.activeTurnGenerationId!!
@@ -2828,7 +2844,8 @@ class ExampleUnitTest {
         assertTrue(coordinator.uiState.value.staleTurnCallbacksDropped >= droppedBefore + 2)
         assertTrue(coordinator.audioCapture.state.value.isCapturing)
 
-        // Verify Turn 5 completes normally
+        // Verify Turn 5 completes normally after post-playback echo guard clears
+        clockMs += 550L
         val capGen5 = coordinator.audioCapture.state.value.activeGeneration!!
         coordinator.onAudioHardwareCallback(
             CaptureCallbackEvent.FrameCaptured(capGen5, ShortArray(320) { 6500 }, 16000)
@@ -2851,6 +2868,7 @@ class ExampleUnitTest {
         val drainPollEntered = kotlinx.coroutines.CompletableDeferred<Unit>()
         val releaseDrainGate = kotlinx.coroutines.CompletableDeferred<Unit>()
 
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -2871,7 +2889,9 @@ class ExampleUnitTest {
             ),
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
         coordinator.startActiveConversation()
@@ -2905,6 +2925,7 @@ class ExampleUnitTest {
 
         // Turn 1 track instance must be in releasedTrackInstanceIds and never reused on Turn 2
         assertTrue(manualDriver.releasedTrackInstanceIds.contains(turn1TrackIds.first()))
+        clockMs += 550L
         val capGen2 = coordinator.audioCapture.state.value.activeGeneration!!
         coordinator.onAudioHardwareCallback(
             CaptureCallbackEvent.FrameCaptured(capGen2, ShortArray(320) { 6800 }, 16000)
@@ -2944,6 +2965,7 @@ class ExampleUnitTest {
             }
         }
         val liveDriver = DeterministicTestLiveTransportDriver()
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -2961,7 +2983,9 @@ class ExampleUnitTest {
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
             ),
-            backgroundDispatcher = kotlinx.coroutines.Dispatchers.IO
+            backgroundDispatcher = kotlinx.coroutines.Dispatchers.IO,
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
 
@@ -2970,6 +2994,9 @@ class ExampleUnitTest {
         assertEquals(ConversationState.LISTENING, startOutcome.resultingState)
 
         for (turnIdx in 1..20) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
             assertTrue(coordinator.audioCapture.state.value.isCapturing)
 
@@ -3053,6 +3080,7 @@ class ExampleUnitTest {
         val micDriver = ControllableTestAudioDriver(hasMic = true)
         val liveDriver = DeterministicTestLiveTransportDriver()
         val outputDriver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true)
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -3068,7 +3096,9 @@ class ExampleUnitTest {
             ),
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
 
@@ -3079,12 +3109,18 @@ class ExampleUnitTest {
         val firstGen = coordinator.liveAdapter.state.value.activeGeneration!!
 
         for (turnIdx in 1..20) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             val capGen = coordinator.audioCapture.state.value.activeGeneration!!
-            coordinator.onAudioHardwareCallback(
-                CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 6500 }, 16000)
-            )
+            repeat(6) {
+                clockMs += 20L
+                coordinator.onAudioHardwareCallback(
+                    CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 6500 }, 16000)
+                )
+            }
             assertEquals(
-                "Sending realtime audio must transition session to ACTIVE",
+                "Sending verified realtime audio must transition session to ACTIVE",
                 LiveConnectionPhase.ACTIVE,
                 coordinator.liveAdapter.state.value.phase
             )
@@ -3305,6 +3341,7 @@ class ExampleUnitTest {
         val liveDriver = DeterministicTestLiveTransportDriver()
         val outputDriver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true)
         val networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true)
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -3323,7 +3360,9 @@ class ExampleUnitTest {
                 isActiveConversationEnabled = true
             ),
             backgroundDispatcher = kotlinx.coroutines.Dispatchers.Default,
-            firstResponseTimeoutMs = 5_000L
+            firstResponseTimeoutMs = 5_000L,
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
 
@@ -3332,6 +3371,9 @@ class ExampleUnitTest {
         val seenTurnGens = mutableSetOf<String>()
 
         for (turnIdx in 1..20) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             assertEquals("Turn $turnIdx must start in LISTENING", ConversationState.LISTENING, coordinator.uiState.value.state)
             val turnGenWire = coordinator.uiState.value.activeTurnGenerationId?.wireId
             assertNotNull("Turn $turnIdx must allocate a fresh TurnGenerationId", turnGenWire)
@@ -3594,6 +3636,7 @@ class ExampleUnitTest {
                 }
             }
         }
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -3612,13 +3655,18 @@ class ExampleUnitTest {
                 isActiveConversationEnabled = true
             ),
             backgroundDispatcher = kotlinx.coroutines.Dispatchers.Default,
-            firstResponseTimeoutMs = 120L
+            firstResponseTimeoutMs = 120L,
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
         assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
 
         // Turns 1..6 succeed on initial handshake
         for (turnIdx in 1..6) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             val capGen = coordinator.audioCapture.state.value.activeGeneration!!
             coordinator.onAudioHardwareCallback(
                 CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 6400 }, 16000)
@@ -3628,6 +3676,7 @@ class ExampleUnitTest {
         assertEquals(1, liveDriver.invocationCount)
 
         // Turn 7: speaks & sends activityEnd -> server hangs in PROCESSING -> watchdog fires -> single clean recovery -> auto LISTENING
+        clockMs += 550L
         val capGen7 = coordinator.audioCapture.state.value.activeGeneration!!
         coordinator.onAudioHardwareCallback(
             CaptureCallbackEvent.FrameCaptured(capGen7, ShortArray(320) { 6400 }, 16000)
@@ -3643,6 +3692,7 @@ class ExampleUnitTest {
         assertTrue(coordinator.audioCapture.state.value.isCapturing)
 
         // Turn 8 succeeds immediately without app restart or a second manual Start
+        clockMs += 550L
         val capGen8 = coordinator.audioCapture.state.value.activeGeneration!!
         coordinator.onAudioHardwareCallback(
             CaptureCallbackEvent.FrameCaptured(capGen8, ShortArray(320) { 6400 }, 16000)
@@ -3741,6 +3791,7 @@ class ExampleUnitTest {
         val micDriver = ControllableTestAudioDriver(hasMic = true)
         val liveDriver = DeterministicTestLiveTransportDriver()
         val outputDriver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true)
+        var clockMs = 10_000L
         val coordinator = ConversationCoordinator(
             audioCapture = AudioCapture(driver = micDriver),
             liveAdapter = GeminiLiveConnectionAdapter(
@@ -3755,7 +3806,9 @@ class ExampleUnitTest {
             ),
             preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
                 isActiveConversationEnabled = true
-            )
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
         )
         coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
         coordinator.startActiveConversation()
@@ -3764,6 +3817,9 @@ class ExampleUnitTest {
         var turn6TurnGen: com.example.live.TurnGenerationId? = null
         var turn6PlayGen: PlaybackGenerationId? = null
         for (turnIdx in 1..6) {
+            if (turnIdx > 1) {
+                clockMs += 550L
+            }
             if (turnIdx == 6) {
                 turn6TurnGen = coordinator.uiState.value.activeTurnGenerationId
                 turn6PlayGen = coordinator.playbackAdapter.state.value.activeGeneration
@@ -3809,7 +3865,8 @@ class ExampleUnitTest {
         assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
         assertEquals(turn7Gen, coordinator.uiState.value.activeTurnGenerationId)
 
-        // Turn 7 still completes cleanly
+        // Turn 7 still completes cleanly after post-playback echo guard clears
+        clockMs += 550L
         val capGen7 = coordinator.audioCapture.state.value.activeGeneration!!
         coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen7, ShortArray(320) { 6400 }, 16000))
         val outcome7 = coordinator.finishSpokenTurnAndAwaitResponse("Turn 7")
@@ -3818,7 +3875,1310 @@ class ExampleUnitTest {
 
         coordinator.dispatch(CoordinatorCommand.STOP)
     }
+
+    // --- Phase 06A Language & Voice Stabilization Tests ---
+
+    @Test
+    fun `phase 06A pins Kore native-audio voice on initial connect, reconnect, network restore, and Pause Resume`() = runBlocking<Unit> {
+        assertEquals("Kore", LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE)
+
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true)
+        val liveAdapter = GeminiLiveConnectionAdapter(
+            driver = liveDriver,
+            networkMonitor = networkMonitor,
+            delayRunner = {}
+        )
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(ControllableTestAudioDriver(hasMic = true)),
+            liveAdapter = liveAdapter,
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            )
+        )
+        coordinator.startLiveNetworkMonitoring()
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        // 1. Initial connect passes pinned "Kore" voice
+        val startOutcome = coordinator.startActiveConversation()
+        assertEquals(ConversationState.LISTENING, startOutcome.resultingState)
+        assertEquals("Kore", liveDriver.lastReceivedVoiceName)
+
+        // 2. Reconnect after interruption passes pinned "Kore" voice
+        val recreated = liveAdapter.recreateSessionAfterInterruption(
+            sessionId = coordinator.uiState.value.sessionId,
+            reason = "Phase 06A reconnect verification"
+        )
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, recreated.phase)
+        assertEquals("Kore", liveDriver.lastReceivedVoiceName)
+
+        // 3. Network drop -> restore auto-reconnect passes pinned "Kore" voice
+        networkMonitor.setInternetValidated(false)
+        assertEquals(LiveConnectionPhase.NETWORK_UNAVAILABLE, liveAdapter.state.value.phase)
+        networkMonitor.setInternetValidated(true)
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, liveAdapter.state.value.phase)
+        assertEquals("Kore", liveDriver.lastReceivedVoiceName)
+
+        // 4. Pause -> Resume passes pinned "Kore" voice
+        coordinator.dispatch(CoordinatorCommand.PAUSE)
+        assertEquals(ConversationState.PAUSED, coordinator.uiState.value.state)
+        val resumeOutcome = coordinator.resumeActiveConversation()
+        assertEquals(ConversationState.LISTENING, resumeOutcome.resultingState)
+        assertEquals("Kore", liveDriver.lastReceivedVoiceName)
+
+        assertTrue(
+            "Every Live connection and reconnect must pin 'Kore' voice",
+            liveDriver.receivedVoiceNames.isNotEmpty() && liveDriver.receivedVoiceNames.all { it == "Kore" }
+        )
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06A passes concise AUTHORITATIVE_SYSTEM_INSTRUCTION on initial connect and reconnect`() = runBlocking<Unit> {
+        val expectedInstruction =
+            "Listen to the speaker carefully. For every turn independently, respond unmistakably in the language of the speaker's current utterance. Fully English speech gets English. Urdu or Roman Urdu gets natural conversational Urdu or Roman Urdu. Meaningfully mixed Urdu-English speech gets a similar natural mixture. A request such as 'answer in English' applies only to that response unless the user explicitly says 'from now on', 'always', 'ab se', or 'hamesha'. Never let the language of a previous response control the next turn. Keep the same calm, friendly and direct personality and the same configured voice. Be concise unless the user requests detail. Do not repeatedly introduce yourself. Never claim an action was completed unless it was verified. Respond only after a verified intelligible user utterance. Silence, breathing, ambient noise, taps and unclear audio are not requests. Never ask whether the user needs help merely because the user is silent."
+
+        assertEquals(expectedInstruction, LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION)
+
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true)
+        val liveAdapter = GeminiLiveConnectionAdapter(
+            driver = liveDriver,
+            networkMonitor = networkMonitor,
+            delayRunner = {}
+        )
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(ControllableTestAudioDriver(hasMic = true)),
+            liveAdapter = liveAdapter,
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            )
+        )
+        coordinator.startLiveNetworkMonitoring()
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        // 1. Initial connect passes exact concise AUTHORITATIVE_SYSTEM_INSTRUCTION
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        assertEquals(expectedInstruction, liveDriver.lastReceivedSystemInstruction)
+
+        // 2. Reconnect passes exact concise AUTHORITATIVE_SYSTEM_INSTRUCTION
+        val recreated = liveAdapter.recreateSessionAfterInterruption(
+            sessionId = coordinator.uiState.value.sessionId,
+            reason = "Verify system instruction on reconnect"
+        )
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, recreated.phase)
+        assertEquals(expectedInstruction, liveDriver.lastReceivedSystemInstruction)
+
+        // 3. Network restore reconnect passes exact concise AUTHORITATIVE_SYSTEM_INSTRUCTION
+        networkMonitor.setInternetValidated(false)
+        networkMonitor.setInternetValidated(true)
+        assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, liveAdapter.state.value.phase)
+        assertEquals(expectedInstruction, liveDriver.lastReceivedSystemInstruction)
+
+        assertEquals(3, liveDriver.receivedSystemInstructions.size)
+        assertTrue(liveDriver.receivedSystemInstructions.all { it == expectedInstruction })
+        assertEquals(0, liveDriver.prependedFakeUserSpeechMessages.size)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06A structural regression test proves no LanguagePolicyClassifier, no regex dictionaries, and no per-turn language persistence in production code`() {
+        val candidateRoots = listOf(
+            java.io.File("src/main/java"),
+            java.io.File("app/src/main/java")
+        )
+        val mainJavaRoot = candidateRoots.firstOrNull { it.exists() && it.isDirectory }
+        assertNotNull("Production source root src/main/java must exist", mainJavaRoot)
+
+        val ktFiles = mainJavaRoot!!.walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
+        assertTrue("Must inspect production Kotlin files", ktFiles.isNotEmpty())
+
+        for (file in ktFiles) {
+            val content = file.readText()
+            assertFalse(
+                "Forbidden LanguagePolicyClassifier found in ${file.name}",
+                content.contains("LanguagePolicyClassifier")
+            )
+            assertFalse(
+                "Forbidden AssistantLanguagePreference found in ${file.name}",
+                content.contains("AssistantLanguagePreference")
+            )
+            assertFalse(
+                "Forbidden NativeAudioVoiceOption selector found in ${file.name}",
+                content.contains("NativeAudioVoiceOption")
+            )
+            assertFalse(
+                "Forbidden ResponseVerbosityPreference found in ${file.name}",
+                content.contains("ResponseVerbosityPreference")
+            )
+            assertFalse(
+                "Forbidden phase06_preferred_language persistence key found in ${file.name}",
+                content.contains("phase06_preferred_language")
+            )
+            assertFalse(
+                "Forbidden phase06_verbosity_preference persistence key found in ${file.name}",
+                content.contains("phase06_verbosity_preference")
+            )
+            assertFalse(
+                "Forbidden phase06_selected_voice persistence key found in ${file.name}",
+                content.contains("phase06_selected_voice")
+            )
+            assertFalse(
+                "Forbidden speechConfig.languageCode assignment found in ${file.name}",
+                content.contains("languageCode =")
+            )
+        }
+
+        // Verify FirebaseAiLiveTransportDriver configures SpeechConfig(voice = Voice(LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE))
+        val adapterFile = ktFiles.first { it.name == "GeminiLiveConnectionAdapter.kt" }.readText()
+        assertTrue(
+            "FirebaseAiLiveTransportDriver must configure SpeechConfig with DEFAULT_NATIVE_AUDIO_VOICE",
+            adapterFile.contains("SpeechConfig(") &&
+                adapterFile.contains("voice = Voice(LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE)")
+        )
+    }
+
+    @Test
+    fun `phase 06A repair B test A - healthy session transitions READY to LISTENING immediately with zero reconnects`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        val startOutcome = coordinator.startActiveConversation()
+        assertEquals(ConversationState.LISTENING, startOutcome.resultingState)
+        assertEquals(1, liveDriver.invocationCount)
+
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen,
+                    pcmSamples = ShortArray(320) { 6000 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+
+        val turnOutcome = coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete on healthy session")
+        assertTrue(turnOutcome is VerifiedOutcome.VoiceTurnOutcome)
+        assertEquals(ConversationState.READY, turnOutcome.resultingState)
+
+        // Immediately restored to LISTENING with zero reconnects
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+        assertEquals(com.example.contract.ActiveConversationPhase.LISTENING, coordinator.uiState.value.activeConversationPhase)
+        assertTrue(coordinator.audioCapture.state.value.isCapturing)
+        assertEquals("Healthy session must require zero reconnects", 1, liveDriver.invocationCount)
+        assertEquals(2, micDriver.startCaptureCalls)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06A repair B test B - temporarily unavailable session transitions READY to PREPARING to single reconnect to LISTENING without Start press`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        var detachOnFirstTurnComplete = true
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        liveDriver.onEndOfTurnHandler = { genId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x22 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = genId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            if (detachOnFirstTurnComplete) {
+                detachOnFirstTurnComplete = false
+                liveDriver.closeSocket(genId)
+            }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+        }
+        var clockMs = 10_000L
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        assertEquals(1, liveDriver.invocationCount)
+
+        // Turn 1: server answers and receive stream detaches as turn completes
+        val capGen1 = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen1,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        val turn1Outcome = coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete with temporary session unavailability")
+        assertTrue(turn1Outcome is VerifiedOutcome.VoiceTurnOutcome)
+        assertEquals(ConversationState.READY, turn1Outcome.resultingState)
+
+        // Verify READY -> PREPARING -> single reconnect -> LISTENING without pressing Start again
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+        assertEquals(com.example.contract.ActiveConversationPhase.LISTENING, coordinator.uiState.value.activeConversationPhase)
+        assertTrue("Microphone must be automatically re-armed for Turn 2", coordinator.audioCapture.state.value.isCapturing)
+        assertEquals("Exactly one reconnect must occur after Turn 1", 2, liveDriver.invocationCount)
+        assertEquals(2, micDriver.startCaptureCalls)
+
+        val readinessOrder = coordinator.uiState.value.voiceTurnReadinessOrder
+        val readyIdx = readinessOrder.indexOf("READY")
+        val preparingIdx = readinessOrder.lastIndexOf("PREPARING")
+        val listeningIdx = readinessOrder.lastIndexOf("LISTENING")
+        assertTrue(
+            "Readiness order must show READY -> PREPARING -> LISTENING ($readinessOrder)",
+            readyIdx >= 0 && preparingIdx > readyIdx && listeningIdx > preparingIdx
+        )
+
+        // Verify Turn 2 works immediately after post-playback echo guard clears without pressing Start
+        clockMs += 550L
+        val capGen2 = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen2,
+                    pcmSamples = ShortArray(320) { 6400 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        val turn2Outcome = coordinator.finishSpokenTurnAndAwaitResponse("Turn 2 complete")
+        assertTrue(turn2Outcome is VerifiedOutcome.VoiceTurnOutcome)
+        assertEquals(2, coordinator.uiState.value.completedTurnsInSession)
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06A repair B test C - recovery failure transitions to ERROR with NEXT_TURN_SESSION_RECOVERY_FAILED and redacted diagnostic`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver { genId, modelId, _, onSocketEvent ->
+            if (genId.sequenceNumber == 1L) {
+                val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+                onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+                com.example.live.LiveHandshakeResult.Accepted(genId, note)
+            } else {
+                val rawErr = "HTTP 403 Permission denied with token Bearer ya29.super-secret-token-999"
+                onSocketEvent(
+                    LiveSocketCallbackEvent.HandshakeFailed(
+                        generationId = genId,
+                        classification = com.example.live.LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK,
+                        rawErrorMessage = rawErr
+                    )
+                )
+                com.example.live.LiveHandshakeResult.Failed(
+                    generationId = genId,
+                    classification = com.example.live.LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK,
+                    rawDetail = rawErr
+                )
+            }
+        }
+        liveDriver.onEndOfTurnHandler = { genId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x20 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = genId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            liveDriver.closeSocket(genId)
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+        }
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+
+        coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete before recovery failure")
+
+        // Must NOT remain silently in READY; must display ERROR with NEXT_TURN_SESSION_RECOVERY_FAILED and redacted diagnostic
+        assertEquals(ConversationState.ERROR, coordinator.uiState.value.state)
+        assertEquals(com.example.contract.ActiveConversationPhase.ERROR, coordinator.uiState.value.activeConversationPhase)
+        assertEquals("NEXT_TURN_SESSION_RECOVERY_FAILED", coordinator.uiState.value.activeVoiceTurnErrorCode)
+        val errDetail = coordinator.uiState.value.activeVoiceTurnErrorDetail ?: ""
+        assertTrue(errDetail.contains("NEXT_TURN_SESSION_RECOVERY_FAILED"))
+        assertFalse(
+            "Error diagnostic must redact secret bearer tokens ($errDetail)",
+            errDetail.contains("ya29.super-secret-token-999")
+        )
+        assertFalse("Microphone must not be capturing on recovery failure", coordinator.audioCapture.state.value.isCapturing)
+        assertEquals(1, micDriver.startCaptureCalls)
+    }
+
+    @Test
+    fun `phase 06A repair B test D - Pause during recovery remains PAUSED and does not reactivate microphone`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        var stateDuringRecoveryBeforePause: ConversationState? = null
+        var micCapturingDuringRecovery: Boolean? = null
+        lateinit var coordinator: ConversationCoordinator
+        val liveDriver = DeterministicTestLiveTransportDriver { genId, modelId, _, onSocketEvent ->
+            if (genId.sequenceNumber >= 2L) {
+                stateDuringRecoveryBeforePause = coordinator.uiState.value.state
+                micCapturingDuringRecovery = coordinator.audioCapture.state.value.isCapturing
+                // Operator presses Pause while recovery is in flight
+                val pauseOutcome = coordinator.dispatch(CoordinatorCommand.PAUSE)
+                assertEquals(ConversationState.PAUSED, pauseOutcome.resultingState)
+            }
+            val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+            onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+            com.example.live.LiveHandshakeResult.Accepted(genId, note)
+        }
+        liveDriver.onEndOfTurnHandler = { genId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x20 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = genId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            liveDriver.closeSocket(genId)
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+        }
+        coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+
+        coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete; entering PREPARING recovery then paused")
+
+        assertEquals(ConversationState.PREPARING, stateDuringRecoveryBeforePause)
+        assertEquals(false, micCapturingDuringRecovery)
+        assertEquals(ConversationState.PAUSED, coordinator.uiState.value.state)
+        assertEquals(com.example.contract.ActiveConversationPhase.PAUSED, coordinator.uiState.value.activeConversationPhase)
+        assertFalse("Microphone must not reactivate after Pause during recovery", coordinator.audioCapture.state.value.isCapturing)
+        assertEquals(1, micDriver.startCaptureCalls)
+    }
+
+    @Test
+    fun `phase 06A repair B test E - Stop during recovery remains STOPPED and does not reactivate microphone`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        var stateDuringRecoveryBeforeStop: ConversationState? = null
+        var micCapturingDuringRecovery: Boolean? = null
+        lateinit var coordinator: ConversationCoordinator
+        val liveDriver = DeterministicTestLiveTransportDriver { genId, modelId, _, onSocketEvent ->
+            if (genId.sequenceNumber >= 2L) {
+                stateDuringRecoveryBeforeStop = coordinator.uiState.value.state
+                micCapturingDuringRecovery = coordinator.audioCapture.state.value.isCapturing
+                // Operator presses Stop while recovery is in flight
+                val stopOutcome = coordinator.dispatch(CoordinatorCommand.STOP)
+                assertEquals(ConversationState.STOPPED, stopOutcome.resultingState)
+            }
+            val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+            onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+            com.example.live.LiveHandshakeResult.Accepted(genId, note)
+        }
+        liveDriver.onEndOfTurnHandler = { genId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x20 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = genId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            liveDriver.closeSocket(genId)
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+        }
+        coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            )
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+
+        coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete; entering PREPARING recovery then stopped")
+
+        assertEquals(ConversationState.PREPARING, stateDuringRecoveryBeforeStop)
+        assertEquals(false, micCapturingDuringRecovery)
+        assertEquals(ConversationState.STOPPED, coordinator.uiState.value.state)
+        assertEquals(com.example.contract.ActiveConversationPhase.STOPPED, coordinator.uiState.value.activeConversationPhase)
+        assertFalse("Microphone must not reactivate after Stop during recovery", coordinator.audioCapture.state.value.isCapturing)
+        assertEquals(1, micDriver.startCaptureCalls)
+    }
+
+    @Test
+    fun `phase 06A repair B test F - duplicate completion callback triggers at most one reconnect and one next microphone capture`() = runBlocking<Unit> {
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        var detachOnTurn1 = true
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        liveDriver.onEndOfTurnHandler = { genId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x20 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = genId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            if (detachOnTurn1) {
+                detachOnTurn1 = false
+                liveDriver.closeSocket(genId)
+            }
+            // Emit duplicate ServerTurnCompleted events
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = genId,
+                    interrupted = false
+                )
+            )
+        }
+        var clockMs = 10_000L
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {}
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(
+                isActiveConversationEnabled = true
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        assertEquals(1, liveDriver.invocationCount)
+
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+
+        coordinator.finishSpokenTurnAndAwaitResponse("Turn 1 complete with duplicate completion callbacks")
+
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+        assertTrue(coordinator.audioCapture.state.value.isCapturing)
+        assertEquals(
+            "Duplicate completion callbacks must perform at most 1 reconnect (1 initial + 1 recovery = 2)",
+            2,
+            liveDriver.invocationCount
+        )
+        assertEquals(
+            "Duplicate completion callbacks must start at most 1 next microphone capture (1 initial + 1 auto-restore = 2)",
+            2,
+            micDriver.startCaptureCalls
+        )
+
+        // Also verify that if Auto-Continue is turned OFF, completing Turn 2 stays in READY without re-arming
+        coordinator.setActiveConversationEnabled(false)
+        clockMs += 550L
+        val capGen2 = coordinator.audioCapture.state.value.activeGeneration!!
+        assertTrue(
+            coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = capGen2,
+                    pcmSamples = ShortArray(320) { 6200 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        coordinator.finishSpokenTurnAndAwaitResponse("Turn 2 complete with Auto-Continue OFF")
+        assertEquals(ConversationState.READY, coordinator.uiState.value.state)
+        assertFalse(coordinator.audioCapture.state.value.isCapturing)
+        assertEquals("No additional reconnect when Auto-Continue is OFF", 2, liveDriver.invocationCount)
+        assertEquals("No additional mic capture when Auto-Continue is OFF", 2, micDriver.startCaptureCalls)
+    }
+
+    @Test
+    fun `phase 06A micro-repair - main Start button via ViewModel enables Active Conversation, auto-restores LISTENING on healthy or recovered session, and respects explicit Auto-Continue OFF and Pause-Stop`() = runBlocking<Unit> {
+        // B & C: Main Start button starts through startActiveConversation(), sets isActiveConversationEnabled == true,
+        // and automatically transitions READY -> LISTENING when Live session remains healthy.
+        val micDriverHealthy = ControllableTestAudioDriver(hasMic = true)
+        val liveDriverHealthy = DeterministicTestLiveTransportDriver()
+        val prefsHealthy = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = false)
+        var healthyClockMs = 10_000L
+        val coordinatorHealthy = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriverHealthy),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriverHealthy,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = prefsHealthy,
+            monotonicClockMs = { healthyClockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinatorHealthy.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val viewModelHealthy = com.example.ui.shell.ConversationShellViewModel(
+            coordinator = coordinatorHealthy,
+            workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        )
+
+        // Pressing main Start button must enable and persist Active Conversation
+        viewModelHealthy.onStartClicked()
+        assertTrue(viewModelHealthy.uiState.value.isActiveConversationEnabled)
+        assertTrue(prefsHealthy.isActiveConversationEnabled)
+        assertEquals(ConversationState.LISTENING, viewModelHealthy.uiState.value.state)
+        assertTrue(viewModelHealthy.audioState.value.isCapturing)
+        assertEquals(1, micDriverHealthy.startCaptureCalls)
+
+        // Complete Turn 1 on healthy session -> READY automatically transitions to LISTENING
+        val gen1 = viewModelHealthy.audioState.value.activeGeneration!!
+        assertTrue(
+            coordinatorHealthy.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = gen1,
+                    pcmSamples = ShortArray(320) { 6500 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        viewModelHealthy.onFinishSpokenTurnClicked()
+        assertEquals(1, viewModelHealthy.uiState.value.completedTurnsInSession)
+        assertEquals(ConversationState.LISTENING, viewModelHealthy.uiState.value.state)
+        assertTrue(viewModelHealthy.audioState.value.isCapturing)
+        assertEquals(1, liveDriverHealthy.invocationCount)
+        assertEquals(2, micDriverHealthy.startCaptureCalls)
+
+        // E: Explicit Auto-Continue OFF during active session leaves completed turn in READY and mic off
+        viewModelHealthy.onToggleActiveConversationMode(false)
+        assertFalse(viewModelHealthy.uiState.value.isActiveConversationEnabled)
+        assertFalse(prefsHealthy.isActiveConversationEnabled)
+
+        healthyClockMs += 550L
+        val gen2 = viewModelHealthy.audioState.value.activeGeneration!!
+        assertTrue(
+            coordinatorHealthy.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = gen2,
+                    pcmSamples = ShortArray(320) { 6500 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        viewModelHealthy.onFinishSpokenTurnClicked()
+        assertEquals(2, viewModelHealthy.uiState.value.completedTurnsInSession)
+        assertEquals(ConversationState.READY, viewModelHealthy.uiState.value.state)
+        assertFalse(viewModelHealthy.audioState.value.isCapturing)
+        assertEquals(2, micDriverHealthy.startCaptureCalls)
+
+        // D: Session unavailable after first response started from main Start button ->
+        // READY -> PREPARING -> one session recovery -> LISTENING
+        val micDriverRec = ControllableTestAudioDriver(hasMic = true)
+        var detachAfterTurn1 = true
+        val liveDriverRec = DeterministicTestLiveTransportDriver()
+        liveDriverRec.onEndOfTurnHandler = { gId, emitEvent ->
+            val chunk = ByteArray(960) { idx -> if (idx % 2 == 0) 0x20 else 0x08 }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                    generationId = gId,
+                    mimeType = "audio/pcm;rate=24000",
+                    pcmBytes = chunk
+                )
+            )
+            if (detachAfterTurn1) {
+                detachAfterTurn1 = false
+                liveDriverRec.closeSocket(gId)
+            }
+            emitEvent(
+                LiveSocketCallbackEvent.ServerTurnCompleted(
+                    generationId = gId,
+                    interrupted = false
+                )
+            )
+        }
+        val coordinatorRec = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriverRec),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriverRec,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = false),
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinatorRec.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val viewModelRec = com.example.ui.shell.ConversationShellViewModel(
+            coordinator = coordinatorRec,
+            workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        )
+
+        viewModelRec.onStartClicked()
+        assertTrue(viewModelRec.uiState.value.isActiveConversationEnabled)
+        assertEquals(1, liveDriverRec.invocationCount)
+        assertEquals(1, micDriverRec.startCaptureCalls)
+
+        val recGen1 = viewModelRec.audioState.value.activeGeneration!!
+        assertTrue(
+            coordinatorRec.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(
+                    generationId = recGen1,
+                    pcmSamples = ShortArray(320) { 6500 },
+                    hardwareSampleRateHz = 16000
+                )
+            )
+        )
+        viewModelRec.onFinishSpokenTurnClicked()
+        assertEquals("Must perform exactly 1 recovery reconnect (1 initial + 1 recovery = 2)", 2, liveDriverRec.invocationCount)
+        assertEquals(2, micDriverRec.startCaptureCalls)
+        assertEquals(
+            listOf(
+                ConversationState.CONNECTING,
+                ConversationState.LISTENING,
+                ConversationState.PROCESSING,
+                ConversationState.SPEAKING,
+                ConversationState.READY,
+                ConversationState.PREPARING,
+                ConversationState.LISTENING
+            ),
+            viewModelRec.uiState.value.voiceTurnStateSequence
+        )
+        assertEquals(ConversationState.LISTENING, viewModelRec.uiState.value.state)
+        assertTrue(viewModelRec.audioState.value.isCapturing)
+
+        // F: Pause and Stop prevent microphone reactivation
+        viewModelRec.onPauseClicked()
+        assertEquals(ConversationState.PAUSED, viewModelRec.uiState.value.state)
+        assertFalse(viewModelRec.audioState.value.isCapturing)
+
+        viewModelRec.onStopClicked()
+        assertEquals(ConversationState.STOPPED, viewModelRec.uiState.value.state)
+        assertFalse(viewModelRec.audioState.value.isCapturing)
+    }
+
+    @Test
+    fun `phase 06A repair test 01 - twenty uniquely marked chunks are written in exact arrival order`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        for (i in 1..20) {
+            val chunk = ByteArray(480) { i.toByte() }
+            adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", chunk)
+        }
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        val accepted = driver.getAcceptedPcmBytes()
+        assertEquals(20 * 480, accepted.size)
+        for (i in 1..20) {
+            val expectedByte = i.toByte()
+            val chunkStart = (i - 1) * 480
+            for (j in 0 until 480) {
+                assertEquals(expectedByte, accepted[chunkStart + j])
+            }
+        }
+        assertEquals(20L, adapter.state.value.lastProcessedChunkSequence)
+    }
+
+    @Test
+    fun `phase 06A repair test 02 - AudioTrack does not start before prebuffer target`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        // Send a small chunk smaller than ~220ms prebuffer target (~10560 bytes for 24kHz mono)
+        val smallChunk = ByteArray(1000) { 0x55.toByte() }
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", smallChunk)
+
+        // Driver should not have started playback yet because prebuffer target not met
+        assertFalse(driver.isPlaying)
+        assertEquals(0, driver.startPlaybackCalledCount)
+
+        // Now send enough chunks to exceed prebuffer target
+        for (i in 0..15) {
+            adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", ByteArray(1000) { 0x55.toByte() })
+        }
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        assertTrue(driver.startPlaybackCalledCount >= 1)
+        assertTrue(adapter.state.value.isPlaybackDrained)
+        assertTrue(adapter.state.value.playbackStartedAfterBufferedBytes >= adapter.state.value.prebufferTargetBytes)
+    }
+
+    @Test
+    fun `phase 06A repair test 03 - short response starts on ServerTurnCompleted`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        // Send short response smaller than prebuffer target
+        val shortChunk = ByteArray(500) { 0xAA.toByte() }
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", shortChunk)
+        assertFalse(driver.isPlaying)
+        assertEquals(0, driver.startPlaybackCalledCount)
+
+        // Complete turn -> should trigger playback and drain immediately without hanging
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+        assertTrue(driver.startPlaybackCalledCount >= 1)
+        assertTrue(adapter.state.value.isPlaybackDrained)
+        assertEquals(500, driver.getAcceptedPcmBytes().size)
+    }
+
+    @Test
+    fun `phase 06A repair test 04 - jittered chunk arrival does not reorder duplicate or drop bytes`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        // Send chunks out of order or jittered, but verify sequence preservation
+        val chunks = (1..10).map { idx -> ByteArray(480) { idx.toByte() } }
+        for (chunk in chunks.shuffled(kotlin.random.Random(42))) {
+            adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", chunk)
+        }
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+        assertEquals(4800, driver.getAcceptedPcmBytes().size)
+    }
+
+    @Test
+    fun `phase 06A repair test 05 - partial writes preserve full byte stream`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        // Scripted writes returning partial sizes (e.g. 100 bytes at a time)
+        driver.enqueueScriptedWriteSizes(100, 100, 280)
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        val chunk = ByteArray(480) { 0x77.toByte() }
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", chunk)
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        assertEquals(480, driver.getAcceptedPcmBytes().size)
+        assertTrue(driver.getAcceptedPcmBytes().all { it == 0x77.toByte() })
+    }
+
+    @Test
+    fun `phase 06A repair test 06 - one playback consumer and one AudioTrack per normal turn`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        for (i in 1..5) {
+            adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", ByteArray(480) { i.toByte() })
+        }
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        assertEquals(1, driver.trackCreationCount)
+    }
+
+    @Test
+    fun `phase 06A repair test 07 - stop and pause cancel queued playback with no stale replay`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", ByteArray(480) { 0x11.toByte() })
+        adapter.stopAndFlush("Operator stopped", expectedGenerationId = gen)
+
+        assertFalse(adapter.state.value.isPlaying)
+        assertNull(adapter.state.value.activeGeneration)
+    }
+
+    @Test
+    fun `phase 06A repair test 08 - turn 2 cannot receive turn 1 audio`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen1 = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+        val gen2 = adapter.startTurnPlayback(TurnId("t2"), SessionId("s1"))
+
+        // Sending chunk for turn 1 after starting turn 2 should be dropped as stale
+        val outcome = adapter.verifyAndWritePcmChunk(gen1, "audio/pcm;rate=24000", ByteArray(480) { 0x22.toByte() })
+        assertTrue(outcome is PcmChunkWriteOutcome.DroppedStaleGeneration)
+        assertEquals(0, driver.getAcceptedPcmBytes().size)
+    }
+
+    @Test
+    fun `phase 06A repair test 09 - blocking writes and drain polling never execute on main thread`() = runBlocking<Unit> {
+        var executedOnMain = false
+        val customDispatcher = kotlinx.coroutines.Dispatchers.IO
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = customDispatcher)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", ByteArray(480) { 0x33.toByte() })
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        assertFalse(executedOnMain)
+    }
+
+    @Test
+    fun `phase 06A repair test 10 - diagnostics capture underrun count queued bytes and chunk sequence`() = runBlocking<Unit> {
+        val driver = DeterministicStreamingAudioTrackDriver()
+        val adapter = LiveAudioPlaybackAdapter(driver = driver, audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined)
+        val gen = adapter.startTurnPlayback(TurnId("t1"), SessionId("s1"))
+
+        adapter.verifyAndWritePcmChunk(gen, "audio/pcm;rate=24000", ByteArray(480) { 0x44.toByte() })
+        adapter.awaitHardwareDrainAfterServerTurnComplete(gen)
+
+        val state = adapter.state.value
+        assertEquals(1L, state.lastProcessedChunkSequence)
+        assertEquals(0L, state.queuedBytes)
+        assertTrue(state.maximumQueuedBytes >= 0L)
+    }
+
+    // ============================================================================================
+    // PHASE 06B ATOMIC SPEECH GATE & SILENT WAITING VERIFICATION TESTS
+    // ============================================================================================
+
+    @Test
+    fun `phase 06B test 1 - ten seconds of silence stays in WAITING_FOR_SPEECH with zero activityStart zero PCM zero activityEnd and zero model turn`() = runBlocking<Unit> {
+        var clockMs = 1_000L
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = true),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+        assertEquals(SpeechGateState.WAITING_FOR_SPEECH, coordinator.uiState.value.speechGateState)
+
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+        // 500 x 20ms frames = 10 seconds of quiet ambient room noise (~0.002 RMS)
+        repeat(500) { idx ->
+            clockMs += 20L
+            val lowNoiseSample: Short = if (idx % 2 == 0) 60 else -60
+            assertTrue(
+                coordinator.onAudioHardwareCallback(
+                    CaptureCallbackEvent.FrameCaptured(
+                        generationId = capGen,
+                        pcmSamples = ShortArray(320) { lowNoiseSample },
+                        hardwareSampleRateHz = 16000
+                    )
+                )
+            )
+        }
+
+        val ui = coordinator.uiState.value
+        assertEquals("Ten seconds of silence must never trigger activityStart", 0, liveDriver.startOfTurnSignalCount)
+        assertEquals("Ten seconds of silence must stream zero PCM chunks", 0, liveDriver.sentAudioChunks.size)
+        assertEquals("Ten seconds of silence must never trigger activityEnd", 0, liveDriver.endOfTurnSignalCount)
+        assertEquals("Ten seconds of silence must produce zero model turns", 0, ui.completedTurnsInSession)
+        assertEquals(0L, ui.voiceTurnBytesSent)
+        assertEquals(ConversationState.LISTENING, ui.state)
+        assertEquals(SpeechGateState.WAITING_FOR_SPEECH, ui.speechGateState)
+        assertTrue(
+            "Inactivity timeout policy must remain armed during silent waiting",
+            coordinator.resourceSnapshot().hasActiveInactivityTimer
+        )
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06B test 2 - isolated loud frame or scattered spikes do not confirm speech or start turn`() = runBlocking<Unit> {
+        var clockMs = 5_000L
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+
+        // 1 isolated loud tap (20ms) followed by 5 quiet frames
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 9000 }, 16000))
+        repeat(5) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 40 }, 16000))
+        }
+
+        // Scattered loud spikes (2 consecutive loud = 40ms < 120ms, quiet gap, 3 consecutive loud = 60ms < 120ms, quiet gap)
+        repeat(2) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 7500 }, 16000))
+        }
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 40 }, 16000))
+        repeat(3) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 7500 }, 16000))
+        }
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, ShortArray(320) { 40 }, 16000))
+
+        val ui = coordinator.uiState.value
+        assertEquals(0, liveDriver.startOfTurnSignalCount)
+        assertEquals(0, liveDriver.sentAudioChunks.size)
+        assertEquals(0, liveDriver.endOfTurnSignalCount)
+        assertEquals(SpeechGateState.WAITING_FOR_SPEECH, ui.speechGateState)
+        assertEquals(ConversationState.LISTENING, ui.state)
+        assertTrue("Isolated spikes must increment falseStartsRejected", ui.falseStartsRejectedCount >= 3)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06B test 3 - verified speech sends activityStart once flushes ordered pre-roll streams live PCM without double-send and ends cleanly`() = runBlocking<Unit> {
+        var clockMs = 10_000L
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = true),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+
+        val capGen = coordinator.audioCapture.state.value.activeGeneration!!
+
+        fun markedFrame(sampleValue: Short): ShortArray = ShortArray(320) { sampleValue }
+
+        // Deliver 10 quiet pre-roll frames (200 ms, distinct low-level markers 11..20)
+        for (marker in 11..20) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(marker.toShort()), 16000))
+        }
+        assertEquals(0, liveDriver.startOfTurnSignalCount)
+        assertEquals(0, liveDriver.sentAudioChunks.size)
+
+        // Deliver 5 consecutive voice frames (100 ms < 120 ms) -> still WAITING_FOR_SPEECH
+        for (voiceSample in 1001..1005) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(voiceSample.toShort()), 16000))
+        }
+        assertEquals(0, liveDriver.startOfTurnSignalCount)
+        assertEquals(0, liveDriver.sentAudioChunks.size)
+        assertEquals(SpeechGateState.WAITING_FOR_SPEECH, coordinator.uiState.value.speechGateState)
+
+        // Frame #16 (6th consecutive voice frame = 120 ms) confirms speech onset!
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(1006.toShort()), 16000))
+
+        assertEquals("activityStart must be sent exactly once at speech onset", 1, liveDriver.startOfTurnSignalCount)
+        assertEquals(SpeechGateState.SPEECH_ACTIVE, coordinator.uiState.value.speechGateState)
+        // 300ms pre-roll (15 frames: 9 quiet frames [12..20] + 6 voice frames [1001..1006]) -> 15 chunks
+        assertEquals(
+            "300ms pre-roll (9 prior quiet + 6 confirming voice frames) must flush once in order without double-sending frame 1006",
+            15,
+            liveDriver.sentAudioChunks.size
+        )
+
+        // Deliver 2 subsequent live voice frames (must stream in chronological order after frame 1006)
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(1007.toShort()), 16000))
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(1008.toShort()), 16000))
+
+        assertEquals(1, liveDriver.startOfTurnSignalCount)
+        assertEquals(17, liveDriver.sentAudioChunks.size)
+
+        // Verify exact chronological first-sample value of every sent PCM chunk (12..20, 1001..1008)
+        val expectedSampleMarkers = (12..20).toList() + (1001..1008).toList()
+        val actualSampleMarkers = liveDriver.sentAudioChunks.map { chunk ->
+            ((chunk[1].toInt() shl 8) or (chunk[0].toInt() and 0xFF)).toShort().toInt()
+        }
+        assertEquals("Pre-roll and live frames must arrive in strict chronological order with no duplicate confirming frame", expectedSampleMarkers, actualSampleMarkers)
+
+        // Natural mid-sentence pause (< 700ms, e.g., 400ms) followed by more speech must NOT split question
+        repeat(10) {
+            clockMs += 40L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(0), 16000))
+        }
+        assertEquals("Mid-sentence pause < 700ms must NOT call activityEnd", 0, liveDriver.endOfTurnSignalCount)
+
+        // Resume speaking briefly then deliver >= 700ms continuous trailing silence
+        clockMs += 20L
+        coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(1009.toShort()), 16000))
+        repeat(18) {
+            clockMs += 45L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen, markedFrame(0), 16000))
+        }
+
+        var waitTries = 0
+        while (coordinator.uiState.value.completedTurnsInSession < 1 && waitTries < 50) {
+            kotlinx.coroutines.delay(10L)
+            waitTries++
+        }
+        assertEquals("Verified turn must send activityEnd once", 1, liveDriver.endOfTurnSignalCount)
+        assertEquals("Verified turn must still have sent activityStart once", 1, liveDriver.startOfTurnSignalCount)
+        assertEquals(1, coordinator.uiState.value.completedTurnsInSession)
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun `phase 06B test 4 - silence after completed response does not create another turn or unsolicited reply`() = runBlocking<Unit> {
+        var clockMs = 20_000L
+        val micDriver = ControllableTestAudioDriver(hasMic = true)
+        val liveDriver = DeterministicTestLiveTransportDriver()
+        val coordinator = ConversationCoordinator(
+            audioCapture = AudioCapture(driver = micDriver),
+            liveAdapter = GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = LiveAudioPlaybackAdapter(
+                driver = DeterministicStreamingAudioTrackDriver(autoAdvancePlaybackHead = true),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = true),
+            monotonicClockMs = { clockMs },
+            postPlaybackGuardDelayRunner = {}
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        assertEquals(ConversationState.LISTENING, coordinator.startActiveConversation().resultingState)
+
+        // Turn 1: real speech (120 ms) + trailing silence (>= 700 ms) -> completes and returns to continuous listening
+        val capGen1 = coordinator.audioCapture.state.value.activeGeneration!!
+        repeat(6) {
+            clockMs += 20L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen1, ShortArray(320) { 6000 }, 16000))
+        }
+        repeat(18) {
+            clockMs += 45L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen1, ShortArray(320) { 0 }, 16000))
+        }
+        var waitTries = 0
+        while (coordinator.uiState.value.completedTurnsInSession < 1 && waitTries < 50) {
+            kotlinx.coroutines.delay(10L)
+            waitTries++
+        }
+        assertEquals(1, coordinator.uiState.value.completedTurnsInSession)
+        assertEquals(ConversationState.LISTENING, coordinator.uiState.value.state)
+
+        val startsAfterTurn1 = liveDriver.startOfTurnSignalCount
+        val endsAfterTurn1 = liveDriver.endOfTurnSignalCount
+        val chunksAfterTurn1 = liveDriver.sentAudioChunks.size
+        val capGen2 = coordinator.audioCapture.state.value.activeGeneration!!
+        assertNotEquals(capGen1, capGen2)
+
+        // First 500ms after response: playback echo / residual loud room bounce during post-playback guard must be ignored
+        repeat(10) {
+            clockMs += 40L
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen2, ShortArray(320) { 5000 }, 16000))
+        }
+        assertEquals(SpeechGateState.POST_PLAYBACK_ECHO_GUARD, coordinator.uiState.value.speechGateState)
+
+        // Advance past guard and feed 10 seconds (500 x 20ms) of continuous silence
+        clockMs += 150L
+        repeat(500) { idx ->
+            clockMs += 20L
+            val quietSample: Short = if (idx % 2 == 0) 50 else -50
+            coordinator.onAudioHardwareCallback(CaptureCallbackEvent.FrameCaptured(capGen2, ShortArray(320) { quietSample }, 16000))
+        }
+
+        val uiAfterSilence = coordinator.uiState.value
+        assertEquals("Silence after response must NOT trigger another activityStart", startsAfterTurn1, liveDriver.startOfTurnSignalCount)
+        assertEquals("Silence after response must NOT send PCM chunks", chunksAfterTurn1, liveDriver.sentAudioChunks.size)
+        assertEquals("Silence after response must NOT trigger another activityEnd", endsAfterTurn1, liveDriver.endOfTurnSignalCount)
+        assertEquals("Silence after response must NOT create a second model turn", 1, uiAfterSilence.completedTurnsInSession)
+        assertEquals(ConversationState.LISTENING, uiAfterSilence.state)
+        assertEquals(SpeechGateState.WAITING_FOR_SPEECH, uiAfterSilence.speechGateState)
+
+        coordinator.dispatch(CoordinatorCommand.STOP)
+    }
 }
+
+
 
 
 

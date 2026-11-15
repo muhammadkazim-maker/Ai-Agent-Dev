@@ -98,7 +98,7 @@ class ConversationShellViewModel(
             activeFinishTurnJob?.cancel()
             activeFinishTurnJob = null
             activeVoiceTurnJob = viewModelScope.launch(workDispatcher) {
-                coordinator.startVoiceTurn()
+                coordinator.startActiveConversation()
             }
         }
     }
@@ -355,6 +355,7 @@ class ConversationShellViewModel(
             reason = "ViewModel cleared",
             disconnectLive = true
         )
+        coordinator.speechDetector.close()
         super.onCleared()
     }
 }

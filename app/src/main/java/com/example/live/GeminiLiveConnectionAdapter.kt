@@ -14,7 +14,9 @@ import com.google.firebase.ai.type.LiveServerSetupComplete
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.RealtimeInputConfig
 import com.google.firebase.ai.type.ResponseModality
+import com.google.firebase.ai.type.SpeechConfig
 import com.google.firebase.ai.type.TextPart
+import com.google.firebase.ai.type.Voice
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.liveGenerationConfig
 import java.io.EOFException
@@ -33,7 +35,6 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLException
 import kotlin.coroutines.cancellation.CancellationException
-import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -84,7 +85,8 @@ interface LiveTransportDriver {
         generationId: LiveSessionGenerationId,
         modelId: String,
         onSocketEvent: (LiveSocketCallbackEvent) -> Unit,
-        systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
+        systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
+        voiceName: String = LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE
     ): LiveHandshakeResult
 
     suspend fun sendStartOfSpokenTurn(
@@ -115,15 +117,6 @@ interface LiveTransportDriver {
 /**
  * Classifies exceptions thrown during Gemini Live WebSocket setup or session negotiation
  * by inspecting the entire exception and cause chain.
- *
- * Enforces Phase 03 error classification rules:
- * - No internet, DNS failure, timeout, socket/IO interruption (anywhere in the cause chain,
- *   even when wrapped inside an App Check or Firebase exception) -> [LiveFailureClassification.NETWORK_ERROR]
- * - Actual HTTP 401/403 or explicit App Check/auth rejection while internet is validated -> [LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK] (no retry)
- * - HTTP 400/404 or unsupported model/endpoint -> [LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT] (no retry, no silent model switch)
- * - HTTP 429 / resource exhausted / quota -> [LiveFailureClassification.QUOTA_EXHAUSTED] (no retry)
- * - Cooperative coroutine cancellation -> [LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE] (no retry)
- * - Never classifies every exception as authentication failure; never logs tokens or secrets.
  */
 object LiveExceptionClassifier {
 
@@ -154,7 +147,6 @@ object LiveExceptionClassifier {
         }
 
         // 3. Hard transport/DNS/timeout/socket errors anywhere in the chain MUST remain NETWORK_ERROR
-        // (even if wrapped inside Firebase/AppCheck exceptions like AppCheck -> UnknownHostException).
         if (allNodes.any { isDirectDnsTimeoutOrConnectFailure(it) }) {
             return LiveFailureClassification.NETWORK_ERROR
         }
@@ -178,12 +170,12 @@ object LiveExceptionClassifier {
             return LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT
         }
 
-        // 7. Remaining validated-network socket/channel/IO interruptions (e.g. ClosedReceiveChannelException, EOF, 502/503/504)
+        // 7. Remaining validated-network socket/channel/IO interruptions
         if (allNodes.any { isNetworkOrIoThrowable(it) }) {
             return LiveFailureClassification.NETWORK_ERROR
         }
 
-        // 8. Default unrecognized runtime transport failures to NETWORK_ERROR (never default to auth failure)
+        // 8. Default unrecognized runtime transport failures to NETWORK_ERROR
         return LiveFailureClassification.NETWORK_ERROR
     }
 
@@ -316,7 +308,6 @@ object LiveExceptionClassifier {
             return true
         }
 
-        // Generic IOException is a network/IO failure unless it explicitly carries an HTTP 401/403/400/404/429 code
         if (node is IOException) {
             val hasExplicitNonNetworkHttp =
                 hasHttpStatusCode(classAndMsg, 401) ||
@@ -346,9 +337,6 @@ object LiveExceptionClassifier {
         return pattern.containsMatchIn(text)
     }
 
-    /**
-     * Formats a redacted summary of the exception and its cause chain without exposing tokens or secrets.
-     */
     fun formatRedactedChain(throwable: Throwable): String {
         val rawChain = generateSequence(throwable) { it.cause }
             .take(6)
@@ -362,16 +350,6 @@ object LiveExceptionClassifier {
 /**
  * Production [LiveTransportDriver] backed by official Android Firebase AI Logic
  * (`Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(...)`).
- *
- * Phase 03 Invariants:
- * - Verifies validated internet (`NET_CAPABILITY_INTERNET` + `NET_CAPABILITY_VALIDATED`) before
- *   calling Firebase AI Logic or requesting an App Check token.
- * - Uses managed credentials via Firebase AI Logic + Firebase App Check (zero long-lived API keys).
- * - Targets `gemini-3.1-flash-live-preview` over `v1beta` BidiGenerateContent WebSocket.
- * - Registers zero action tools (`tools = emptyList()`).
- * - Verifies WebSocket connect + setup handshake (`liveModel.connect()`) WITHOUT invoking
- *   `startAudioConversation()`, preserving the single `AudioCapture` owner and not claiming
- *   audio playback in Phase 03.
  */
 @OptIn(PublicPreviewAPI::class)
 class FirebaseAiLiveTransportDriver(
@@ -466,13 +444,12 @@ class FirebaseAiLiveTransportDriver(
         generationId: LiveSessionGenerationId,
         modelId: String,
         onSocketEvent: (LiveSocketCallbackEvent) -> Unit,
-        systemInstruction: String
+        systemInstruction: String,
+        voiceName: String
     ): LiveHandshakeResult {
         return driverLifecycleMutex.withLock {
-            // Invalidate, cancel/join old collector, and close any prior LiveSession once off-main FIRST.
             closeAndAwaitSocket(null)
 
-            // Requirement 4 & 5: If no validated network exists, do NOT call Firebase AI Logic or request App Check token.
             if (networkMonitor != null && !networkMonitor.isInternetValidated()) {
                 return@withLock LiveHandshakeResult.Failed(
                     generationId = generationId,
@@ -481,9 +458,15 @@ class FirebaseAiLiveTransportDriver(
                 )
             }
 
+            if (modelId.isBlank() || (!modelId.contains("live", ignoreCase = true) && !modelId.contains("native-audio", ignoreCase = true))) {
+                return@withLock LiveHandshakeResult.Failed(
+                    generationId = generationId,
+                    classification = LiveFailureClassification.UNSUPPORTED_MODEL_OR_ENDPOINT,
+                    rawDetail = "Unsupported or non-Live model identifier '$modelId' on ${LiveConfigConstants.ENDPOINT_FAMILY.wireCode}"
+                )
+            }
+
             try {
-                // Verify prerequisite before attempting network handshake: never fake success when
-                // FirebaseApp is uninitialized in JVM tests or unconfigured builds.
                 val initializedApps = try {
                     com.google.firebase.FirebaseApp.getApps(
                         com.google.firebase.FirebaseApp.getInstance().applicationContext
@@ -501,6 +484,9 @@ class FirebaseAiLiveTransportDriver(
 
                 val liveConfig = liveGenerationConfig {
                     responseModality = ResponseModality.AUDIO
+                    speechConfig = SpeechConfig(
+                        voice = Voice(LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE)
+                    )
                     inputAudioTranscription = AudioTranscriptionConfig()
                     outputAudioTranscription = AudioTranscriptionConfig()
                     realtimeInputConfig = RealtimeInputConfig.builder()
@@ -514,7 +500,7 @@ class FirebaseAiLiveTransportDriver(
                 val liveModel = Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
                     modelName = modelId,
                     generationConfig = liveConfig,
-                    tools = emptyList(), // Phase 03/04/05: zero action tools registered
+                    tools = emptyList(),
                     systemInstruction = sysInstructionContent
                 )
 
@@ -671,7 +657,6 @@ class FirebaseAiLiveTransportDriver(
                     activeReceiveJob = receiveJob
                 }
 
-                // Wait for collector attachment or immediate receive channel error
                 val attachOutcome = withTimeout(handshakeTimeoutMs) {
                     collectorAttach.await()
                 }
@@ -709,7 +694,7 @@ class FirebaseAiLiveTransportDriver(
 
                 handshakeReturnedAccepted = true
                 val acceptedNote =
-                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent (${modelId}, tools=0, collector=ATTACHED)"
+                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent ($modelId, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, tools=0, collector=ATTACHED)"
                 onSocketEvent(
                     LiveSocketCallbackEvent.SetupAccepted(
                         generationId = generationId,
@@ -846,7 +831,7 @@ class DeterministicTestLiveTransportDriver(
         attempt: Int,
         onSocketEvent: (LiveSocketCallbackEvent) -> Unit
     ) -> LiveHandshakeResult = { genId, modelId, _, onSocketEvent ->
-        val note = "SETUP_ACCEPTED (${modelId} @ ${genId.wireId}, tools=0, audioPlayback=NOT_CLAIMED)"
+        val note = "SETUP_ACCEPTED (${modelId} @ ${genId.wireId}, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, tools=0, audioPlayback=NOT_CLAIMED)"
         onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
         LiveHandshakeResult.Accepted(genId, note)
     }
@@ -889,6 +874,9 @@ class DeterministicTestLiveTransportDriver(
     val receivedSystemInstructions = mutableListOf<String>()
     var lastReceivedSystemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
         private set
+    val receivedVoiceNames = mutableListOf<String>()
+    var lastReceivedVoiceName: String = LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE
+        private set
     val prependedFakeUserSpeechMessages = mutableListOf<String>()
     var startOfTurnSignalCount: Int = 0
         private set
@@ -916,7 +904,8 @@ class DeterministicTestLiveTransportDriver(
         generationId: LiveSessionGenerationId,
         modelId: String,
         onSocketEvent: (LiveSocketCallbackEvent) -> Unit,
-        systemInstruction: String
+        systemInstruction: String,
+        voiceName: String
     ): LiveHandshakeResult {
         val attempt = attemptCounter.incrementAndGet().toInt()
         lastConnectedGenId = generationId
@@ -926,6 +915,8 @@ class DeterministicTestLiveTransportDriver(
         collectorAttachedGenerations.add(generationId)
         lastReceivedSystemInstruction = systemInstruction
         receivedSystemInstructions.add(systemInstruction)
+        lastReceivedVoiceName = voiceName
+        receivedVoiceNames.add(voiceName)
         val wrappedCallback: (LiveSocketCallbackEvent) -> Unit = { event ->
             if (event is LiveSocketCallbackEvent.SetupAccepted && event.generationId == generationId) {
                 isSetupAcceptedForCurrentGen = true
@@ -995,25 +986,7 @@ class DeterministicTestLiveTransportDriver(
 }
 
 /**
- * Single Gemini Live Connection Adapter for OmniVoice Rebuild (Phase 03 & Phase 04).
- *
- * Enforces PROJECT_CONTRACT.md Phase 03, Offline Detection, and Phase 04 Language Mirroring invariants:
- * 1. Lifecycle-safe connectivity monitoring via [LiveNetworkMonitor] (`ConnectivityManager.NetworkCallback`).
- * 2. When validated internet access (`NET_CAPABILITY_INTERNET` + `NET_CAPABILITY_VALIDATED`) is lost:
- *    - Immediately invalidates stale `SETUP_ACCEPTED` state (`handshakeVerified = false`).
- *    - Closes/cancels any active Gemini Live connection and scheduled retries cleanly.
- *    - Transitions to `NETWORK_UNAVAILABLE`.
- * 3. Before every manual or automatic handshake, verifies `networkMonitor.isInternetValidated()`.
- *    If false, does NOT call Firebase AI Logic or App Check and returns `NETWORK_UNAVAILABLE`.
- * 4. Honest error classification via [LiveExceptionClassifier]:
- *    - DNS/timeout/socket/IO errors -> `NETWORK_ERROR` (eligible for bounded backoff up to 3 attempts while online).
- *    - Real HTTP 401/403 or App Check rejection while internet is validated -> `BAD_CREDENTIALS_OR_APP_CHECK` (no retry).
- * 5. Recovery policy:
- *    - When validated internet returns, transitions to `NETWORK_RESTORED` (`READY_TO_RECONNECT`) and performs
- *      at most 1 controlled automatic reconnect per offline interruption.
- * 6. Protects against stale callbacks with [LiveSessionGenerationId]; old requests never overwrite newer state.
- * 7. Sends [systemInstruction] (`LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION`) through the official
- *    Gemini Live session/system-instruction mechanism on every handshake without prepending fake user speech.
+ * Single Gemini Live Connection Adapter for OmniVoice Rebuild (Phase 03–06A).
  */
 class GeminiLiveConnectionAdapter(
     private val driver: LiveTransportDriver? = null,
@@ -1058,30 +1031,20 @@ class GeminiLiveConnectionAdapter(
             configuredModelId = configuredModelId,
             systemInstruction = systemInstruction,
             isInternetValidated = lastKnownValidated,
+            statusDetail = "Ready to verify $configuredModelId handshake via Firebase AI Logic (${LiveConfigConstants.LIVE_API_VERSION}).",
             diagnostics = RedactedLiveDiagnostics(
                 modelId = configuredModelId,
                 systemInstruction = systemInstruction,
                 isInternetValidated = lastKnownValidated,
-                redactedSummary = "Idle. Ready to verify ${configuredModelId} handshake via Firebase AI Logic (${LiveConfigConstants.LIVE_API_VERSION})."
+                redactedSummary = "Idle. Ready to verify $configuredModelId handshake via Firebase AI Logic (${LiveConfigConstants.LIVE_API_VERSION})."
             )
         )
     )
     val state: StateFlow<LiveConnectionState> = _state.asStateFlow()
 
-    /**
-     * Optional synchronous listener invoked whenever [state] updates so [com.example.coordinator.ConversationCoordinator]
-     * stays immediately synchronized even when [LiveNetworkMonitor] callbacks fire from background threads
-     * or in standalone unit tests without a ViewModel collector.
-     */
     @Volatile
     var onStateChanged: ((LiveConnectionState) -> Unit)? = null
 
-    /**
-     * Listener invoked synchronously for validated active-generation server content events
-     * ([LiveSocketCallbackEvent.ServerAudioChunkReceived], [LiveSocketCallbackEvent.ServerTurnCompleted],
-     * [LiveSocketCallbackEvent.ServerTranscriptionReceived]).
-     * Stale callbacks from superseded or closed generations are rejected before reaching this listener.
-     */
     @Volatile
     var onServerEventListener: ((LiveSocketCallbackEvent) -> Unit)? = null
 
@@ -1090,31 +1053,14 @@ class GeminiLiveConnectionAdapter(
         onStateChanged?.invoke(_state.value)
     }
 
-    /**
-     * Registers lifecycle-safe connectivity monitoring while the diagnostics screen or Live session is active.
-     */
     fun startNetworkMonitoring() {
         networkMonitor.startMonitoring(::onNetworkValidatedChanged)
     }
 
-    /**
-     * Unregisters connectivity monitoring safely when no longer needed.
-     */
     fun stopNetworkMonitoring() {
         networkMonitor.stopMonitoring()
     }
 
-    /**
-     * Handles real-time connectivity transitions from [LiveNetworkMonitor].
-     *
-     * - When `isValidated == false`:
-     *   Immediately invalidates any stale `SETUP_ACCEPTED` or `ACTIVE` connection, cancels scheduled retries,
-     *   closes the socket cleanly, and transitions to `NETWORK_UNAVAILABLE`.
-     * - When `isValidated == true`:
-     *   Transitions from offline state to `NETWORK_RESTORED` (`READY_TO_RECONNECT`), and performs at most
-     *   one controlled automatic reconnect if an active/requested session was interrupted by the outage
-     *   and no connect is already in flight.
-     */
     fun onNetworkValidatedChanged(isValidated: Boolean) {
         if (!isValidated) {
             val prevGen: LiveSessionGenerationId?
@@ -1138,7 +1084,6 @@ class GeminiLiveConnectionAdapter(
 
                 lastKnownValidated = false
                 prevGen = activeGenerationId
-                // Advance request sequence and clear activeGenerationId so any in-flight/old callback is rejected
                 activeConnectRequestId = connectRequestSeq.incrementAndGet()
                 activeGenerationId = null
                 jobToCancel = activeConnectJob
@@ -1177,7 +1122,6 @@ class GeminiLiveConnectionAdapter(
             return
         }
 
-        // Validated internet is now true
         var shouldTriggerSingleReconnect = false
         val reconnectSessionId: SessionId
         synchronized(lock) {
@@ -1189,7 +1133,6 @@ class GeminiLiveConnectionAdapter(
             lastKnownValidated = true
 
             if (!wasOffline) {
-                // Deduplicate repeated capability callbacks while already online
                 if (!_state.value.isInternetValidated) {
                     updateStateAndNotify { current ->
                         current.copy(
@@ -1201,7 +1144,6 @@ class GeminiLiveConnectionAdapter(
                 return
             }
 
-            // Never clobber an active in-flight handshake or healthy session
             if (inFlightConnectDeferred?.isActive == true || isHealthyEstablishedSessionLocked()) {
                 return
             }
@@ -1262,10 +1204,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Generates a fresh, monotonically increasing [LiveSessionGenerationId] bound to a specific
-     * socket attempt and [SessionId].
-     */
     private fun nextGenerationId(sessionId: SessionId, attempt: Int): LiveSessionGenerationId {
         val seq = generationSeq.incrementAndGet()
         return LiveSessionGenerationId(
@@ -1275,12 +1213,6 @@ class GeminiLiveConnectionAdapter(
         )
     }
 
-    /**
-     * Processes a socket/session callback event only if its [LiveSessionGenerationId] matches
-     * the currently active socket generation AND validated internet is available.
-     * Stale callbacks from superseded or closed sockets are deterministically rejected, logged as
-     * `STALE_CALLBACK_DROPPED`, and counted.
-     */
     fun onSocketCallback(event: LiveSocketCallbackEvent): Boolean {
         val closeGenAfterCallback: LiveSessionGenerationId?
         val acceptedWhileOnline: Boolean
@@ -1303,7 +1235,6 @@ class GeminiLiveConnectionAdapter(
                 return false
             }
 
-            // Never report SETUP_ACCEPTED while no validated internet is available!
             val validatedNow = networkMonitor.isInternetValidated()
             if (!validatedNow) {
                 if (!operatorHalted) {
@@ -1534,12 +1465,6 @@ class GeminiLiveConnectionAdapter(
             effectiveDriver.isReceiverCollectorAttached(gen)
     }
 
-    /**
-     * Returns true only if the Gemini Live session is currently `SETUP_ACCEPTED` or `ACTIVE`, validated
-     * internet is available, the coordinator's server-event collector (`onServerEventListener`)
-     * is attached, and the transport driver's `session.receive()` collector is actively attached
-     * for the active [LiveSessionGenerationId].
-     */
     fun isSessionReadyForAudio(): Boolean {
         if (!networkMonitor.isInternetValidated()) return false
         return synchronized(lock) {
@@ -1547,9 +1472,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Updates whether the Phase 04 audio playback adapter has claimed output for the active turn.
-     */
     fun setAudioPlaybackClaimed(claimed: Boolean) {
         synchronized(lock) {
             updateStateAndNotify { prev ->
@@ -1563,10 +1485,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Transitions a verified `SETUP_ACCEPTED` session to [LiveConnectionPhase.ACTIVE] when realtime
-     * audio streaming for a turn begins, without opening a new socket connection.
-     */
     fun markSessionActive(): Boolean {
         return synchronized(lock) {
             val gen = activeGenerationId ?: return@synchronized false
@@ -1587,12 +1505,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Streams a 16kHz 16-bit mono PCM audio chunk to the currently verified active Gemini Live session.
-     * Transitions `SETUP_ACCEPTED -> ACTIVE` when the first chunk streams.
-     * Returns `false` if no verified session is active, if the receiver collector is not attached,
-     * or if validated internet was lost.
-     */
     suspend fun sendRealtimeAudioToActiveSession(
         pcm16kHzBytes: ByteArray,
         mimeType: String = "audio/pcm;rate=16000"
@@ -1633,9 +1545,6 @@ class GeminiLiveConnectionAdapter(
         )
     }
 
-    /**
-     * Signals explicit start-of-spoken-turn (`activityStart`) to the currently verified active Gemini Live session.
-     */
     suspend fun signalStartOfSpokenTurn(): Boolean {
         if (!networkMonitor.isInternetValidated()) {
             onNetworkValidatedChanged(false)
@@ -1658,10 +1567,6 @@ class GeminiLiveConnectionAdapter(
         return effectiveDriver.sendStartOfSpokenTurn(activeGen)
     }
 
-    /**
-     * Signals end-of-spoken-turn to the currently verified active Gemini Live session.
-     * Returns `false` if no verified session is active or if validated internet was lost.
-     */
     suspend fun signalEndOfSpokenTurn(): Boolean {
         if (!networkMonitor.isInternetValidated()) {
             onNetworkValidatedChanged(false)
@@ -1686,12 +1591,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Authoritative single-flight entry point for Start / voice turns:
-     * - Reuses an already healthy `SETUP_ACCEPTED` or `ACTIVE` session across sequential turns without reconnecting.
-     * - Joins any already in-flight handshake via single-flight `CompletableDeferred` without starting duplicate sockets.
-     * - Connects once if disconnected or recovers cleanly after `FAILED` / exhausted retries without restarting the app.
-     */
     suspend fun ensureConnectedSession(sessionId: SessionId): LiveConnectionState {
         return executeHandshakeWithPolicy(
             sessionId = sessionId,
@@ -1701,14 +1600,6 @@ class GeminiLiveConnectionAdapter(
         )
     }
 
-    /**
-     * Initiates a real Gemini Live handshake with bounded exponential backoff (up to 3 attempts)
-     * for transient network/socket errors while online.
-     *
-     * Set [reuseIfHealthy] to `true` (or call [ensureConnectedSession]) to reuse an existing
-     * healthy `SETUP_ACCEPTED`/`ACTIVE` session instead of opening a replacement socket.
-     * Overlapping concurrent calls are always single-flight deduplicated behind [connectMutex].
-     */
     suspend fun connectWithBoundedRetry(
         sessionId: SessionId,
         reuseIfHealthy: Boolean = false
@@ -1727,7 +1618,6 @@ class GeminiLiveConnectionAdapter(
         isControlledAutoReconnect: Boolean,
         reuseIfHealthy: Boolean = false
     ): LiveConnectionState {
-        // Single-flight gate: either reuse healthy session or join an already in-flight connection
         val myDeferred: CompletableDeferred<LiveConnectionState>
         var existingToAwait: CompletableDeferred<LiveConnectionState>? = null
         var joinedWasAutoOnly = false
@@ -1764,7 +1654,6 @@ class GeminiLiveConnectionAdapter(
             if (!shouldFallbackRetryFromAuto) {
                 return joinedState
             }
-            // Only if a single-attempt background auto-reconnect failed, fall through once for full manual recovery
             return executeHandshakeWithPolicy(
                 sessionId = sessionId,
                 maxAttemptsLimit = maxAttemptsLimit,
@@ -1779,7 +1668,6 @@ class GeminiLiveConnectionAdapter(
                     return@withLock _state.value
                 }
 
-                // Pre-handshake check for NET_CAPABILITY_INTERNET + NET_CAPABILITY_VALIDATED
                 if (!networkMonitor.isInternetValidated()) {
                     synchronized(lock) {
                         lastKnownValidated = false
@@ -1821,8 +1709,6 @@ class GeminiLiveConnectionAdapter(
                     return@withLock _state.value
                 }
 
-                // Before creating a fresh generation: invalidate old generation, cancel collector/retry job,
-                // close old session once, and wait for cleanup off the main thread.
                 val hadPriorSessionOrFailure: Boolean
                 val requestId: Long
                 val priorJobToCancel: Job?
@@ -1892,7 +1778,6 @@ class GeminiLiveConnectionAdapter(
                             prev.copy(
                                 phase = connectingPhase,
                                 activeGeneration = created,
-                                configuredModelId = configuredModelId,
                                 failureClassification = LiveFailureClassification.NONE,
                                 isInternetValidated = true,
                                 attemptCount = attempt,
@@ -1928,7 +1813,8 @@ class GeminiLiveConnectionAdapter(
                             generationId = genId,
                             modelId = configuredModelId,
                             onSocketEvent = ::onSocketCallback,
-                            systemInstruction = systemInstruction
+                            systemInstruction = systemInstruction,
+                            voiceName = LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE
                         )
                     } catch (ce: CancellationException) {
                         withContext(backgroundDispatcher + NonCancellable) {
@@ -1937,7 +1823,6 @@ class GeminiLiveConnectionAdapter(
                         throw ce
                     }
 
-                    // Verify this generation wasn't preempted by STOP/PAUSE/disconnect, a newer request, or offline loss
                     val validatedAfterCall = networkMonitor.isInternetValidated()
                     val stillCurrent = synchronized(lock) {
                         activeConnectRequestId == requestId && activeGenerationId == genId
@@ -1985,7 +1870,6 @@ class GeminiLiveConnectionAdapter(
                                 return@withLock _state.value
                             }
 
-                            // Non-retryable failure classes MUST stop automatic retries immediately!
                             if (!classification.retryable) {
                                 val stopReason =
                                     "AUTO_RETRY_HALTED_${classification.wireCode} (Non-retryable on model $configuredModelId; silent model fallback prohibited)"
@@ -2021,7 +1905,6 @@ class GeminiLiveConnectionAdapter(
                                 return@withLock _state.value
                             }
 
-                            // Transient network/socket failure: check bounded backoff policy & effectiveMaxAttempts
                             val nextDelayMs = if (attempt >= effectiveMaxAttempts) {
                                 null
                             } else {
@@ -2066,7 +1949,6 @@ class GeminiLiveConnectionAdapter(
                                 return@withLock _state.value
                             }
 
-                            // Wait bounded backoff before next attempt
                             retryCount += 1
                             synchronized(lock) {
                                 if (activeConnectRequestId != requestId) {
@@ -2101,7 +1983,6 @@ class GeminiLiveConnectionAdapter(
 
                             delayRunner(nextDelayMs)
 
-                            // Check if disconnected, preempted by newer request, or went offline during backoff delay
                             if (!networkMonitor.isInternetValidated()) {
                                 onNetworkValidatedChanged(false)
                                 return@withLock _state.value
@@ -2131,10 +2012,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Cancels any scheduled retry backoff or in-flight connection attempt when the diagnostics
-     * screen is disposed, without destroying an already-verified `SETUP_ACCEPTED` or `ACTIVE` session.
-     */
     fun cancelScheduledRetries(reason: String) {
         val jobToCancel: Job?
         val genToClose: LiveSessionGenerationId?
@@ -2179,11 +2056,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Immediately disconnects any active or connecting Gemini Live session, cancels scheduled
-     * retries and auto-reconnect eligibility, invalidates the active [LiveSessionGenerationId]
-     * so late callbacks are dropped as stale, and releases socket resources.
-     */
     fun disconnectAndRelease(reason: String) {
         val prevGen: LiveSessionGenerationId?
         val jobToCancel: Job?
@@ -2222,10 +2094,6 @@ class GeminiLiveConnectionAdapter(
         effectiveDriver.closeSocket(prevGen)
     }
 
-    /**
-     * Suspends until the old receive collector is cancelled/joined and the underlying LiveSession
-     * is closed once off the main thread.
-     */
     suspend fun disconnectAndReleaseAsync(reason: String) {
         disconnectAndRelease(reason)
         withContext(backgroundDispatcher + NonCancellable) {
@@ -2233,10 +2101,6 @@ class GeminiLiveConnectionAdapter(
         }
     }
 
-    /**
-     * Recreates only the Gemini Live session (never the Activity/app) after an unexpected server
-     * turn interruption so the next turn starts with a clean session state.
-     */
     suspend fun recreateSessionAfterInterruption(
         sessionId: SessionId,
         reason: String

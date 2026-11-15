@@ -1,21 +1,21 @@
 package com.example.coordinator
 
+import com.example.audio.PlaybackGenerationId
 import com.example.contract.SessionId
 import com.example.contract.TurnId
 import com.example.contract.VerifiedOutcome
-import com.example.live.DiagnosticRedactor
 import com.example.live.TurnGenerationId
-import com.example.audio.PlaybackGenerationId
+import java.util.EnumSet
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 
 /**
- * Canonical 11-checkpoint per-turn lifecycle trace steps recorded with redacted timestamps
- * and generation IDs for diagnosing any stuck or delayed turn (Phase 05 test 05.2).
+ * Redacted, monotonically ordered 11-checkpoint lifecycle steps for a single spoken turn in Phase 05.
+ * Used to pinpoint the earliest missing event if a turn stalls in `LISTENING` or `PROCESSING`.
  */
-enum class TurnTraceStep(val wireName: String) {
+enum class TurnTraceStep(val wireCode: String) {
     LISTENING_STARTED("1_LISTENING_STARTED"),
     FIRST_MIC_FRAME("2_FIRST_MIC_FRAME"),
     LAST_MIC_FRAME("2_LAST_MIC_FRAME"),
@@ -31,24 +31,37 @@ enum class TurnTraceStep(val wireName: String) {
 }
 
 /**
- * Isolated turn-scoped runtime container allocated fresh for every voice turn.
- * Never reuses completed/cancelled [CompletableDeferred], closed channels/jobs, old VAD counters,
- * old activity flags, or old playback counters across turns.
+ * Point-in-time resource snapshot of the [ConversationCoordinator] used to verify zero leaked
+ * coroutines, timers, or hardware handles across multi-turn conversations and Stop/Pause transitions.
  */
-internal class TurnRuntimeState(
+data class CoordinatorResourceSnapshot(
+    val activeTurnJobs: Int,
+    val hasActiveInactivityTimer: Boolean,
+    val hasActiveFirstResponseWatchdog: Boolean,
+    val isMicrophoneCapturing: Boolean,
+    val isPlaybackTrackOpen: Boolean,
+    val activeLiveSessionCount: Int,
+    val isReceiverCollectorAttached: Boolean,
+    val staleTurnCallbacksDropped: Int,
+    val firstResponseTimeoutCount: Int,
+    val firstResponseRecoveryCount: Int
+)
+
+/**
+ * Fresh, isolated, turn-scoped runtime state created anew for EVERY spoken turn in Phase 05.
+ *
+ * Strictly prevents any completed/cancelled `Deferred`, old VAD speech/silence flags, old completion signals,
+ * old timers, or old playback counters from leaking from turn `N` into turn `N+1`.
+ */
+class TurnRuntimeState(
     val turnSeq: Long,
     val sessionId: SessionId,
     val turnId: TurnId,
     val turnGen: TurnGenerationId,
-    val createdAtLabel: String
-) {
-    val parentJob: CompletableJob = SupervisorJob()
+    val createdAtLabel: String,
+    val parentJob: CompletableJob = SupervisorJob(),
     val completionDeferred: CompletableDeferred<VerifiedOutcome> = CompletableDeferred()
-    val micSendJobs: MutableList<Job> = mutableListOf()
-    val writeJobs: MutableList<Job> = mutableListOf()
-    var drainJob: Job? = null
-    var firstResponseWatchdogJob: Job? = null
-
+) {
     var playbackGen: PlaybackGenerationId? = null
     var speechChunks: Int = 0
     var trailingSilenceChunks: Int = 0
@@ -66,6 +79,7 @@ internal class TurnRuntimeState(
     var activityStartAttempted: Boolean = false
     var activityStartSent: Boolean = false
     var activityStartFailed: Boolean = false
+
     var endOfTurnRequested: Boolean = false
     var endOfTurnSubmissionInFlight: Boolean = false
     var endOfTurnSubmitted: Boolean = false
@@ -74,144 +88,111 @@ internal class TurnRuntimeState(
     var serverResponseStarted: Boolean = false
     var firstResponseWatchdogArmed: Boolean = false
     var firstResponseTimeoutFired: Boolean = false
+
     var completionHandled: Boolean = false
     var closed: Boolean = false
 
-    private val recordedSteps = LinkedHashSet<TurnTraceStep>()
+    var firstResponseWatchdogJob: Job? = null
+    var drainJob: Job? = null
+    val micSendJobs: MutableList<Job> = mutableListOf()
+    val writeJobs: MutableList<Job> = mutableListOf()
+
+    private val recordedSteps: EnumSet<TurnTraceStep> = EnumSet.noneOf(TurnTraceStep::class.java)
     val structuredTraceEntries: MutableList<String> = mutableListOf()
 
+    @Synchronized
     fun recordStep(
         step: TurnTraceStep,
         timestampLabel: String,
-        liveGenWireId: String?,
+        liveGenWireId: String? = null,
         detail: String? = null
     ) {
-        val shouldAppend = when (step) {
-            TurnTraceStep.LAST_MIC_FRAME -> {
-                // Keep updating latest mic frame checkpoint cleanly without spamming list
-                recordedSteps.add(step)
-                val prefix = "${step.wireName} @"
-                val idx = structuredTraceEntries.indexOfFirst { it.startsWith(prefix) }
-                val entry = formatStepEntry(step, timestampLabel, liveGenWireId, detail)
-                if (idx >= 0) {
-                    structuredTraceEntries[idx] = entry
-                } else {
-                    structuredTraceEntries.add(entry)
-                }
-                false
+        recordedSteps.add(step)
+        val livePart = liveGenWireId ?: "NONE"
+        val detailSuffix = if (!detail.isNullOrBlank()) " [$detail]" else ""
+        val entry = "${step.wireCode}@$timestampLabel(turnGen=${turnGen.wireId},liveGen=$livePart,playGen=${playbackGen?.wireId ?: "NONE"})$detailSuffix"
+        if (step == TurnTraceStep.LAST_MIC_FRAME) {
+            val existingIdx = structuredTraceEntries.indexOfFirst { it.startsWith(TurnTraceStep.LAST_MIC_FRAME.wireCode) }
+            if (existingIdx >= 0) {
+                structuredTraceEntries[existingIdx] = entry
+                return
             }
-            else -> recordedSteps.add(step)
         }
-        if (shouldAppend) {
-            structuredTraceEntries.add(formatStepEntry(step, timestampLabel, liveGenWireId, detail))
+        if (structuredTraceEntries.none { it.startsWith("${step.wireCode}@") }) {
+            structuredTraceEntries.add(entry)
         }
     }
 
-    private fun formatStepEntry(
-        step: TurnTraceStep,
-        timestampLabel: String,
-        liveGenWireId: String?,
-        detail: String?
-    ): String {
-        val safeTs = DiagnosticRedactor.redact(timestampLabel)
-        val safeLive = DiagnosticRedactor.redact(liveGenWireId ?: "none")
-        val suffix = detail?.takeIf { it.isNotBlank() }?.let { " (${DiagnosticRedactor.redact(it)})" } ?: ""
-        return "${step.wireName} @ $safeTs [tgen=${turnGen.wireId}, live=$safeLive]$suffix"
-    }
-
+    @Synchronized
     fun hasStep(step: TurnTraceStep): Boolean = recordedSteps.contains(step)
 
-    /**
-     * Identifies the earliest missing checkpoint in the 11-step turn lifecycle up to drain.
-     */
+    @Synchronized
     fun earliestMissingStep(): String {
-        val orderedRequired = listOf(
-            TurnTraceStep.LISTENING_STARTED,
-            TurnTraceStep.FIRST_MIC_FRAME,
-            TurnTraceStep.USER_SPEECH_DETECTED,
-            TurnTraceStep.LAST_MIC_FRAME,
-            TurnTraceStep.AUDIO_CAPTURE_STOPPED,
-            TurnTraceStep.ACTIVITY_END_SENT,
-            TurnTraceStep.SERVER_RESPONSE_START,
-            TurnTraceStep.FIRST_AUDIO_CHUNK,
-            TurnTraceStep.SERVER_TURN_COMPLETE,
-            TurnTraceStep.AUDIOTRACK_FRAMES_DRAINED
-        )
-        for (step in orderedRequired) {
-            if (!recordedSteps.contains(step)) {
-                return step.wireName
-            }
+        if (!recordedSteps.contains(TurnTraceStep.LISTENING_STARTED)) return TurnTraceStep.LISTENING_STARTED.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.FIRST_MIC_FRAME)) return TurnTraceStep.FIRST_MIC_FRAME.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.USER_SPEECH_DETECTED)) return TurnTraceStep.USER_SPEECH_DETECTED.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.AUDIO_CAPTURE_STOPPED)) return TurnTraceStep.AUDIO_CAPTURE_STOPPED.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.ACTIVITY_END_SENT)) return TurnTraceStep.ACTIVITY_END_SENT.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.SERVER_RESPONSE_START) &&
+            !recordedSteps.contains(TurnTraceStep.FIRST_AUDIO_CHUNK) &&
+            !recordedSteps.contains(TurnTraceStep.SERVER_TURN_COMPLETE)
+        ) {
+            return TurnTraceStep.SERVER_RESPONSE_START.wireCode
         }
-        return if (!recordedSteps.contains(TurnTraceStep.NEXT_LISTENING_STARTED)) {
-            TurnTraceStep.NEXT_LISTENING_STARTED.wireName
-        } else {
-            "NONE"
+        if (!recordedSteps.contains(TurnTraceStep.FIRST_AUDIO_CHUNK) &&
+            !recordedSteps.contains(TurnTraceStep.SERVER_TURN_COMPLETE)
+        ) {
+            return TurnTraceStep.FIRST_AUDIO_CHUNK.wireCode
         }
+        if (!recordedSteps.contains(TurnTraceStep.SERVER_TURN_COMPLETE)) return TurnTraceStep.SERVER_TURN_COMPLETE.wireCode
+        if (!recordedSteps.contains(TurnTraceStep.AUDIOTRACK_FRAMES_DRAINED)) return TurnTraceStep.AUDIOTRACK_FRAMES_DRAINED.wireCode
+        return "NONE"
     }
 
-    fun collectAllJobs(): List<Job> {
-        val jobs = mutableListOf<Job>()
-        firstResponseWatchdogJob?.let { jobs.add(it) }
-        drainJob?.let { jobs.add(it) }
-        jobs.addAll(micSendJobs)
-        jobs.addAll(writeJobs)
-        jobs.add(parentJob)
-        return jobs
-    }
-
-    fun activeJobCount(): Int {
-        var count = 0
-        if (firstResponseWatchdogJob?.isActive == true) count += 1
-        if (drainJob?.isActive == true) count += 1
-        count += micSendJobs.count { it.isActive }
-        count += writeJobs.count { it.isActive }
-        if (parentJob.isActive && count > 0) {
-            // parentJob itself is a SupervisorJob supervising children
-            count += 1
-        }
-        return count
-    }
-
+    @Synchronized
     fun cancelWatchdog() {
         firstResponseWatchdogJob?.cancel()
         firstResponseWatchdogJob = null
     }
 
-    fun dispose(cancelAllJobs: Boolean = true) {
+    @Synchronized
+    fun collectAllJobs(): List<Job> {
+        val all = mutableListOf<Job>()
+        all.addAll(micSendJobs)
+        all.addAll(writeJobs)
+        firstResponseWatchdogJob?.let { all.add(it) }
+        drainJob?.let { all.add(it) }
+        return all
+    }
+
+    @Synchronized
+    fun activeJobCount(): Int {
+        var count = 0
+        count += micSendJobs.count { it.isActive }
+        count += writeJobs.count { it.isActive }
+        if (firstResponseWatchdogJob?.isActive == true) count += 1
+        if (drainJob?.isActive == true) count += 1
+        return count
+    }
+
+    @Synchronized
+    fun dispose(cancelAllJobs: Boolean) {
         closed = true
-        cancelWatchdog()
+        firstResponseWatchdogJob?.cancel()
+        firstResponseWatchdogJob = null
         if (cancelAllJobs) {
-            drainJob?.cancel()
-            drainJob = null
             for (job in micSendJobs) {
                 job.cancel()
             }
             for (job in writeJobs) {
                 job.cancel()
             }
+            drainJob?.cancel()
+            drainJob = null
             parentJob.cancel()
         } else {
-            // Complete supervisor job cleanly once finished so no active supervisor leaks
-            parentJob.complete()
+            micSendJobs.removeAll { it.isCompleted }
+            writeJobs.removeAll { it.isCompleted }
         }
-        micSendJobs.clear()
-        writeJobs.clear()
     }
 }
-
-/**
- * Snapshot of active coordinator, timer, audio hardware, and Live session resources
- * used to verify zero leaks after Turns 1, 7, 10, and 20+.
- */
-data class CoordinatorResourceSnapshot(
-    val activeTurnJobs: Int,
-    val hasActiveInactivityTimer: Boolean,
-    val hasActiveFirstResponseWatchdog: Boolean,
-    val isMicrophoneCapturing: Boolean,
-    val isPlaybackTrackOpen: Boolean,
-    val activeLiveSessionCount: Int,
-    val isReceiverCollectorAttached: Boolean,
-    val staleTurnCallbacksDropped: Int,
-    val firstResponseTimeoutCount: Int,
-    val firstResponseRecoveryCount: Int
-)

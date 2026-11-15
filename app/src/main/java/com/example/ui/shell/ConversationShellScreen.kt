@@ -1004,13 +1004,23 @@ private fun VoiceTurnPipelineCard(
                     label = "TURNS COMPLETED: ${uiState.completedTurnsInSession} • STALE DROPPED: ${uiState.staleTurnCallbacksDropped}",
                     tag = "active_conversation_turns_chip"
                 )
+                val vadModelStatus = when {
+                    uiState.vadModelLoaded -> "LOADED"
+                    !uiState.vadModelLoadError.isNullOrBlank() -> "LOAD_FAILED"
+                    else -> "NOT_LOADED"
+                }
+                val vadDecisionLabel = if (uiState.vadSpeechDecision) "SPEECH" else "NOISE"
+                TelemetryChip(
+                    label = "VAD: ${uiState.vadDetectorName} v${uiState.vadDetectorVersion} ($vadModelStatus) • $vadDecisionLabel p=${"%.2f".format(uiState.vadSpeechProbability)}",
+                    tag = "speech_vad_detector_chip"
+                )
+                TelemetryChip(
+                    label = "GATE: ${uiState.speechGateState.wireCode} • cand=${uiState.consecutiveSpeechDurationMs}ms (${uiState.vadCandidateConfirmationCount}w) • actStart=${uiState.activityStartCount}",
+                    tag = "speech_vad_gate_chip"
+                )
                 TelemetryChip(
                     label = uiState.duplexPolicyLabel,
                     tag = "duplex_policy_chip"
-                )
-                TelemetryChip(
-                    label = "LANGUAGE: MIRROR SPOKEN TURN (EN / UR / ROMAN-UR)",
-                    tag = "voice_turn_language_policy_chip"
                 )
             }
 
@@ -1786,12 +1796,12 @@ private fun SettingsPlaceholderDialog(
                     text = "• Application ID: ${BuildConfig.APPLICATION_ID}\n" +
                         "• Version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
                         "• Source/Build ID: ${BuildConfig.SOURCE_BUILD_ID}\n" +
+                        "• Live Model ID: ${uiState.liveConnectionState.configuredModelId} (${uiState.liveConnectionState.phase.wireCode})\n" +
                         "• Model Config: ${BuildConfig.MODEL_CONFIG_STATUS}\n" +
                         "• Duplex Policy: ${uiState.duplexPolicyLabel} (Barge-In Claimed: ${uiState.isSpokenBargeInClaimed})\n" +
                         "• Active Phase: ${uiState.activeConversationPhase.wireLabel} (Completed Turns: ${uiState.completedTurnsInSession})\n" +
                         "• Resource Releases Before Capture: ${uiState.resourceReleaseBeforeCaptureCount}\n" +
                         "• Inactivity Closures: ${uiState.inactivityClosedCount}\n" +
-                        "• Live Model ID: ${uiState.liveConnectionState.configuredModelId} (${uiState.liveConnectionState.phase.wireCode})\n" +
                         "• Live Session Gen: ${uiState.liveConnectionState.diagnostics.sessionGenerationWireId}\n" +
                         "• Audio Owner: ${uiState.audioCaptureState.owner.wireLabel} (Gen: ${uiState.audioCaptureState.activeGeneration?.wireId ?: "NONE"})\n" +
                         "• Playback Gen: ${uiState.playbackState.activeGeneration?.wireId ?: "NONE"} (Drained: ${uiState.playbackState.isPlaybackDrained}, State=${uiState.playbackState.trackState}, Play=${uiState.playbackState.playState}, Write=${uiState.playbackState.lastWriteErrorName}, Recreated=${uiState.playbackState.trackRecreationCount})\n" +

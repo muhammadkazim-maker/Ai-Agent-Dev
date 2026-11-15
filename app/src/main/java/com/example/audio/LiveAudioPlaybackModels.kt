@@ -196,6 +196,7 @@ data class AudioTrackDiagnostics(
     val bufferSizeInFrames: Int = 0,
     val trackInstanceId: Long = 0L,
     val lastWriteCode: Int = 0,
+    val underrunCount: Int = 0,
     val diagnostic: String = "NONE"
 )
 
@@ -250,6 +251,13 @@ data class LiveAudioPlaybackState(
     val trackRecreationCount: Int = 0,
     val activeTrackInstanceId: Long = 0L,
     val drainDeadlineMs: Long = 0L,
+    val underrunCount: Int = 0,
+    val queuedBytes: Long = 0L,
+    val maximumQueuedBytes: Long = 0L,
+    val prebufferTargetBytes: Long = 0L,
+    val playbackStartedAfterBufferedBytes: Long = 0L,
+    val expectedChunkSequence: Long = 0L,
+    val lastProcessedChunkSequence: Long = 0L,
     val lastError: String? = null,
     val statusDetail: String = "Streaming playback adapter idle."
 )

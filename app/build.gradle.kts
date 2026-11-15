@@ -87,6 +87,9 @@ android {
       }
     }
   }
+  androidResources {
+    noCompress += "onnx"
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -101,7 +104,9 @@ secrets {
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
 }
 
-googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
+googleServices {
+    missingGoogleServicesStrategy = MissingGoogleServicesStrategy.ERROR
+}
 
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
@@ -145,6 +150,7 @@ dependencies {
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+  implementation(libs.onnxruntime.android)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)
@@ -155,6 +161,7 @@ dependencies {
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  testImplementation(libs.onnxruntime.jvm)
   testImplementation(libs.robolectric)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
@@ -165,4 +172,8 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   // "ksp"(libs.androidx.room.compiler)
   // "ksp"(libs.moshi.kotlin.codegen)
+}
+
+configurations.matching { it.name.contains("UnitTest") }.configureEach {
+  exclude(group = "com.microsoft.onnxruntime", module = "onnxruntime-android")
 }

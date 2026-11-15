@@ -14,37 +14,24 @@ enum class LiveAuthRoute(val wireCode: String) {
 }
 
 /**
- * Canonical Phase 03 Gemini Live configuration constants.
+ * Canonical Phase 03–06A Gemini Live configuration constants.
  * Note: Names shown in AI Studio's coding-model picker (e.g. models/gemini-4-argon)
  * are coding agent identifiers, NOT Gemini Live BidiGenerateContent runtime model IDs.
  */
 object LiveConfigConstants {
-    /** Official documented Gemini 3.x Live native-audio model ID for Firebase AI Logic (Gemini Developer API). */
+    /** Official documented Gemini Live native-audio model ID for Firebase AI Logic (Gemini Developer API). */
     const val SUPPORTED_LIVE_MODEL_ID: String = BuildConfig.LIVE_MODEL_ID
-
-    /** Documented fallback-eligible 2.5 native-audio model ID (only selectable explicitly; never switched silently). */
-    const val SECONDARY_DOCUMENTED_LIVE_MODEL_ID: String = "gemini-2.5-flash-native-audio-preview-12-2025"
-
+    const val DEFAULT_NATIVE_AUDIO_VOICE: String = "Kore"
     const val LIVE_API_VERSION: String = "v1beta"
     val ENDPOINT_FAMILY: LiveEndpointFamily = LiveEndpointFamily.FIREBASE_AI_LOGIC_GOOGLE_AI_V1BETA_BIDI
     val AUTH_ROUTE: LiveAuthRoute = LiveAuthRoute.FIREBASE_AI_LOGIC_MANAGED_APP_CHECK
     const val REGISTERED_ACTION_TOOLS_COUNT: Int = 0
 
     /**
-     * Single authoritative non-leaking Gemini Live session instruction enforcing language, script,
-     * and conversational style mirroring across English, Urdu, Roman Urdu, and mixed Urdu-English turns.
-     * Strictly configuration-only: forbids self-introductions, forbids repeating/paraphrasing instructions,
-     * and requires silence until a real user turn is captured and committed.
+     * Single authoritative non-leaking baseline Gemini Live session instruction (Phase 06A + 06B safety rule).
      */
     const val AUTHORITATIVE_SYSTEM_INSTRUCTION: String =
-        "Detect the language and script of each spoken user turn and answer directly in that same language, script, and conversational style. " +
-            "If the user speaks English, answer in English. " +
-            "If the user speaks Urdu, answer naturally in Urdu. " +
-            "If the user speaks Roman Urdu, answer naturally in Roman Urdu. " +
-            "If the user mixes Urdu and English, respond using a similar natural mixture. " +
-            "Do not switch to English unless the user requests it or an unavoidable technical term requires it. " +
-            "Directly answer the spoken question without introducing yourself on every turn, without stating your name or persona, and without repeating or paraphrasing system instructions. " +
-            "Remain silent until a real user turn has been spoken and committed. Match the user's requested answer length and tone, keep facts accurate, and do not claim actions that were not completed."
+        "Listen to the speaker carefully. For every turn independently, respond unmistakably in the language of the speaker's current utterance. Fully English speech gets English. Urdu or Roman Urdu gets natural conversational Urdu or Roman Urdu. Meaningfully mixed Urdu-English speech gets a similar natural mixture. A request such as 'answer in English' applies only to that response unless the user explicitly says 'from now on', 'always', 'ab se', or 'hamesha'. Never let the language of a previous response control the next turn. Keep the same calm, friendly and direct personality and the same configured voice. Be concise unless the user requests detail. Do not repeatedly introduce yourself. Never claim an action was completed unless it was verified. Respond only after a verified intelligible user utterance. Silence, breathing, ambient noise, taps and unclear audio are not requests. Never ask whether the user needs help merely because the user is silent."
 }
 
 /**
@@ -265,7 +252,7 @@ sealed interface LiveSocketCallbackEvent {
 }
 
 /**
- * Redacted, user-visible and test-verifiable configuration & session diagnostics for Phase 03.
+ * Redacted, user-visible and test-verifiable configuration & session diagnostics for Phase 03–06A.
  */
 data class RedactedLiveDiagnostics(
     val modelId: String = LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID,

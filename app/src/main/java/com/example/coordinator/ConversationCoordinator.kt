@@ -15,10 +15,19 @@ import com.example.audio.PcmChunkWriteOutcome
 import com.example.audio.PcmResampler
 import com.example.audio.PlaybackCallbackEvent
 import com.example.audio.PlaybackGenerationId
+import com.example.audio.DefaultNoContextSyntheticSpeechDetector
+import com.example.audio.SileroVadDetector
+import com.example.audio.SpeechActivityGate
+import com.example.audio.SpeechGateDecision
+import com.example.audio.SpeechGateState
+import com.example.audio.SpeechNeuralDetector
+import com.example.audio.WakeWordDetector
+import com.example.audio.WakeAuthorization
+import com.example.audio.WakeWordState
+import com.example.audio.FakeWakeWordDetector
 import com.example.contract.ActionId
 import com.example.contract.ActiveConversationPhase
 import com.example.contract.ContractIdGenerator
-import com.example.contract.ConversationGenerationStamp
 import com.example.contract.ConversationState
 import com.example.contract.CoordinatorCommand
 import com.example.contract.InactivityTimeoutOption
@@ -37,10 +46,11 @@ import com.example.live.LiveSocketCallbackEvent
 import com.example.live.TurnGenerationId
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -148,29 +158,32 @@ data class ConversationUiState(
     val currentTurnUserTranscript: String = "",
     val currentTurnModelTranscript: String = "",
     val authoritativeSystemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
-    val lastVoiceTurnSummary: String = "Ready. Press Start to begin a verified Gemini Live voice conversation."
+    val lastVoiceTurnSummary: String = "Ready. Press Start to begin a verified Gemini Live voice conversation.",
+    val speechGateState: SpeechGateState = SpeechGateState.IDLE,
+    val vadDetectorName: String = SileroVadDetector.DETECTOR_NAME,
+    val vadDetectorVersion: String = SileroVadDetector.DETECTOR_VERSION,
+    val vadModelLoaded: Boolean = false,
+    val vadModelLoadError: String? = null,
+    val vadSpeechDecision: Boolean = false,
+    val vadSpeechProbability: Float = 0f,
+    val vadCandidateConfirmationCount: Int = 0,
+    val noiseFloorRms: Float = 0.002f,
+    val activeSpeechStartThresholdRms: Float = 0.012f,
+    val consecutiveSpeechDurationMs: Long = 0L,
+    val preRollDurationMs: Long = 0L,
+    val preRollBytes: Int = 0,
+    val falseStartsRejectedCount: Int = 0,
+    val activityStartCount: Int = 0,
+    val activityEndCount: Int = 0,
+    val isPostPlaybackGuardActive: Boolean = false,
+    val wakeWordState: WakeWordState = WakeWordState.COMMAND_LISTENING,
+    val wakeWordStatusLabel: String = "LISTENING (NATURAL SPEECH ACTIVE)",
+    val wakeAuthorizationActive: Boolean = true,
+    val lastWakeKeyword: String? = null
 )
 
 /**
- * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 through Phase 05).
- *
- * Enforces PROJECT_CONTRACT.md, Phase 04, and Phase 05 invariants:
- * 1. Single coordinator authority and serialized state machine (`Preparing`, `Listening`, `Thinking`,
- *    `Speaking`, `Paused`, `Error`, plus `Idle` and `Stopped`) connecting the Phase 02 [AudioCapture]
- *    owner, Phase 03 [GeminiLiveConnectionAdapter], and Phase 04 [LiveAudioPlaybackAdapter].
- * 2. Events carry session and turn generations ([SessionId], [TurnGenerationId]); stale or overlapping
- *    events from an older turn or session are deterministically dropped and can never close, interrupt,
- *    or resume a newer turn.
- * 3. After actual speech completion (`SPEAKING` hardware drain verified), automatically restores capture
- *    (`PREPARING -> LISTENING`) while the active conversation is enabled, performing actual resource
- *    release before replacement capture.
- * 4. After first-use consent and configuration, reopening the visible conversation screen may resume
- *    according to a remembered user preference ([ConversationUiState.autoResumeOnScreenReopen]),
- *    while NEVER overriding deliberate Pause/Mute or Stop.
- * 5. Uses inactivity-based session closure with a visible setting ([InactivityTimeoutOption]) and
- *    never stops after an arbitrary turn count (supports 20+ continuous turns).
- * 6. Keeps the half-duplex policy explicit (`isSpokenBargeInClaimed = false`; microphone disabled
- *    during `THINKING` and `SPEAKING`) and maintains a short session transcript bounded in size.
+ * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 through Phase 06B).
  */
 class ConversationCoordinator(
     private val idGenerator: ContractIdGenerator = ContractIdGenerator(),
@@ -188,13 +201,37 @@ class ConversationCoordinator(
     val maxTranscriptEntries: Int = 24,
     val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
     val firstResponseTimeoutMs: Long = 12_000L,
-    private val clockProvider: () -> String = { "PHASE05-T+${System.currentTimeMillis() % 100000}ms" }
+    private val monotonicClockMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    val preRollDurationMs: Long = 300L,
+    val speechConfirmDurationMs: Long = 120L,
+    val trailingSilenceDurationMs: Long = 700L,
+    val postPlaybackEchoGuardMs: Long = 500L,
+    private val postPlaybackGuardDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) },
+    private val clockProvider: () -> String = { "PHASE05-T+${System.currentTimeMillis() % 100000}ms" },
+    val speechDetector: SpeechNeuralDetector = DefaultNoContextSyntheticSpeechDetector(
+        energyThresholdRms = max(0.012f, speechRmsThreshold)
+    ),
+    val wakeWordDetector: WakeWordDetector = FakeWakeWordDetector()
 ) {
     private sealed interface PrerequisiteCheck {
         data object Passed : PrerequisiteCheck
         data class NotConfigured(val detail: String) : PrerequisiteCheck
         data class MissingPrerequisite(val code: String, val detail: String) : PrerequisiteCheck
     }
+
+    private val effectiveSpeechConfirmDurationMs: Long =
+        if (speechDetector.requiresLoadedModel && speechConfirmDurationMs == 120L) 160L else speechConfirmDurationMs
+
+    val speechGate: SpeechActivityGate = SpeechActivityGate(
+        speechDetector = speechDetector,
+        sampleRateHz = PcmResampler.TARGET_SAMPLE_RATE_HZ,
+        preRollTargetMs = preRollDurationMs,
+        speechConfirmDurationMs = effectiveSpeechConfirmDurationMs,
+        trailingSilenceDurationMs = trailingSilenceDurationMs,
+        postPlaybackEchoGuardMs = postPlaybackEchoGuardMs,
+        baseMinThresholdRms = max(0.012f, speechRmsThreshold),
+        monotonicClockMs = monotonicClockMs
+    )
 
     private val executedActionIds = LinkedHashSet<String>()
     private val maxTrackedActions = 512
@@ -210,6 +247,10 @@ class ConversationCoordinator(
     private var activeTimeoutRecoveryJob: Job? = null
     @Volatile
     private var activeTimeoutRecoveryDeferred: CompletableDeferred<VerifiedOutcome>? = null
+    @Volatile
+    private var activeNextTurnRecoveryJob: Job? = null
+    @Volatile
+    private var postPlaybackGuardJob: Job? = null
     private val micSendMutex = Mutex()
     @Volatile
     private var needsSessionRecreationBeforeNextTurn: Boolean = false
@@ -220,6 +261,15 @@ class ConversationCoordinator(
     @Volatile
     private var previousTurnEarliestMissingStep: String? = null
     private var consecutiveFirstResponseTimeouts: Int = 0
+
+    @Volatile
+    private var wakeWordState: WakeWordState = WakeWordState.COMMAND_LISTENING
+    @Volatile
+    private var activeWakeAuthorization: WakeAuthorization? = null
+
+    private fun ensureWakeAuthorizationValid(turn: TurnRuntimeState?): Boolean {
+        return true
+    }
 
     private val turnScope = CoroutineScope(SupervisorJob() + backgroundDispatcher)
 
@@ -268,26 +318,23 @@ class ConversationCoordinator(
         liveAdapter.onStateChanged = { onLiveAdapterStateUpdated() }
         liveAdapter.onServerEventListener = { event -> onServerSocketEvent(event) }
         playbackAdapter.onStateChanged = { syncPlaybackState() }
+        syncLiveState()
+        syncSpeechGateTelemetryLocked()
     }
 
     fun nextActionId(verb: String): ActionId = idGenerator.nextActionId(verb)
 
-    /**
-     * Returns true if any per-turn background coroutine jobs are still active.
-     * Used by lifecycle tests to verify zero leaked coroutines after turn completion or Stop.
-     */
     @Synchronized
     fun hasActiveTurnJobs(): Boolean {
         val turn = activeTurn
-        val recoveryActive = activeTimeoutRecoveryJob?.isActive == true
+        val recoveryActive =
+            activeTimeoutRecoveryJob?.isActive == true ||
+                activeNextTurnRecoveryJob?.isActive == true ||
+                postPlaybackGuardJob?.isActive == true
         if (turn == null) return recoveryActive
         return recoveryActive || turn.activeJobCount() > 0 || turn.parentJob.isActive
     }
 
-    /**
-     * Returns an exact point-in-time snapshot of active jobs, timers, hardware resources,
-     * and Live session collectors for verifying zero resource leaks across multi-turn runs.
-     */
     @Synchronized
     fun resourceSnapshot(): CoordinatorResourceSnapshot {
         val turn = activeTurn
@@ -295,8 +342,12 @@ class ConversationCoordinator(
         val playSnap = playbackAdapter.state.value
         val audioSnap = audioCapture.state.value
         val ui = _uiState.value
+        val recoveryJobsCount =
+            (if (activeTimeoutRecoveryJob?.isActive == true) 1 else 0) +
+                (if (activeNextTurnRecoveryJob?.isActive == true) 1 else 0) +
+                (if (postPlaybackGuardJob?.isActive == true) 1 else 0)
         return CoordinatorResourceSnapshot(
-            activeTurnJobs = (turn?.activeJobCount() ?: 0) + if (activeTimeoutRecoveryJob?.isActive == true) 1 else 0,
+            activeTurnJobs = (turn?.activeJobCount() ?: 0) + recoveryJobsCount,
             hasActiveInactivityTimer = inactivityTimerJob?.isActive == true,
             hasActiveFirstResponseWatchdog = turn?.firstResponseWatchdogJob?.isActive == true,
             isMicrophoneCapturing = audioSnap.isCapturing,
@@ -309,10 +360,36 @@ class ConversationCoordinator(
         )
     }
 
-    /**
-     * Synchronizes the latest [AudioCaptureState], [LiveConnectionState], and [LiveAudioPlaybackState]
-     * into [ConversationUiState] using lock-free CAS updates so UI collectors never block on audio threads.
-     */
+    private fun syncSpeechGateTelemetryLocked() {
+        val gateSnap = speechGate.telemetrySnapshot()
+        _uiState.update { state ->
+            state.copy(
+                speechGateState = gateSnap.gateState,
+                vadDetectorName = gateSnap.detectorName,
+                vadDetectorVersion = gateSnap.detectorVersion,
+                vadModelLoaded = gateSnap.isModelLoaded,
+                vadModelLoadError = gateSnap.modelLoadError,
+                vadSpeechDecision = gateSnap.lastSpeechDecision,
+                vadSpeechProbability = gateSnap.lastSpeechProbability,
+                vadCandidateConfirmationCount = gateSnap.candidateConfirmationCount,
+                noiseFloorRms = gateSnap.noiseFloorRms,
+                activeSpeechStartThresholdRms = gateSnap.activeSpeechStartThresholdRms,
+                consecutiveSpeechDurationMs = gateSnap.consecutiveSpeechDurationMs,
+                preRollDurationMs = gateSnap.preRollDurationMs,
+                preRollBytes = gateSnap.preRollBytes,
+                falseStartsRejectedCount = gateSnap.falseStartsRejected,
+                activityStartCount = gateSnap.activityStartCount,
+                activityEndCount = gateSnap.activityEndCount,
+                isPostPlaybackGuardActive = gateSnap.isPostPlaybackGuardActive
+            )
+        }
+    }
+
+    private fun cancelPostPlaybackGuardJobLocked() {
+        postPlaybackGuardJob?.cancel()
+        postPlaybackGuardJob = null
+    }
+
     fun syncAudioState() {
         val snap = audioCapture.state.value
         val liveSnap = liveAdapter.state.value
@@ -329,9 +406,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Synchronizes the latest [LiveConnectionState] from [liveAdapter] into [ConversationUiState] lock-free.
-     */
     fun syncLiveState() {
         val liveSnap = liveAdapter.state.value
         _uiState.update { current ->
@@ -342,10 +416,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Synchronizes the latest [LiveAudioPlaybackState] from [playbackAdapter] into [ConversationUiState]
-     * using lock-free CAS updates while ignoring snapshots belonging to a superseded playback generation.
-     */
     fun syncPlaybackState() {
         val playSnap = playbackAdapter.state.value
         val expectedPlaybackGen = activeTurn?.playbackGen
@@ -364,7 +434,10 @@ class ConversationCoordinator(
         val liveSnap = liveAdapter.state.value
         synchronized(this) {
             _uiState.update { current ->
-                current.copy(liveConnectionState = liveSnap)
+                current.copy(
+                    liveConnectionState = liveSnap,
+                    authoritativeSystemInstruction = liveSnap.systemInstruction
+                )
             }
             val turn = activeTurn ?: return
             if (turn.closed) return
@@ -413,19 +486,12 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Updates the Android RECORD_AUDIO permission state in the single [AudioCapture] owner.
-     */
     @Synchronized
     fun onMicPermissionUpdated(permissionState: MicPermissionState) {
         audioCapture.updatePermissionState(permissionState)
         syncAudioState()
     }
 
-    /**
-     * Forwards a generation-tagged hardware callback through [AudioCapture] and updates state.
-     * Returns true if accepted by the active generation, false if dropped as stale.
-     */
     @Synchronized
     fun onAudioHardwareCallback(event: CaptureCallbackEvent): Boolean {
         val accepted = audioCapture.onHardwareCallback(event)
@@ -433,40 +499,24 @@ class ConversationCoordinator(
         return accepted
     }
 
-    /**
-     * Forwards a generation-tagged socket callback through [GeminiLiveConnectionAdapter] and updates state.
-     * Returns true if accepted by the active socket generation, false if dropped as stale.
-     */
     fun onLiveSocketCallback(event: LiveSocketCallbackEvent): Boolean {
         val accepted = liveAdapter.onSocketCallback(event)
         syncLiveState()
         return accepted
     }
 
-    /**
-     * Starts lifecycle-safe connectivity monitoring (`ConnectivityManager.NetworkCallback`) while
-     * the diagnostics screen or a Gemini Live session is active.
-     */
     @Synchronized
     fun startLiveNetworkMonitoring() {
         liveAdapter.startNetworkMonitoring()
         syncLiveState()
     }
 
-    /**
-     * Unregisters connectivity monitoring safely when no longer needed.
-     */
     @Synchronized
     fun stopLiveNetworkMonitoring() {
         liveAdapter.stopNetworkMonitoring()
         syncLiveState()
     }
 
-    /**
-     * Called when the Live Diagnostics screen is disposed (navigated away).
-     * Cancels any scheduled retry backoff (`CONNECTING` / `RETRY_BACKOFF_WAITING`), and unregisters
-     * the network callback if no active `SETUP_ACCEPTED` session is being monitored.
-     */
     @Synchronized
     fun onLiveDiagnosticsDisposed(reason: String = "Live Diagnostics screen disposed") {
         liveAdapter.cancelScheduledRetries(reason)
@@ -477,14 +527,16 @@ class ConversationCoordinator(
         syncLiveState()
     }
 
-    /**
-     * Checks all Phase 04 prerequisites before starting or connecting a voice turn.
-     * Never returns [PrerequisiteCheck.NotConfigured] unless [isVoiceTurnConfigured] is explicitly false.
-     */
     private fun checkVoiceTurnPrerequisitesLocked(): PrerequisiteCheck {
         if (!isVoiceTurnConfigured) {
             return PrerequisiteCheck.NotConfigured(
                 "Voice turn adapters are explicitly marked unconfigured in this coordinator instance."
+            )
+        }
+        if (speechDetector.requiresLoadedModel && !speechDetector.isModelLoaded) {
+            return PrerequisiteCheck.MissingPrerequisite(
+                code = "VAD_MODEL_LOAD_FAILED",
+                detail = "Silero VAD neural detector failed to load (${speechDetector.loadError ?: "unknown model load failure"}). Refusing RMS-only fallback."
             )
         }
         val permState = audioCapture.state.value.permissionState
@@ -509,23 +561,18 @@ class ConversationCoordinator(
         return PrerequisiteCheck.Passed
     }
 
-    /**
-     * Enables or disables Phase 05 continuous foreground active conversation mode (auto-restoring
-     * microphone capture after each completed spoken response).
-     */
     @Synchronized
     fun setActiveConversationEnabled(enabled: Boolean) {
         preferencesStore.isActiveConversationEnabled = enabled
+        if (!enabled) {
+            activeNextTurnRecoveryJob?.cancel()
+            activeNextTurnRecoveryJob = null
+        }
         _uiState.update { state ->
             state.copy(isActiveConversationEnabled = enabled)
         }
     }
 
-    /**
-     * Sets the remembered user preference for whether reopening the visible conversation screen
-     * automatically resumes listening (after first-use consent & configuration, and never overriding
-     * deliberate Pause/Mute or Stop).
-     */
     @Synchronized
     fun setAutoResumeOnScreenReopen(enabled: Boolean) {
         preferencesStore.autoResumeOnScreenReopen = enabled
@@ -534,9 +581,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Updates the user-selected inactivity session closure timeout option (`30s`, `1m`, `2m`, `5m`).
-     */
     @Synchronized
     fun setInactivityTimeoutOption(option: InactivityTimeoutOption) {
         preferencesStore.inactivityTimeoutOption = option
@@ -553,10 +597,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Overrides the inactivity timeout duration in milliseconds (useful for deterministic testing)
-     * and re-arms the timer if currently listening.
-     */
     @Synchronized
     fun setCustomInactivityTimeoutMs(timeoutMs: Long) {
         require(timeoutMs > 0L) { "inactivityTimeoutMs must be positive" }
@@ -569,11 +609,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Records that an Android configuration change (e.g. portrait <-> landscape orientation rotation)
-     * preserved the single ViewModel-scoped [ConversationCoordinator] without creating duplicate
-     * coordinators or dropping active conversation state.
-     */
     @Synchronized
     fun onConfigurationChangePreserved() {
         _uiState.update { state ->
@@ -583,10 +618,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Starts a foreground active conversation (enabling continuous turn restoration after speech
-     * completion) and initiates the first turn.
-     */
     suspend fun startActiveConversation(
         actionId: ActionId = idGenerator.nextActionId("START_ACTIVE")
     ): VerifiedOutcome {
@@ -596,10 +627,6 @@ class ConversationCoordinator(
         )
     }
 
-    /**
-     * Resumes a paused conversation after verifying Stop precedence and releasing any stale resources
-     * before replacement capture.
-     */
     suspend fun resumeActiveConversation(
         actionId: ActionId = idGenerator.nextActionId("RESUME")
     ): VerifiedOutcome {
@@ -646,16 +673,6 @@ class ConversationCoordinator(
         return startVoiceTurn(actionId = actionId)
     }
 
-    /**
-     * Invoked when the visible conversation screen is reopened / foregrounded.
-     *
-     * Strictly enforces:
-     * 1. Only auto-resumes if first-use consent & configuration have already been completed
-     *    (`hasCompletedFirstUseConsentAndConfig == true` and `RECORD_AUDIO` is granted) and the user
-     *    preference `autoResumeOnScreenReopen` is enabled.
-     * 2. NEVER overrides deliberate Pause/Mute (`isDeliberatelyPaused` / `PAUSED`) or deliberate
-     *    Stop (`isDeliberatelyStopped` / `STOPPED`).
-     */
     suspend fun onConversationScreenVisible(
         actionId: ActionId = idGenerator.nextActionId("SCREEN_REOPEN")
     ): VerifiedOutcome? {
@@ -690,36 +707,11 @@ class ConversationCoordinator(
         val jobs = mutableListOf<Job>()
         activeTurn?.collectAllJobs()?.let { jobs.addAll(it) }
         activeTimeoutRecoveryJob?.let { jobs.add(it) }
+        activeNextTurnRecoveryJob?.let { jobs.add(it) }
+        postPlaybackGuardJob?.let { jobs.add(it) }
         return jobs
     }
 
-    private suspend fun cancelAndJoinPreviousTurnJobsOffMain(reason: String) {
-        val jobsToJoin: List<Job>
-        synchronized(this) {
-            cancelInactivityTimerLocked()
-            jobsToJoin = collectActiveTurnJobsLocked()
-            if (activeTurn == null) {
-                for (job in jobsToJoin) {
-                    job.cancel()
-                }
-            }
-        }
-        if (jobsToJoin.any { it.isActive }) {
-            withContext(backgroundDispatcher) {
-                for (job in jobsToJoin) {
-                    if (job.isActive) {
-                        job.cancel()
-                        job.join()
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Releases any prior microphone capture or audio playback hardware resources before starting
-     * replacement capture, incrementing [ConversationUiState.resourceReleaseBeforeCaptureCount].
-     */
     private fun releaseResourcesBeforeReplacementCaptureLocked(reason: String) {
         audioCapture.stopAndRelease(reason = reason, wipeEphemeral = true)
         playbackAdapter.stopAndFlush(reason = reason)
@@ -755,10 +747,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Closes the active conversation session when no speech activity occurs within the configured
-     * inactivity window (`inactivityTimeoutMs`), releasing audio hardware and the Live socket cleanly.
-     */
     @Synchronized
     fun onInactivityTimeoutExpired(
         sessionId: SessionId,
@@ -814,21 +802,6 @@ class ConversationCoordinator(
         return true
     }
 
-    /**
-     * Phase 04/05 Voice Coordinator entry point triggered when the main Start button is pressed.
-     *
-     * Automatically:
-     * 1. Ignores/debounces additional Start presses while a turn is already active in
-     *    `PREPARING`, `CONNECTING`, `LISTENING`, `THINKING`/`PROCESSING`, or `SPEAKING` so duplicate
-     *    turns cannot be created.
-     * 2. Verifies adapter availability (never shows `NOT_CONFIGURED` when adapters exist).
-     * 3. Verifies `RECORD_AUDIO` permission, microphone hardware, and validated internet.
-     * 4. Performs actual resource release before replacement capture.
-     * 5. Attaches the server-event/audio receiver collector before any connection or microphone frame.
-     * 6. Transitions through `PREPARING` (`CONNECTING` if not yet `SETUP_ACCEPTED`) and waits
-     *    asynchronously with bounded [connectionTimeoutMs] for `SETUP_ACCEPTED` before starting
-     *    `AudioRecord` and transitioning to `LISTENING`.
-     */
     suspend fun startVoiceTurn(
         actionId: ActionId = idGenerator.nextActionId("START"),
         enableActiveConversationOverride: Boolean? = null
@@ -838,8 +811,8 @@ class ConversationCoordinator(
         val turnId: TurnId
         val turnGen: TurnGenerationId
         val alreadySetupAccepted: Boolean
+        var resetGateCounters = false
 
-        // Join any lingering prior turn jobs off the main thread before replacement capture
         val preCheckJobs = synchronized(this) {
             val current = _uiState.value
             if (executedActionIds.contains(actionId.value)) {
@@ -857,6 +830,7 @@ class ConversationCoordinator(
             val isTurnCurrentlyActive =
                 (activeTurn?.let { !it.closed } == true) ||
                     (activeTimeoutRecoveryJob?.isActive == true) ||
+                    (activeNextTurnRecoveryJob?.isActive == true) ||
                     current.state == ConversationState.PREPARING ||
                     current.state == ConversationState.CONNECTING ||
                     current.state == ConversationState.LISTENING ||
@@ -911,11 +885,10 @@ class ConversationCoordinator(
                 return duplicateOutcome
             }
 
-            // Requirement 7: Ignore/debounce additional Start presses while PREPARING, CONNECTING,
-            // LISTENING, THINKING, PROCESSING, or SPEAKING so duplicate turns cannot be created.
             val isTurnCurrentlyActive =
                 (activeTurn?.let { !it.closed } == true) ||
                     (activeTimeoutRecoveryJob?.isActive == true) ||
+                    (activeNextTurnRecoveryJob?.isActive == true) ||
                     current.state == ConversationState.PREPARING ||
                     current.state == ConversationState.CONNECTING ||
                     current.state == ConversationState.LISTENING ||
@@ -947,6 +920,11 @@ class ConversationCoordinator(
             recordActionId(actionId)
             turnId = idGenerator.nextTurnId()
             sessionId = current.sessionId
+            resetGateCounters =
+                current.state == ConversationState.IDLE ||
+                    current.state == ConversationState.STOPPED ||
+                    current.state == ConversationState.PAUSED ||
+                    current.state == ConversationState.ERROR
 
             if (enableActiveConversationOverride != null) {
                 preferencesStore.isActiveConversationEnabled = enableActiveConversationOverride
@@ -954,7 +932,6 @@ class ConversationCoordinator(
             val effectiveActiveConv =
                 enableActiveConversationOverride ?: _uiState.value.isActiveConversationEnabled
 
-            // Cleanly cancel any previous turn jobs and perform actual resource release before replacement capture
             cancelInactivityTimerLocked()
             cancelActiveTurnStreamsLocked("Initializing voice turn (${turnId.value})")
             releaseResourcesBeforeReplacementCaptureLocked("Actual resource release before starting turn ${turnId.value}")
@@ -1013,13 +990,11 @@ class ConversationCoordinator(
                 }
 
                 is PrerequisiteCheck.Passed -> {
-                    // First-use consent and configuration verified! Clear deliberate pause/stop flags.
                     isDeliberatelyPaused = false
                     isDeliberatelyStopped = false
                     consecutiveFirstResponseTimeouts = 0
                     preferencesStore.hasCompletedFirstUseConsentAndConfig = true
 
-                    // Ensure server-event/audio collector is attached BEFORE connecting or sending audio
                     liveAdapter.onStateChanged = { onLiveAdapterStateUpdated() }
                     liveAdapter.onServerEventListener = { event -> onServerSocketEvent(event) }
 
@@ -1111,8 +1086,6 @@ class ConversationCoordinator(
             }
         }
 
-        // Wait asynchronously (with bounded timeout) on backgroundDispatcher for SETUP_ACCEPTED
-        // before starting AudioRecord or displaying LISTENING, reusing a healthy established session across turns.
         val finalLiveState: LiveConnectionState? = if (alreadySetupAccepted) {
             liveAdapter.state.value
         } else {
@@ -1126,7 +1099,6 @@ class ConversationCoordinator(
 
         return synchronized(this) {
             val turn = activeTurn
-            // Check if STOP, PAUSE, or RESET_IDLE preempted this turn while connecting
             if (turn == null || turn.closed || turn.turnSeq != turnSeq || turn.turnGen != turnGen) {
                 val now = _uiState.value
                 return@synchronized now.lastOutcome ?: VerifiedOutcome.StateTransitionVerified(
@@ -1207,12 +1179,10 @@ class ConversationCoordinator(
                 return@synchronized failOutcome
             }
 
-            // Record SETUP_ACCEPTED before AudioRecord start and before LISTENING state
             appendTurnEventLocked("SETUP_ACCEPTED")
             appendFirstTurnLifecycleLocked("SETUP_ACCEPTED")
             appendReadinessOrderLocked("SETUP_ACCEPTED")
 
-            // Allocate streaming playback generation for this turn
             val playbackGen = playbackAdapter.startTurnPlayback(
                 turnId = turnId,
                 sessionId = sessionId
@@ -1220,10 +1190,7 @@ class ConversationCoordinator(
             turn.playbackGen = playbackGen
             liveAdapter.setAudioPlaybackClaimed(true)
 
-            // Transition state to LISTENING and record AUDIO_RECORD_START inside the synchronized lock
-            // right before starting AudioRecord so even an immediate first microphone buffer is accepted.
             appendFirstTurnLifecycleLocked("AUDIO_RECORD_START")
-            appendTurnEventLocked("USER_ACTIVITY_START")
             val liveGenWire = finalLiveState.activeGeneration?.wireId ?: liveAdapter.state.value.activeGeneration?.wireId
             turn.recordStep(
                 step = TurnTraceStep.LISTENING_STARTED,
@@ -1246,7 +1213,9 @@ class ConversationCoordinator(
                 )
             }
 
-            // Start 16kHz PCM microphone capture bound to LIVE_VOICE_TURN owner AFTER SETUP_ACCEPTED
+            speechGate.beginWaitingForSpeech(resetSessionCounters = resetGateCounters)
+            syncSpeechGateTelemetryLocked()
+
             val captureGen = audioCapture.startCapture(
                 owner = AudioOwner.LIVE_VOICE_TURN,
                 sessionId = sessionId
@@ -1259,8 +1228,24 @@ class ConversationCoordinator(
                 )
             }
 
+            wakeWordState = WakeWordState.COMMAND_LISTENING
+            activeWakeAuthorization = WakeAuthorization(
+                generationId = captureGen,
+                expiresAtMs = monotonicClockMs() + 24L * 3600L * 1000L,
+                keyword = "FOREGROUND_ACTIVE"
+            )
+            _uiState.update { state ->
+                state.copy(
+                    wakeWordState = WakeWordState.COMMAND_LISTENING,
+                    wakeWordStatusLabel = "LISTENING (NATURAL SPEECH ACTIVE)",
+                    wakeAuthorizationActive = true
+                )
+            }
+
             val audioSnap = audioCapture.state.value
             if (!audioSnap.isCapturing) {
+                speechGate.cancelAndResetToIdle(resetSessionCounters = false)
+                syncSpeechGateTelemetryLocked()
                 turn.playbackGen = null
                 turn.dispose(cancelAllJobs = true)
                 activeTurn = null
@@ -1302,7 +1287,7 @@ class ConversationCoordinator(
             armInactivityTimerLocked(sessionId, turn.turnGen)
 
             val listeningDetail =
-                "LISTENING (${captureGen.wireId} -> ${liveGenWire ?: "live"}): Speak clearly. Pause when finished or tap 'Send Spoken Question'."
+                "LISTENING (${captureGen.wireId} -> ${liveGenWire ?: "live"}): Waiting silently for speech. Speak clearly when ready or tap 'Send Spoken Question'."
             val listeningOutcome = VerifiedOutcome.StateTransitionVerified(
                 actionId = idGenerator.nextActionId("listening"),
                 sessionId = sessionId,
@@ -1330,11 +1315,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Automatically restores microphone capture (`PREPARING -> LISTENING`) after actual speech
-     * completion (`SPEAKING` hardware drain verified) or bounded single timeout recovery while the
-     * active conversation is enabled, after first releasing the previous turn's capture and playback resources.
-     */
     private fun autoRestoreCaptureForNextTurnLocked(
         previousTurnId: TurnId,
         completedTurn: TurnRuntimeState? = null,
@@ -1367,7 +1347,6 @@ class ConversationCoordinator(
             )
         }
 
-        // Actual resource release before replacement capture
         releaseResourcesBeforeReplacementCaptureLocked(
             "Actual resource release before auto-restoring capture after ${previousTurnId.value} -> ${nextTurnId.value}"
         )
@@ -1414,7 +1393,7 @@ class ConversationCoordinator(
                 activeTurnGenerationId = turnGen,
                 voiceTurnStateSequence = updatedTurnSeq,
                 voiceTurnReadinessOrder = updatedReadiness,
-                turnEventTrace = listOf("AUTO_RESTORE_PREPARING", "SETUP_ACCEPTED", "USER_ACTIVITY_START"),
+                turnEventTrace = listOf("AUTO_RESTORE_PREPARING", "SETUP_ACCEPTED"),
                 lastCompletedTurnTrace = completedTurn?.structuredTraceEntries?.toList() ?: state.lastCompletedTurnTrace,
                 lastCompletedTurnEarliestMissingStep = completedTurn?.earliestMissingStep() ?: state.lastCompletedTurnEarliestMissingStep,
                 structuredTurnTrace = nextTurn.structuredTraceEntries.toList(),
@@ -1429,6 +1408,13 @@ class ConversationCoordinator(
                 currentTurnModelTranscript = ""
             )
         }
+
+        if (allowRestoreAfterTimeoutRecovery) {
+            speechGate.beginWaitingForSpeech(resetSessionCounters = false)
+        } else {
+            speechGate.beginPostPlaybackEchoGuard()
+        }
+        syncSpeechGateTelemetryLocked()
 
         val captureGen = audioCapture.startCapture(
             owner = AudioOwner.LIVE_VOICE_TURN,
@@ -1454,18 +1440,42 @@ class ConversationCoordinator(
             )!!
         }
 
+        if (!allowRestoreAfterTimeoutRecovery && postPlaybackEchoGuardMs > 0L) {
+            cancelPostPlaybackGuardJobLocked()
+            postPlaybackGuardJob = turnScope.launch(nextTurn.parentJob) {
+                postPlaybackGuardDelayRunner(postPlaybackEchoGuardMs)
+                synchronized(this@ConversationCoordinator) {
+                    if (activeTurn === nextTurn &&
+                        !nextTurn.closed &&
+                        nextTurn.turnSeq == turnSeq &&
+                        !isDeliberatelyPaused &&
+                        !isDeliberatelyStopped &&
+                        _uiState.value.state == ConversationState.LISTENING
+                    ) {
+                        if (speechGate.refreshGuardIfExpired()) {
+                            syncSpeechGateTelemetryLocked()
+                        }
+                    }
+                }
+            }
+        }
+
         armInactivityTimerLocked(sessionId, turnGen)
 
         val detail = if (allowRestoreAfterTimeoutRecovery) {
             "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation automatically restored after clean recovery from FIRST_RESPONSE_TIMEOUT."
         } else {
-            "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation capture automatically restored after speech completion."
+            "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation restored (post-playback echo guard -> silent waiting)."
         }
         val outcome = VerifiedOutcome.StateTransitionVerified(
             actionId = idGenerator.nextActionId("auto_restore_listening"),
             sessionId = sessionId,
             turnId = nextTurnId,
-            previousState = if (allowRestoreAfterTimeoutRecovery) ConversationState.PREPARING else ConversationState.READY,
+            previousState = if (allowRestoreAfterTimeoutRecovery || current.state == ConversationState.PREPARING) {
+                ConversationState.PREPARING
+            } else {
+                ConversationState.READY
+            },
             resultingState = ConversationState.LISTENING,
             detail = detail
         )
@@ -1487,17 +1497,6 @@ class ConversationCoordinator(
         return outcome
     }
 
-    /**
-     * Streams captured 16kHz PCM microphone frames to the active Gemini Live session and monitors
-     * speech + trailing silence for automatic end-of-turn signaling.
-     *
-     * Strictly enforces:
-     * - Microphone frames are only captured and queued while the turn is in [ConversationState.LISTENING]
-     *   and [AudioCapture] is actively capturing for [captureGenId].
-     * - Half-duplex policy: No microphone frames are ever captured or sent during `THINKING`/`PROCESSING`
-     *   or `SPEAKING`.
-     * - Resets the inactivity session closure timer whenever non-silent speech is captured.
-     */
     private fun onVoiceTurnMicSamplesCaptured(
         turnSeq: Long,
         captureGenId: CaptureGenerationId,
@@ -1505,18 +1504,18 @@ class ConversationCoordinator(
         rmsLinear: Float
     ) {
         if (samples16kHz.isEmpty()) return
-        val pcmBytes = shortArrayToLittleEndianBytes(samples16kHz)
-        var shouldTriggerAutoEnd = false
-        var speechChunksForLog = 0
+        val samplesCopy = samples16kHz.copyOf()
+        val pcmBytes = shortArrayToLittleEndianBytes(samplesCopy)
+        val capturedAtMs = monotonicClockMs()
 
-        val turn: TurnRuntimeState
-        val turnGen: TurnGenerationId
         synchronized(this) {
-            val currentTurn = activeTurn ?: return
-            if (currentTurn.closed ||
-                currentTurn.turnSeq != turnSeq ||
-                currentTurn.endOfTurnRequested ||
-                currentTurn.endOfTurnSubmitted ||
+            val turn = activeTurn ?: return
+            if (turn.closed ||
+                turn.turnSeq != turnSeq ||
+                turn.endOfTurnRequested ||
+                turn.endOfTurnSubmitted ||
+                isDeliberatelyPaused ||
+                isDeliberatelyStopped ||
                 _uiState.value.state != ConversationState.LISTENING
             ) {
                 return
@@ -1525,99 +1524,224 @@ class ConversationCoordinator(
             if (currentCaptureGen == null || currentCaptureGen != captureGenId || !audioCapture.state.value.isCapturing) {
                 return
             }
-            turn = currentTurn
-            turnGen = currentTurn.turnGen
+            val turnGen = turn.turnGen
+            val previousSendJob = turn.micSendJobs.lastOrNull()
 
-            val liveGenWire = liveAdapter.state.value.activeGeneration?.wireId
-            turn.capturedFramesCount += samples16kHz.size.toLong()
-            turn.capturedBytesCount += pcmBytes.size.toLong()
-            turn.peakRmsLinear = max(turn.peakRmsLinear, rmsLinear)
-            val isNonSilentFrame = rmsLinear >= 0.008f
-            if (isNonSilentFrame) {
-                turn.nonSilentSpeechFramesCount += samples16kHz.size.toLong()
-            }
+            // Natural speech conversation active without requiring wake word.
 
-            if (!turn.hasStep(TurnTraceStep.FIRST_MIC_FRAME)) {
-                turn.recordStep(
-                    step = TurnTraceStep.FIRST_MIC_FRAME,
-                    timestampLabel = clockProvider(),
-                    liveGenWireId = liveGenWire,
-                    detail = "samples=${samples16kHz.size}, rms=${"%.3f".format(rmsLinear)}"
-                )
-            }
-            turn.recordStep(
-                step = TurnTraceStep.LAST_MIC_FRAME,
-                timestampLabel = clockProvider(),
-                liveGenWireId = liveGenWire,
-                detail = "capturedFrames=${turn.capturedFramesCount}, rms=${"%.3f".format(rmsLinear)}"
-            )
-            if (isNonSilentFrame && !turn.hasStep(TurnTraceStep.USER_SPEECH_DETECTED)) {
-                turn.recordStep(
-                    step = TurnTraceStep.USER_SPEECH_DETECTED,
-                    timestampLabel = clockProvider(),
-                    liveGenWireId = liveGenWire,
-                    detail = "rms=${"%.3f".format(rmsLinear)}"
-                )
-            }
-
-            val snap = audioCapture.state.value
-            val newPeakRms = max(_uiState.value.voiceTurnPeakRmsLinear, rmsLinear)
-            _uiState.update { state ->
-                state.copy(
-                    isMicrophoneActive = snap.isCapturing,
-                    microphoneStatusLabel = formatMicLabel(snap),
-                    audioCaptureState = snap,
-                    voiceTurnPeakRmsLinear = newPeakRms,
-                    structuredTurnTrace = turn.structuredTraceEntries.toList(),
-                    activeTurnEarliestMissingStep = turn.earliestMissingStep()
-                )
-            }
-
-            if (rmsLinear >= speechRmsThreshold) {
-                turn.speechChunks += 1
-                turn.trailingSilenceChunks = 0
-                // Reset inactivity timer on active speech
-                armInactivityTimerLocked(turn.sessionId, turnGen)
-            } else if (turn.speechChunks >= minSpeechChunksForAutoEnd) {
-                turn.trailingSilenceChunks += 1
-                if (turn.trailingSilenceChunks >= silenceChunksForAutoEnd && !turn.autoEndTriggered) {
-                    turn.autoEndTriggered = true
-                    shouldTriggerAutoEnd = true
-                    speechChunksForLog = turn.speechChunks
-                }
-            }
-
+            // Enqueue neural VAD inference + ordered Live send off the Main and AudioRecord capture loops,
+            // preserving strict chronological sample order via previousSendJob?.join().
             val sendJob = turnScope.launch(turn.parentJob) {
+                previousSendJob?.join()
+
+                val stillCapturingOrFlushing = synchronized(this@ConversationCoordinator) {
+                    activeTurn === turn &&
+                        !turn.closed &&
+                        turn.turnSeq == turnSeq &&
+                        !turn.endOfTurnSubmitted &&
+                        !isDeliberatelyPaused &&
+                        !isDeliberatelyStopped &&
+                        _uiState.value.state == ConversationState.LISTENING
+                }
+                if (!stillCapturingOrFlushing) {
+                    return@launch
+                }
+
+                val decision = speechGate.onFrameCaptured(
+                    samples16kHz = samplesCopy,
+                    pcmBytes = pcmBytes,
+                    rmsLinear = rmsLinear,
+                    capturedAtMs = capturedAtMs
+                )
+
+                var shouldTriggerAutoEnd = false
+                var trailingSilenceMsForLog = 0L
+                val liveGenWire: String?
+
+                synchronized(this@ConversationCoordinator) {
+                    if (activeTurn !== turn ||
+                        turn.closed ||
+                        turn.turnSeq != turnSeq ||
+                        turn.endOfTurnSubmitted ||
+                        isDeliberatelyPaused ||
+                        isDeliberatelyStopped ||
+                        _uiState.value.state != ConversationState.LISTENING
+                    ) {
+                        return@launch
+                    }
+
+                    syncSpeechGateTelemetryLocked()
+
+                    if (decision is SpeechGateDecision.DetectorUnavailable) {
+                        failActiveVoiceTurnLocked(
+                            failureCode = "VAD_MODEL_LOAD_FAILED",
+                            detail = "Silero VAD neural detector unavailable (${decision.reason}). Refusing RMS-only fallback.",
+                            expectedSessionId = turnGen.sessionId,
+                            expectedTurnSeq = turnSeq,
+                            expectedTurnGen = turnGen
+                        )
+                        return@launch
+                    }
+
+                    if (decision is SpeechGateDecision.IgnoredDuringGuard) {
+                        return@launch
+                    }
+
+                    liveGenWire = liveAdapter.state.value.activeGeneration?.wireId
+                    turn.capturedFramesCount += samplesCopy.size.toLong()
+                    turn.capturedBytesCount += pcmBytes.size.toLong()
+                    turn.peakRmsLinear = max(turn.peakRmsLinear, rmsLinear)
+
+                    val isSpeechObservedByVad =
+                        decision is SpeechGateDecision.SpeechConfirmedStart ||
+                            decision is SpeechGateDecision.StreamActiveFrame ||
+                            speechGate.hasObservedWaitingSpeechCandidate()
+                    if (isSpeechObservedByVad) {
+                        turn.nonSilentSpeechFramesCount += samplesCopy.size.toLong()
+                    }
+
+                    if (!turn.hasStep(TurnTraceStep.FIRST_MIC_FRAME)) {
+                        turn.recordStep(
+                            step = TurnTraceStep.FIRST_MIC_FRAME,
+                            timestampLabel = clockProvider(),
+                            liveGenWireId = liveGenWire,
+                            detail = "samples=${samplesCopy.size}, rms=${"%.3f".format(rmsLinear)}"
+                        )
+                    }
+                    turn.recordStep(
+                        step = TurnTraceStep.LAST_MIC_FRAME,
+                        timestampLabel = clockProvider(),
+                        liveGenWireId = liveGenWire,
+                        detail = "capturedFrames=${turn.capturedFramesCount}, rms=${"%.3f".format(rmsLinear)}"
+                    )
+
+                    if (decision is SpeechGateDecision.WaitingSilent) {
+                        val snap = audioCapture.state.value
+                        val newPeakRms = max(_uiState.value.voiceTurnPeakRmsLinear, rmsLinear)
+                        _uiState.update { state ->
+                            state.copy(
+                                isMicrophoneActive = snap.isCapturing,
+                                microphoneStatusLabel = formatMicLabel(snap),
+                                audioCaptureState = snap,
+                                voiceTurnPeakRmsLinear = newPeakRms,
+                                structuredTurnTrace = turn.structuredTraceEntries.toList(),
+                                activeTurnEarliestMissingStep = turn.earliestMissingStep()
+                            )
+                        }
+                        return@launch
+                    }
+
+                    if (decision is SpeechGateDecision.SpeechConfirmedStart) {
+                        if (!turn.hasStep(TurnTraceStep.USER_SPEECH_DETECTED)) {
+                            val gateSnap = speechGate.telemetrySnapshot()
+                            turn.recordStep(
+                                step = TurnTraceStep.USER_SPEECH_DETECTED,
+                                timestampLabel = clockProvider(),
+                                liveGenWireId = liveGenWire,
+                                detail = "vad=${gateSnap.detectorName}(p=${"%.2f".format(gateSnap.lastSpeechProbability)}), preRollBytes=${decision.preRollTotalBytes}"
+                            )
+                        }
+                        armInactivityTimerLocked(turn.sessionId, turnGen)
+                    } else if (decision is SpeechGateDecision.StreamActiveFrame && decision.trailingSilenceDurationMs == 0L) {
+                        armInactivityTimerLocked(turn.sessionId, turnGen)
+                    }
+
+                    val snap = audioCapture.state.value
+                    val newPeakRms = max(_uiState.value.voiceTurnPeakRmsLinear, rmsLinear)
+                    _uiState.update { state ->
+                        state.copy(
+                            isMicrophoneActive = snap.isCapturing,
+                            microphoneStatusLabel = formatMicLabel(snap),
+                            audioCaptureState = snap,
+                            voiceTurnPeakRmsLinear = newPeakRms,
+                            structuredTurnTrace = turn.structuredTraceEntries.toList(),
+                            activeTurnEarliestMissingStep = turn.earliestMissingStep()
+                        )
+                    }
+
+                    shouldTriggerAutoEnd =
+                        decision is SpeechGateDecision.StreamActiveFrame &&
+                            decision.shouldEndSpeechTurn &&
+                            !turn.autoEndTriggered
+                    if (shouldTriggerAutoEnd) {
+                        turn.autoEndTriggered = true
+                    }
+                    trailingSilenceMsForLog =
+                        (decision as? SpeechGateDecision.StreamActiveFrame)?.trailingSilenceDurationMs ?: 0L
+                }
+
                 var startFailed = false
-                var sent = false
+                var allSent = true
+                var sentFramesNow = 0L
+                var sentChunksNow = 0L
+                var sentBytesNow = 0L
+
                 micSendMutex.withLock {
                     val allowedToFlush = synchronized(this@ConversationCoordinator) {
                         activeTurn === turn &&
                             !turn.closed &&
                             turn.turnSeq == turnSeq &&
                             !turn.endOfTurnSubmitted &&
+                            !isDeliberatelyPaused &&
+                            !isDeliberatelyStopped &&
                             (_uiState.value.state == ConversationState.LISTENING)
                     }
                     if (!allowedToFlush) {
                         return@launch
                     }
-                    if (!turn.activityStartAttempted) {
-                        turn.activityStartAttempted = true
-                        val startOk = liveAdapter.signalStartOfSpokenTurn()
-                        turn.activityStartSent = startOk
-                        if (!startOk) {
-                            turn.activityStartFailed = true
-                            startFailed = true
+
+                    when (decision) {
+                        is SpeechGateDecision.SpeechConfirmedStart -> {
+                            if (!turn.activityStartAttempted) {
+                                turn.activityStartAttempted = true
+                                val startOk = liveAdapter.signalStartOfSpokenTurn()
+                                turn.activityStartSent = startOk
+                                if (!startOk) {
+                                    turn.activityStartFailed = true
+                                    startFailed = true
+                                }
+                            }
+                            if (!startFailed) {
+                                for (chunk in decision.preRollPcmChunks) {
+                                    val chunkOk = liveAdapter.sendRealtimeAudioToActiveSession(
+                                        pcm16kHzBytes = chunk,
+                                        mimeType = "audio/pcm;rate=16000"
+                                    )
+                                    if (!chunkOk) {
+                                        allSent = false
+                                        break
+                                    }
+                                    sentFramesNow += (chunk.size / 2).toLong()
+                                    sentChunksNow += 1L
+                                    sentBytesNow += chunk.size.toLong()
+                                }
+                            }
                         }
-                    }
-                    if (!startFailed) {
-                        sent = liveAdapter.sendRealtimeAudioToActiveSession(
-                            pcm16kHzBytes = pcmBytes,
-                            mimeType = "audio/pcm;rate=16000"
-                        )
+
+                        is SpeechGateDecision.StreamActiveFrame -> {
+                            if (!turn.activityStartSent) {
+                                startFailed = true
+                                allSent = false
+                            } else {
+                                val chunkOk = liveAdapter.sendRealtimeAudioToActiveSession(
+                                    pcm16kHzBytes = decision.pcmBytes,
+                                    mimeType = "audio/pcm;rate=16000"
+                                )
+                                if (!chunkOk) {
+                                    allSent = false
+                                } else {
+                                    sentFramesNow += (decision.pcmBytes.size / 2).toLong()
+                                    sentChunksNow += 1L
+                                    sentBytesNow += decision.pcmBytes.size.toLong()
+                                }
+                            }
+                        }
+
+                        else -> Unit
                     }
                 }
-                if (startFailed || !sent) {
+
+                if (startFailed || !allSent) {
                     synchronized(this@ConversationCoordinator) {
                         if (activeTurn === turn &&
                             !turn.closed &&
@@ -1649,12 +1773,14 @@ class ConversationCoordinator(
                     return@launch
                 }
 
-                // Increment confirmed-sent metrics ONLY after transport confirms the chunk was sent!
                 synchronized(this@ConversationCoordinator) {
                     if (activeTurn === turn && !turn.closed && turn.turnSeq == turnSeq) {
-                        turn.confirmedSentFramesCount += samples16kHz.size.toLong()
-                        turn.confirmedSentChunksCount += 1L
-                        turn.confirmedSentBytesCount += pcmBytes.size.toLong()
+                        turn.confirmedSentFramesCount += sentFramesNow
+                        turn.confirmedSentChunksCount += sentChunksNow
+                        turn.confirmedSentBytesCount += sentBytesNow
+                        if (!_uiState.value.turnEventTrace.contains("USER_ACTIVITY_START")) {
+                            appendTurnEventLocked("USER_ACTIVITY_START")
+                        }
                         appendTurnEventLocked("MIC_FRAMES_STREAMED")
                         appendFirstTurnLifecycleLocked("AUDIO_SENT")
                         _uiState.update { state ->
@@ -1671,7 +1797,8 @@ class ConversationCoordinator(
 
                 if (shouldTriggerAutoEnd) {
                     finishSpokenTurnAndAwaitResponse(
-                        reason = "Automatic end-of-turn silence detected after $speechChunksForLog speech chunks"
+                        reason = "Automatic end-of-turn monotonic trailing silence detected (${trailingSilenceMsForLog}ms)",
+                        fromAutoEndJob = kotlin.coroutines.coroutineContext[Job]
                     )
                 }
             }
@@ -1680,15 +1807,10 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Completes the spoken question capture (`LISTENING -> THINKING / PROCESSING`), verifies that non-silent
-     * speech was captured, flushes queued microphone buffers, verifies confirmed sent audio frames,
-     * sends exactly ONE documented Gemini Live end-of-turn (`activityEnd`) signal, and ONLY THEN enters
-     * `PROCESSING` (`THINKING`) and arms the cancellable first-response watchdog.
-     */
     suspend fun finishSpokenTurnAndAwaitResponse(
         reason: String = "Operator signaled end of spoken question",
-        requireCapturedSpeech: Boolean = true
+        requireCapturedSpeech: Boolean = true,
+        fromAutoEndJob: Job? = null
     ): VerifiedOutcome {
         val turn: TurnRuntimeState
         val turnSeq: Long
@@ -1719,16 +1841,36 @@ class ConversationCoordinator(
             turnId = turn.turnId
             completionDeferred = turn.completionDeferred
 
+            if (!ensureWakeAuthorizationValid(currentTurn)) {
+                stopTurnMicrophoneLocked("Wake authorization required", true, currentTurn)
+                return failActiveVoiceTurnLocked(
+                    failureCode = "WAKE_WORD_REQUIRED",
+                    detail = "Manual submit rejected: Wake word 'Jarvis' not detected. Say 'Jarvis' first to activate OmniVoice."
+                )!!
+            }
+
             if (current.state == ConversationState.LISTENING) {
                 if (turn.endOfTurnRequested || turn.endOfTurnSubmissionInFlight || turn.endOfTurnSubmitted) {
-                    // Duplicate end-of-turn trigger on the same turn: never send a second activityEnd!
                     needsEndOfTurnSignal = false
                     micJobsToFlush = emptyList()
                 } else {
                     cancelInactivityTimerLocked()
 
-                    // Gate 1: Real audio must have been captured
-                    if (turn.capturedFramesCount <= 0L) {
+                    val currentJob = kotlin.coroutines.coroutineContext[Job]
+                    if (fromAutoEndJob != null) {
+                        val triggerIdx = turn.micSendJobs.indexOfFirst { it === fromAutoEndJob }
+                        if (triggerIdx >= 0 && triggerIdx + 1 < turn.micSendJobs.size) {
+                            val tailJobs = turn.micSendJobs.subList(triggerIdx + 1, turn.micSendJobs.size).toList()
+                            for (tailJob in tailJobs) {
+                                tailJob.cancel()
+                            }
+                            turn.micSendJobs.removeAll(tailJobs.toSet())
+                        }
+                        micJobsToFlush = emptyList()
+                    } else {
+                        micJobsToFlush = turn.micSendJobs.filter { it.isActive && it !== currentJob }
+                    }
+                    if (turn.capturedFramesCount <= 0L && micJobsToFlush.isEmpty()) {
                         turn.endOfTurnRequested = true
                         stopTurnMicrophoneLocked(
                             reason = "No microphone audio captured ($reason)",
@@ -1744,31 +1886,7 @@ class ConversationCoordinator(
                         )!!
                     }
 
-                    // Gate 2: Captured audio must contain real non-silent speech
-                    val hasRealSpeech =
-                        turn.nonSilentSpeechFramesCount > 0L && turn.peakRmsLinear >= 0.008f
-                    if (!hasRealSpeech && (requireCapturedSpeech || turn.capturedFramesCount > 0L)) {
-                        turn.endOfTurnRequested = true
-                        stopTurnMicrophoneLocked(
-                            reason = "Silent turn rejected ($reason)",
-                            cancelQueuedMicSends = true,
-                            turnForTrace = turn
-                        )
-                        appendTurnEventLocked("SILENT_TURN_REJECTED")
-                        return failActiveVoiceTurnLocked(
-                            failureCode = "SILENT_AUDIO_CAPTURED",
-                            detail = "Captured microphone audio had no speech signal (capturedFrames=${turn.capturedFramesCount}, peak RMS=${"%.3f".format(turn.peakRmsLinear)}). Refusing to enter PROCESSING.",
-                            expectedSessionId = sessionId,
-                            expectedTurnSeq = turnSeq,
-                            expectedTurnGen = turnGen
-                        )!!
-                    }
-
-                    // Half-duplex: Stop hardware capture now, flush remaining mic send jobs BEFORE
-                    // checking confirmed sent frames, submitting activityEnd, and entering PROCESSING.
                     turn.endOfTurnRequested = true
-                    val currentJob = kotlin.coroutines.coroutineContext[Job]
-                    micJobsToFlush = turn.micSendJobs.filter { it.isActive && it !== currentJob }
                     stopTurnMicrophoneLocked(
                         reason = "Spoken question complete ($reason)",
                         cancelQueuedMicSends = false,
@@ -1784,117 +1902,258 @@ class ConversationCoordinator(
 
         if (needsEndOfTurnSignal) {
             withContext(backgroundDispatcher) {
-                for (job in micJobsToFlush) {
-                    job.join()
-                }
-            }
-
-            val readyToSendEndOfTurn = synchronized(this) {
-                if (activeTurn !== turn ||
-                    turn.closed ||
-                    turn.turnSeq != turnSeq ||
-                    turn.turnGen != turnGen ||
-                    isDeliberatelyPaused ||
-                    isDeliberatelyStopped
-                ) {
-                    return@synchronized false
-                }
-                if (turn.endOfTurnSubmitted) {
-                    return@synchronized false
-                }
-                // Gate 3: Audio frames must be confirmed sent before submitting end-of-turn / entering PROCESSING
-                if (turn.confirmedSentFramesCount <= 0L) {
-                    val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                        "NETWORK_UNAVAILABLE"
-                    } else {
-                        "NO_AUDIO_FRAMES_SENT"
-                    }
-                    failActiveVoiceTurnLocked(
-                        failureCode = failCode,
-                        detail = "Captured audio was not confirmed sent to Gemini Live (confirmedSentFrames=0, capturedFrames=${turn.capturedFramesCount}). Refusing to enter PROCESSING.",
-                        expectedSessionId = sessionId,
-                        expectedTurnSeq = turnSeq,
-                        expectedTurnGen = turnGen
-                    )
-                    return@synchronized false
-                }
-                if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                    failActiveVoiceTurnLocked(
-                        failureCode = "NETWORK_UNAVAILABLE",
-                        detail = "NETWORK_UNAVAILABLE: Validated internet lost before end-of-turn could be submitted.",
-                        expectedSessionId = sessionId,
-                        expectedTurnSeq = turnSeq,
-                        expectedTurnGen = turnGen
-                    )
-                    return@synchronized false
-                }
-                turn.endOfTurnSubmissionInFlight = true
-                true
-            }
-
-            if (!readyToSendEndOfTurn) {
-                return turn.completionDeferred.await()
-            }
-
-            val signaled = withContext(backgroundDispatcher) {
-                micSendMutex.withLock {
-                    val stillEligible = synchronized(this@ConversationCoordinator) {
-                        activeTurn === turn &&
-                            !turn.closed &&
-                            turn.turnSeq == turnSeq &&
-                            !turn.endOfTurnSubmitted &&
-                            !isDeliberatelyPaused &&
-                            !isDeliberatelyStopped
-                    }
-                    if (!stillEligible) {
-                        false
-                    } else {
-                        liveAdapter.signalEndOfSpokenTurn()
-                    }
-                }
-            }
-
-            synchronized(this) {
-                turn.endOfTurnSubmissionInFlight = false
-                if (activeTurn !== turn || turn.closed || turn.turnSeq != turnSeq || turn.turnGen != turnGen) {
-                    // Turn already completed synchronously inside signalEndOfSpokenTurn (e.g. test driver) or failed
-                    return@synchronized
-                }
-                if (!signaled) {
-                    turn.endOfTurnFailed = true
-                    val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                        "NETWORK_UNAVAILABLE"
-                    } else {
-                        "END_OF_TURN_SEND_FAILED"
-                    }
-                    failActiveVoiceTurnLocked(
-                        failureCode = failCode,
-                        detail = "Failed to send end-of-turn signal to Gemini Live ($failCode). Refusing to remain in PROCESSING.",
-                        expectedSessionId = sessionId,
-                        expectedTurnSeq = turnSeq,
-                        expectedTurnGen = turnGen
-                    )
-                    return@synchronized
-                }
-
-                // Gate 4 passed: End-of-turn succeeded -> NOW promote to PROCESSING & arm watchdog!
-                turn.endOfTurnSubmitted = true
-                promoteToProcessingLocked(
+                flushPreRollAndSubmitEndOfTurn(
                     turn = turn,
+                    turnSeq = turnSeq,
+                    turnGen = turnGen,
                     sessionId = sessionId,
                     turnId = turnId,
-                    turnGen = turnGen
+                    reason = reason,
+                    requireCapturedSpeech = requireCapturedSpeech,
+                    micJobsToFlush = micJobsToFlush
                 )
-                if (!turn.serverResponseStarted &&
-                    _uiState.value.state == ConversationState.PROCESSING &&
-                    !turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE)
-                ) {
-                    armFirstResponseWatchdogLocked(turn)
-                }
             }
         }
 
         return completionDeferred.await()
+    }
+
+    private suspend fun flushPreRollAndSubmitEndOfTurn(
+        turn: TurnRuntimeState,
+        turnSeq: Long,
+        turnGen: TurnGenerationId,
+        sessionId: SessionId,
+        turnId: TurnId,
+        reason: String,
+        requireCapturedSpeech: Boolean,
+        micJobsToFlush: List<Job>
+    ) {
+        for (job in micJobsToFlush) {
+            job.join()
+        }
+
+        val manualPreRollChunks: List<ByteArray>? = synchronized(this) {
+            if (activeTurn !== turn ||
+                turn.closed ||
+                turn.turnSeq != turnSeq ||
+                turn.turnGen != turnGen ||
+                turn.endOfTurnSubmitted ||
+                isDeliberatelyPaused ||
+                isDeliberatelyStopped ||
+                _uiState.value.state != ConversationState.LISTENING
+            ) {
+                return@synchronized null
+            }
+            if (turn.capturedFramesCount <= 0L) {
+                failActiveVoiceTurnLocked(
+                    failureCode = "NO_AUDIO_CAPTURED",
+                    detail = "No microphone audio frames were captured for ${turnId.value}. Refusing to enter PROCESSING. Speak clearly and try again.",
+                    expectedSessionId = sessionId,
+                    expectedTurnSeq = turnSeq,
+                    expectedTurnGen = turnGen
+                )
+                return@synchronized null
+            }
+            val hasRealSpeech =
+                turn.nonSilentSpeechFramesCount > 0L && (speechDetector.requiresLoadedModel || turn.peakRmsLinear >= 0.008f)
+            if (!hasRealSpeech && (requireCapturedSpeech || turn.capturedFramesCount > 0L)) {
+                appendTurnEventLocked("SILENT_TURN_REJECTED")
+                failActiveVoiceTurnLocked(
+                    failureCode = "SILENT_AUDIO_CAPTURED",
+                    detail = "Captured microphone audio had no speech signal (capturedFrames=${turn.capturedFramesCount}, peak RMS=${"%.3f".format(turn.peakRmsLinear)}). Refusing to enter PROCESSING.",
+                    expectedSessionId = sessionId,
+                    expectedTurnSeq = turnSeq,
+                    expectedTurnGen = turnGen
+                )
+                return@synchronized null
+            }
+            val chunks =
+                if (speechGate.telemetrySnapshot().gateState == SpeechGateState.WAITING_FOR_SPEECH) {
+                    speechGate.consumePreRollForManualSubmit()
+                } else {
+                    emptyList()
+                }
+            if (chunks.isNotEmpty() && !turn.hasStep(TurnTraceStep.USER_SPEECH_DETECTED)) {
+                turn.recordStep(
+                    step = TurnTraceStep.USER_SPEECH_DETECTED,
+                    timestampLabel = clockProvider(),
+                    liveGenWireId = liveAdapter.state.value.activeGeneration?.wireId,
+                    detail = "manualSubmitPreRoll=${chunks.sumOf { it.size }}B"
+                )
+            }
+            syncSpeechGateTelemetryLocked()
+            chunks
+        }
+
+        if (manualPreRollChunks == null) {
+            return
+        }
+
+        if (manualPreRollChunks.isNotEmpty()) {
+            var startFailed = false
+            var sentFramesNow = 0L
+            var sentChunksNow = 0L
+            var sentBytesNow = 0L
+            micSendMutex.withLock {
+                val stillEligible = synchronized(this@ConversationCoordinator) {
+                    activeTurn === turn &&
+                        !turn.closed &&
+                        turn.turnSeq == turnSeq &&
+                        !turn.endOfTurnSubmitted &&
+                        !isDeliberatelyPaused &&
+                        !isDeliberatelyStopped
+                }
+                if (stillEligible) {
+                    if (!turn.activityStartAttempted) {
+                        turn.activityStartAttempted = true
+                        val startOk = liveAdapter.signalStartOfSpokenTurn()
+                        turn.activityStartSent = startOk
+                        if (!startOk) {
+                            turn.activityStartFailed = true
+                            startFailed = true
+                        }
+                    }
+                    if (!startFailed) {
+                        for (chunk in manualPreRollChunks) {
+                            val ok = liveAdapter.sendRealtimeAudioToActiveSession(
+                                pcm16kHzBytes = chunk,
+                                mimeType = "audio/pcm;rate=16000"
+                            )
+                            if (!ok) break
+                            sentFramesNow += (chunk.size / 2).toLong()
+                            sentChunksNow += 1L
+                            sentBytesNow += chunk.size.toLong()
+                        }
+                    }
+                }
+            }
+            if (sentFramesNow > 0L) {
+                synchronized(this@ConversationCoordinator) {
+                    if (activeTurn === turn && !turn.closed && turn.turnSeq == turnSeq) {
+                        turn.confirmedSentFramesCount += sentFramesNow
+                        turn.confirmedSentChunksCount += sentChunksNow
+                        turn.confirmedSentBytesCount += sentBytesNow
+                        if (!_uiState.value.turnEventTrace.contains("USER_ACTIVITY_START")) {
+                            appendTurnEventLocked("USER_ACTIVITY_START")
+                        }
+                        appendTurnEventLocked("MIC_FRAMES_STREAMED")
+                        appendFirstTurnLifecycleLocked("AUDIO_SENT")
+                        _uiState.update { state ->
+                            state.copy(
+                                voiceTurnFramesSent = turn.confirmedSentFramesCount,
+                                voiceTurnChunksSent = turn.confirmedSentChunksCount,
+                                voiceTurnBytesSent = turn.confirmedSentBytesCount,
+                                structuredTurnTrace = turn.structuredTraceEntries.toList(),
+                                activeTurnEarliestMissingStep = turn.earliestMissingStep()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        val readyToSendEndOfTurn = synchronized(this) {
+            if (activeTurn !== turn ||
+                turn.closed ||
+                turn.turnSeq != turnSeq ||
+                turn.turnGen != turnGen ||
+                isDeliberatelyPaused ||
+                isDeliberatelyStopped
+            ) {
+                return@synchronized false
+            }
+            if (turn.endOfTurnSubmitted) {
+                return@synchronized false
+            }
+            if (turn.confirmedSentFramesCount <= 0L) {
+                val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
+                    "NETWORK_UNAVAILABLE"
+                } else {
+                    "NO_AUDIO_FRAMES_SENT"
+                }
+                failActiveVoiceTurnLocked(
+                    failureCode = failCode,
+                    detail = "Captured audio was not confirmed sent to Gemini Live (confirmedSentFrames=0, capturedFrames=${turn.capturedFramesCount}). Refusing to enter PROCESSING.",
+                    expectedSessionId = sessionId,
+                    expectedTurnSeq = turnSeq,
+                    expectedTurnGen = turnGen
+                )
+                return@synchronized false
+            }
+            if (!liveAdapter.networkMonitor.isInternetValidated()) {
+                failActiveVoiceTurnLocked(
+                    failureCode = "NETWORK_UNAVAILABLE",
+                    detail = "NETWORK_UNAVAILABLE: Validated internet lost before end-of-turn could be submitted.",
+                    expectedSessionId = sessionId,
+                    expectedTurnSeq = turnSeq,
+                    expectedTurnGen = turnGen
+                )
+                return@synchronized false
+            }
+            turn.endOfTurnSubmissionInFlight = true
+            true
+        }
+
+        if (!readyToSendEndOfTurn) {
+            return
+        }
+
+        val signaled = micSendMutex.withLock {
+            val stillEligible = synchronized(this@ConversationCoordinator) {
+                activeTurn === turn &&
+                    !turn.closed &&
+                    turn.turnSeq == turnSeq &&
+                    !turn.endOfTurnSubmitted &&
+                    !isDeliberatelyPaused &&
+                    !isDeliberatelyStopped
+            }
+            if (!stillEligible) {
+                false
+            } else {
+                liveAdapter.signalEndOfSpokenTurn()
+            }
+        }
+
+        synchronized(this) {
+            turn.endOfTurnSubmissionInFlight = false
+            if (activeTurn !== turn || turn.closed || turn.turnSeq != turnSeq || turn.turnGen != turnGen) {
+                return@synchronized
+            }
+            if (!signaled) {
+                turn.endOfTurnFailed = true
+                val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
+                    "NETWORK_UNAVAILABLE"
+                } else {
+                    "END_OF_TURN_SEND_FAILED"
+                }
+                failActiveVoiceTurnLocked(
+                    failureCode = failCode,
+                    detail = "Failed to send end-of-turn signal to Gemini Live ($failCode). Refusing to remain in PROCESSING.",
+                    expectedSessionId = sessionId,
+                    expectedTurnSeq = turnSeq,
+                    expectedTurnGen = turnGen
+                )
+                return@synchronized
+            }
+
+            turn.endOfTurnSubmitted = true
+            if (!turn.autoEndTriggered) {
+                speechGate.recordManualEndOfSpeech()
+                syncSpeechGateTelemetryLocked()
+            }
+            promoteToProcessingLocked(
+                turn = turn,
+                sessionId = sessionId,
+                turnId = turnId,
+                turnGen = turnGen
+            )
+            if (!turn.serverResponseStarted &&
+                _uiState.value.state == ConversationState.PROCESSING &&
+                !turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE)
+            ) {
+                armFirstResponseWatchdogLocked(turn)
+            }
+        }
     }
 
     private fun promoteToProcessingLocked(
@@ -1959,8 +2218,6 @@ class ConversationCoordinator(
         val expectedTurnGen = turn.turnGen
         turn.firstResponseWatchdogJob = turnScope.launch(turn.parentJob) {
             delay(timeoutMs)
-            // Launch recovery handler on turnScope (NOT as a child of turn.parentJob) so disposing
-            // the timed-out turn never cancels the single clean session recovery coroutine.
             turnScope.launch {
                 handleFirstResponseTimeout(
                     expectedTurnSeq = expectedSeq,
@@ -2030,7 +2287,6 @@ class ConversationCoordinator(
                     "trace=[${turn.structuredTraceEntries.joinToString(" -> ")}]"
             )
 
-            // Cleanly close and invalidate the stuck turn generation first
             cancelInactivityTimerLocked()
             activeTurn = null
             turn.dispose(cancelAllJobs = true)
@@ -2087,7 +2343,6 @@ class ConversationCoordinator(
                 return
             }
 
-            // Prepare for bounded single clean Live-session recovery off-lock
             activeTimeoutRecoveryJob = recoveryJob
             activeTimeoutRecoveryDeferred = deferredToResolve
             val preparingPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.PREPARING)
@@ -2111,7 +2366,6 @@ class ConversationCoordinator(
             }
         }
 
-        // Perform at most ONE clean Live-session recovery off-lock
         val recoveredLiveState = try {
             withContext(backgroundDispatcher) {
                 liveAdapter.recreateSessionAfterInterruption(
@@ -2171,7 +2425,6 @@ class ConversationCoordinator(
                     completedTurn = turn,
                     allowRestoreAfterTimeoutRecovery = true
                 )
-                // Preserve missing-step diagnostic from recovered Turn while turn is active in LISTENING
                 _uiState.update { state ->
                     state.copy(activeTurnEarliestMissingStep = missingStep)
                 }
@@ -2179,7 +2432,6 @@ class ConversationCoordinator(
                 return
             }
 
-            // Either single-turn mode OR Live recovery failed: stop cleanly in ERROR without infinite retry
             val failCode = when {
                 !liveAdapter.networkMonitor.isInternetValidated() ||
                     recoveredLiveState.phase == LiveConnectionPhase.NETWORK_UNAVAILABLE -> "NETWORK_UNAVAILABLE"
@@ -2234,12 +2486,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Delivers a hardware playback callback strictly bound to `(sessionId, turnId, playbackGenerationId)`.
-     * Stale callbacks (for example, an `ov01-turn-0004` `HARDWARE_DRAIN_INCOMPLETE` callback arriving
-     * during `ov01-turn-0005`) are logged as `STALE_CALLBACK_DROPPED`, counted in
-     * [ConversationUiState.staleTurnCallbacksDropped], and never mutate the active turn.
-     */
     @Synchronized
     fun onTurnBoundPlaybackCallback(event: PlaybackCallbackEvent): Boolean {
         val current = _uiState.value
@@ -2265,15 +2511,93 @@ class ConversationCoordinator(
         }
         val accepted = playbackAdapter.onPlaybackCallback(event)
         syncPlaybackState()
+        if (accepted && !turn.closed) {
+            when (event) {
+                is PlaybackCallbackEvent.BytesAcceptedByHardware -> {
+                    if (event.totalBytesAccepted > 0L) {
+                        transitionToSpeakingLocked(turn, activePlaybackGen)
+                    }
+                }
+                is PlaybackCallbackEvent.PlaybackFailed -> {
+                    val code = when {
+                        event.errorCode == "UNSUPPORTED_AUDIO_MIME" -> "UNSUPPORTED_AUDIO_MIME"
+                        event.reason.startsWith("PLAYBACK_TRACK_INIT_FAILED") -> "AUDIO_PLAYBACK_WRITE_FAILED"
+                        event.errorCode.isNotBlank() -> event.errorCode
+                        else -> "AUDIO_TRACK_WRITE_FAILED"
+                    }
+                    failActiveVoiceTurnLocked(
+                        failureCode = code,
+                        detail = "Native-audio playback failed [$code] on ${turn.turnGen.turnIdValue}: ${event.reason}",
+                        expectedSessionId = turn.turnGen.sessionId,
+                        expectedTurnSeq = turn.turnSeq,
+                        expectedTurnGen = turn.turnGen,
+                        expectedPlaybackGen = activePlaybackGen
+                    )
+                }
+                else -> Unit
+            }
+        }
         return accepted
     }
 
-    /**
-     * Forwards a server socket callback bound to both a [SessionId] and a [TurnGenerationId].
-     * Stale callbacks from an older session or older turn generation (or overlapping completion
-     * callbacks for an already-completed turn) are deterministically dropped and counted
-     * (`staleTurnCallbacksDropped`) so stale events cannot close or resume a newer turn.
-     */
+    private fun transitionToSpeakingLocked(
+        turn: TurnRuntimeState,
+        playbackGen: PlaybackGenerationId
+    ) {
+        if (turn.closed || playbackAdapter.state.value.bytesAcceptedByHardware <= 0L) {
+            return
+        }
+        appendTurnEventLocked("AUDIO_TRACK_WRITES")
+        appendFirstTurnLifecycleLocked("PLAYBACK")
+        val currentState = _uiState.value.state
+        if (currentState == ConversationState.LISTENING ||
+            currentState == ConversationState.PROCESSING ||
+            currentState == ConversationState.THINKING
+        ) {
+            stopTurnMicrophoneLocked(
+                reason = "Playback started (SPEAKING)",
+                cancelQueuedMicSends = true,
+                turnForTrace = turn
+            )
+            val updatedSeq = appendTurnStateLocked(ConversationState.SPEAKING)
+            val updatedReadiness = appendReadinessOrderLocked("SPEAKING")
+            val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.SPEAKING)
+            val speakDetail =
+                "SPEAKING (${playbackGen.wireId}): Streaming Gemini native-audio PCM response through Android AudioTrack (${playbackAdapter.state.value.totalFramesWrittenToHardware} frames accepted; half-duplex mic disabled)..."
+            val speakOutcome = VerifiedOutcome.StateTransitionVerified(
+                actionId = idGenerator.nextActionId("speaking"),
+                sessionId = _uiState.value.sessionId,
+                turnId = _uiState.value.currentTurnId,
+                previousState = currentState,
+                resultingState = ConversationState.SPEAKING,
+                detail = speakDetail
+            )
+            _uiState.update { state ->
+                state.copy(
+                    activeConversationPhase = ActiveConversationPhase.SPEAKING,
+                    activeConversationPhaseSequence = updatedPhaseSeq,
+                    voiceTurnStateSequence = updatedSeq,
+                    voiceTurnReadinessOrder = updatedReadiness,
+                    structuredTurnTrace = turn.structuredTraceEntries.toList(),
+                    activeTurnEarliestMissingStep = turn.earliestMissingStep(),
+                    lastVoiceTurnSummary = if (state.currentTurnModelTranscript.isNotBlank()) {
+                        "Gemini: \"${state.currentTurnModelTranscript}\""
+                    } else {
+                        speakDetail
+                    }
+                )
+            }
+            applyVerifiedOutcome(
+                sessionId = _uiState.value.sessionId,
+                turnId = _uiState.value.currentTurnId,
+                actionId = speakOutcome.actionId,
+                newState = ConversationState.SPEAKING,
+                roleLabel = "AUDIO_PLAYBACK",
+                outcome = speakOutcome
+            )
+        }
+    }
+
     fun onSessionAndTurnScopedEvent(
         sessionId: SessionId,
         turnGenerationId: TurnGenerationId,
@@ -2306,11 +2630,6 @@ class ConversationCoordinator(
         return onLiveSocketCallback(event)
     }
 
-    /**
-     * Forwards a server socket callback bound to a specific [TurnGenerationId].
-     * Stale callbacks from an older [TurnGenerationId] or session are deterministically dropped and
-     * counted (`staleTurnCallbacksDropped`) so an older turn can never interrupt a new turn.
-     */
     fun onTurnScopedServerEvent(
         turnGenerationId: TurnGenerationId,
         event: LiveSocketCallbackEvent
@@ -2332,10 +2651,6 @@ class ConversationCoordinator(
         return "$existing $safe"
     }
 
-    /**
-     * Handles validated active-generation server events (`ServerAudioChunkReceived`, `ServerTurnCompleted`,
-     * `ServerTranscriptionReceived`) forwarded from [GeminiLiveConnectionAdapter].
-     */
     private fun onServerSocketEvent(event: LiveSocketCallbackEvent) {
         when (event) {
             is LiveSocketCallbackEvent.ServerTranscriptionReceived -> {
@@ -2433,7 +2748,6 @@ class ConversationCoordinator(
                         if (turn.endOfTurnSubmissionInFlight) {
                             turn.endOfTurnSubmitted = true
                         } else {
-                            // Unsolicited server audio while mic open: stop mic immediately (half-duplex)
                             stopTurnMicrophoneLocked(
                                 reason = "Server began native-audio response",
                                 cancelQueuedMicSends = true,
@@ -2476,13 +2790,14 @@ class ConversationCoordinator(
                         )
                     }
 
-                    // Launch and register write job inside synchronized block so ServerTurnCompleted
-                    // always awaits every preceding chunk write before checking hardware drain!
                     val writeJob = turnScope.launch(turn.parentJob) {
                         val writeOutcome = playbackAdapter.verifyAndWritePcmChunk(
                             generationId = playbackGen,
                             rawMimeType = event.mimeType,
-                            pcmBytes = event.pcmBytes
+                            pcmBytes = event.pcmBytes,
+                            onEvent = { pbEvent ->
+                                onTurnBoundPlaybackCallback(pbEvent)
+                            }
                         )
                         syncPlaybackState()
 
@@ -2515,84 +2830,38 @@ class ConversationCoordinator(
                                 }
                                 return@launch
                             }
-                            if (writeOutcome is PcmChunkWriteOutcome.WrittenToHardware &&
-                                writeOutcome.totalBytesAcceptedByHardware > 0L &&
-                                playbackAdapter.state.value.totalFramesWrittenToHardware > 0L
-                            ) {
-                                appendTurnEventLocked("AUDIO_TRACK_WRITES")
-                                appendFirstTurnLifecycleLocked("PLAYBACK")
-                                if (_uiState.value.state == ConversationState.LISTENING ||
-                                    _uiState.value.state == ConversationState.PROCESSING ||
-                                    _uiState.value.state == ConversationState.THINKING
-                                ) {
-                                    // Ensure zero mic send jobs can remain once SPEAKING begins (half-duplex)
-                                    stopTurnMicrophoneLocked(
-                                        reason = "Playback started (SPEAKING)",
-                                        cancelQueuedMicSends = true,
-                                        turnForTrace = turn
-                                    )
-                                    val updatedSeq = appendTurnStateLocked(ConversationState.SPEAKING)
-                                    val updatedReadiness = appendReadinessOrderLocked("SPEAKING")
-                                    val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.SPEAKING)
-                                    val speakDetail =
-                                        "SPEAKING (${playbackGen.wireId}): Streaming Gemini native-audio PCM response through Android AudioTrack (${playbackAdapter.state.value.totalFramesWrittenToHardware} frames accepted; half-duplex mic disabled)..."
-                                    val speakOutcome = VerifiedOutcome.StateTransitionVerified(
-                                        actionId = idGenerator.nextActionId("speaking"),
-                                        sessionId = _uiState.value.sessionId,
-                                        turnId = _uiState.value.currentTurnId,
-                                        previousState = ConversationState.PROCESSING,
-                                        resultingState = ConversationState.SPEAKING,
-                                        detail = speakDetail
-                                    )
-                                    _uiState.update { state ->
-                                        state.copy(
-                                            activeConversationPhase = ActiveConversationPhase.SPEAKING,
-                                            activeConversationPhaseSequence = updatedPhaseSeq,
-                                            voiceTurnStateSequence = updatedSeq,
-                                            voiceTurnReadinessOrder = updatedReadiness,
-                                            structuredTurnTrace = turn.structuredTraceEntries.toList(),
-                                            activeTurnEarliestMissingStep = turn.earliestMissingStep(),
-                                            lastVoiceTurnSummary = if (state.currentTurnModelTranscript.isNotBlank()) {
-                                                "Gemini: \"${state.currentTurnModelTranscript}\""
-                                            } else {
-                                                speakDetail
-                                            }
-                                        )
+                            when (writeOutcome) {
+                                is PcmChunkWriteOutcome.WrittenToHardware -> {
+                                    if (playbackAdapter.state.value.bytesAcceptedByHardware > 0L) {
+                                        transitionToSpeakingLocked(turn, playbackGen)
                                     }
-                                    applyVerifiedOutcome(
-                                        sessionId = _uiState.value.sessionId,
-                                        turnId = _uiState.value.currentTurnId,
-                                        actionId = speakOutcome.actionId,
-                                        newState = ConversationState.SPEAKING,
-                                        roleLabel = "AUDIO_PLAYBACK",
-                                        outcome = speakOutcome
+                                }
+                                is PcmChunkWriteOutcome.RejectedMime -> {
+                                    failActiveVoiceTurnLocked(
+                                        failureCode = "UNSUPPORTED_AUDIO_MIME",
+                                        detail = "Native-audio playback failed [UNSUPPORTED_AUDIO_MIME] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
+                                        expectedSessionId = turnGen.sessionId,
+                                        expectedTurnSeq = turnSeq,
+                                        expectedTurnGen = turnGen,
+                                        expectedPlaybackGen = playbackGen
                                     )
                                 }
-                            } else {
-                                val playSnap = playbackAdapter.state.value
-                                val code = when (writeOutcome) {
-                                    is PcmChunkWriteOutcome.RejectedMime -> "UNSUPPORTED_AUDIO_MIME"
-                                    is PcmChunkWriteOutcome.FailedWrite ->
-                                        if (writeOutcome.reason.startsWith("PLAYBACK_TRACK_INIT_FAILED")) {
-                                            "AUDIO_PLAYBACK_WRITE_FAILED"
-                                        } else {
-                                            "AUDIO_TRACK_WRITE_FAILED"
-                                        }
-                                    else -> "AUDIO_TRACK_WRITE_FAILED"
+                                is PcmChunkWriteOutcome.FailedWrite -> {
+                                    val code = if (writeOutcome.reason.startsWith("PLAYBACK_TRACK_INIT_FAILED")) {
+                                        "AUDIO_PLAYBACK_WRITE_FAILED"
+                                    } else {
+                                        "AUDIO_TRACK_WRITE_FAILED"
+                                    }
+                                    failActiveVoiceTurnLocked(
+                                        failureCode = code,
+                                        detail = "Native-audio playback failed [$code] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
+                                        expectedSessionId = turnGen.sessionId,
+                                        expectedTurnSeq = turnSeq,
+                                        expectedTurnGen = turnGen,
+                                        expectedPlaybackGen = playbackGen
+                                    )
                                 }
-                                val failReason = when (writeOutcome) {
-                                    is PcmChunkWriteOutcome.RejectedMime -> writeOutcome.reason
-                                    is PcmChunkWriteOutcome.FailedWrite -> writeOutcome.reason
-                                    else -> playSnap.lastError ?: playSnap.statusDetail
-                                }
-                                failActiveVoiceTurnLocked(
-                                    failureCode = code,
-                                    detail = "Native-audio playback failed [$code] on ${turnGen.turnIdValue}: $failReason",
-                                    expectedSessionId = turnGen.sessionId,
-                                    expectedTurnSeq = turnSeq,
-                                    expectedTurnGen = turnGen,
-                                    expectedPlaybackGen = playbackGen
-                                )
+                                is PcmChunkWriteOutcome.DroppedStaleGeneration -> Unit
                             }
                         }
                     }
@@ -2650,7 +2919,6 @@ class ConversationCoordinator(
                         detail = "interrupted=${event.interrupted}"
                     )
                     cancelInactivityTimerLocked()
-                    // Ensure microphone capture is completely stopped before draining response
                     if (_uiState.value.state == ConversationState.LISTENING || audioCapture.state.value.isCapturing) {
                         stopTurnMicrophoneLocked(
                             reason = "Server turn completed",
@@ -2661,7 +2929,6 @@ class ConversationCoordinator(
                     writeJobsSnapshot = turn.writeJobs.toList()
                 }
 
-                // Await all queued audio buffer writes FIRST before checking hardware drain.
                 val drainJob = turnScope.launch(turn.parentJob) {
                     try {
                         for (job in writeJobsSnapshot) {
@@ -2769,6 +3036,7 @@ class ConversationCoordinator(
                         }
 
                         var readyOutcome: VerifiedOutcome.VoiceTurnOutcome? = null
+                        var recoveryJobToStart: Job? = null
 
                         synchronized(this@ConversationCoordinator) {
                             if (activeTurn !== turn ||
@@ -2832,16 +3100,16 @@ class ConversationCoordinator(
                             appendTurnEventLocked("READY")
                             appendFirstTurnLifecycleLocked("PLAYBACK")
 
-                            // Healthy turn completed: reset consecutive first-response timeout counter
                             consecutiveFirstResponseTimeouts = 0
+
                             turn.completionHandled = true
                             turn.drainJob = null
                             activeTurn = null
                             liveAdapter.setAudioPlaybackClaimed(false)
 
+                            val current = _uiState.value
                             val updatedSeq = appendTurnStateLocked(ConversationState.READY)
                             val updatedReadiness = appendReadinessOrderLocked("READY")
-                            val current = _uiState.value
                             val newCompletedCount = current.completedTurnsInSession + 1
                             val dialogueTurn = SessionDialogueTurn(
                                 sessionId = current.sessionId,
@@ -2885,6 +3153,12 @@ class ConversationCoordinator(
                                 code = "VOICE_TURN_COMPLETED_DRAINED",
                                 detail = readySummary
                             )
+                            val wantsAutoRestore =
+                                _uiState.value.isActiveConversationEnabled &&
+                                    !isDeliberatelyPaused &&
+                                    !isDeliberatelyStopped
+                            val sessionReadyNow = liveAdapter.isSessionReadyForAudio()
+
                             _uiState.update { state ->
                                 state.copy(
                                     activeConversationPhase = ActiveConversationPhase.IDLE,
@@ -2909,17 +3183,14 @@ class ConversationCoordinator(
                                 outcome = readyOutcome!!
                             )
 
-                            // Phase 05 Active Conversation: Only AFTER actual speech completion & hardware
-                            // playback drain verified, automatically release resources and restore capture
-                            // while active conversation is enabled (never overriding Pause or Stop).
-                            val shouldAutoRestore =
-                                _uiState.value.isActiveConversationEnabled &&
-                                    !isDeliberatelyPaused &&
-                                    !isDeliberatelyStopped &&
-                                    liveAdapter.isSessionReadyForAudio()
-
-                            if (shouldAutoRestore) {
+                            if (wantsAutoRestore && sessionReadyNow) {
                                 autoRestoreCaptureForNextTurnLocked(
+                                    previousTurnId = current.currentTurnId,
+                                    completedTurn = turn
+                                )
+                            } else if (wantsAutoRestore) {
+                                recoveryJobToStart = prepareNextTurnSessionRecoveryLocked(
+                                    sessionId = current.sessionId,
                                     previousTurnId = current.currentTurnId,
                                     completedTurn = turn
                                 )
@@ -2930,8 +3201,14 @@ class ConversationCoordinator(
                             }
                         }
 
-                        // Dispose turn's own supervisor cleanly once outcome is ready so zero jobs remain active.
                         turn.dispose(cancelAllJobs = false)
+                        if (recoveryJobToStart != null) {
+                            recoveryJobToStart!!.start()
+                            try {
+                                recoveryJobToStart!!.join()
+                            } catch (_: CancellationException) {
+                            }
+                        }
                         readyOutcome?.let { turn.completionDeferred.complete(it) }
                     } finally {
                         synchronized(this@ConversationCoordinator) {
@@ -2964,7 +3241,6 @@ class ConversationCoordinator(
         try {
             android.util.Log.i("OmniVoiceTurn", DiagnosticRedactor.redact(message))
         } catch (_: Throwable) {
-            // Safe in pure JVM unit tests where android.util.Log is not mocked
         }
     }
 
@@ -3056,10 +3332,153 @@ class ConversationCoordinator(
         }
     }
 
+    private fun prepareNextTurnSessionRecoveryLocked(
+        sessionId: SessionId,
+        previousTurnId: TurnId,
+        completedTurn: TurnRuntimeState
+    ): Job? {
+        val existingJob = activeNextTurnRecoveryJob
+        if (existingJob != null && !existingJob.isCompleted && !existingJob.isCancelled) {
+            logTurnLifecycleEventLocked(
+                "SINGLE_FLIGHT_NEXT_TURN_RECOVERY: Recovery job already active for ${sessionId.value}; ignoring duplicate completion."
+            )
+            return null
+        }
+
+        val preparingSeq = appendTurnStateLocked(ConversationState.PREPARING)
+        val preparingReadiness = appendReadinessOrderLocked("PREPARING")
+        val preparingPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.PREPARING)
+        val preparingDetail =
+            "PREPARING: Gemini Live session temporarily unavailable after ${previousTurnId.value}; recovering session before restoring LISTENING..."
+        val preparingOutcome = VerifiedOutcome.StateTransitionVerified(
+            actionId = idGenerator.nextActionId("next_turn_preparing"),
+            sessionId = sessionId,
+            turnId = previousTurnId,
+            previousState = ConversationState.READY,
+            resultingState = ConversationState.PREPARING,
+            detail = preparingDetail
+        )
+        _uiState.update { state ->
+            state.copy(
+                state = ConversationState.PREPARING,
+                activeConversationPhase = ActiveConversationPhase.PREPARING,
+                activeConversationPhaseSequence = preparingPhaseSeq,
+                voiceTurnStateSequence = preparingSeq,
+                voiceTurnReadinessOrder = preparingReadiness,
+                lastVoiceTurnSummary = preparingDetail
+            )
+        }
+        applyVerifiedOutcome(
+            sessionId = sessionId,
+            turnId = previousTurnId,
+            actionId = preparingOutcome.actionId,
+            newState = ConversationState.PREPARING,
+            roleLabel = "ACTIVE_CONVERSATION",
+            outcome = preparingOutcome
+        )
+
+        var createdJob: Job? = null
+        val job = turnScope.launch(start = CoroutineStart.LAZY) {
+            val recoveredState = try {
+                withContext(backgroundDispatcher) {
+                    withTimeoutOrNull(connectionTimeoutMs) {
+                        liveAdapter.ensureConnectedSession(sessionId)
+                    }
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (_: Throwable) {
+                liveAdapter.state.value
+            }
+
+            synchronized(this@ConversationCoordinator) {
+                if (activeNextTurnRecoveryJob === createdJob) {
+                    activeNextTurnRecoveryJob = null
+                }
+                val currentAfter = _uiState.value
+                val sameSession = currentAfter.sessionId == sessionId
+                val validState =
+                    currentAfter.state == ConversationState.READY ||
+                        currentAfter.state == ConversationState.PREPARING
+                val activeConvStillEnabled = currentAfter.isActiveConversationEnabled
+                val notPausedOrStopped =
+                    !isDeliberatelyPaused &&
+                        !isDeliberatelyStopped &&
+                        currentAfter.state != ConversationState.PAUSED &&
+                        currentAfter.state != ConversationState.STOPPED
+                val noNewerTurn = activeTurn == null || activeTurn?.closed == true
+
+                if (!sameSession || !validState || !activeConvStillEnabled || !notPausedOrStopped || !noNewerTurn) {
+                    logTurnLifecycleEventLocked(
+                        "NEXT_TURN_RECOVERY_SKIPPED: Post-recovery invariant changed (sameSession=$sameSession, state=${currentAfter.state.wireLabel}, activeConv=$activeConvStillEnabled, notPausedOrStopped=$notPausedOrStopped, noNewerTurn=$noNewerTurn)."
+                    )
+                    return@launch
+                }
+
+                if (recoveredState != null && liveAdapter.isSessionReadyForAudio()) {
+                    autoRestoreCaptureForNextTurnLocked(
+                        previousTurnId = previousTurnId,
+                        completedTurn = completedTurn
+                    )
+                } else {
+                    val rawDiagnostic =
+                        recoveredState?.diagnostics?.redactedSummary?.takeIf { it.isNotBlank() }
+                            ?: recoveredState?.statusDetail?.takeIf { it.isNotBlank() }
+                            ?: liveAdapter.state.value.diagnostics.redactedSummary.takeIf { it.isNotBlank() }
+                            ?: liveAdapter.state.value.statusDetail
+                    val safeDiagnostic = DiagnosticRedactor.redact(rawDiagnostic)
+                    val failureCode = "NEXT_TURN_SESSION_RECOVERY_FAILED"
+                    val failureDetail =
+                        "$failureCode: Could not restore Gemini Live session for next turn after ${previousTurnId.value} ($safeDiagnostic). Press Start to reconnect."
+                    val errorSeq = appendTurnStateLocked(ConversationState.ERROR)
+                    val errorReadiness = appendReadinessOrderLocked("ERROR")
+                    val errorPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
+                    val errorOutcome = VerifiedOutcome.PrerequisiteFailureOutcome(
+                        actionId = idGenerator.nextActionId("next_turn_recovery_failed"),
+                        sessionId = sessionId,
+                        turnId = previousTurnId,
+                        resultingState = ConversationState.ERROR,
+                        failureCode = failureCode,
+                        detail = failureDetail
+                    )
+                    _uiState.update { state ->
+                        state.copy(
+                            state = ConversationState.ERROR,
+                            activeConversationPhase = ActiveConversationPhase.ERROR,
+                            activeConversationPhaseSequence = errorPhaseSeq,
+                            activeTurnGenerationId = null,
+                            voiceTurnStateSequence = errorSeq,
+                            voiceTurnReadinessOrder = errorReadiness,
+                            activeVoiceTurnErrorCode = failureCode,
+                            activeVoiceTurnErrorDetail = failureDetail,
+                            lastVoiceTurnSummary = "ERROR [$failureCode]: $failureDetail"
+                        )
+                    }
+                    applyVerifiedOutcome(
+                        sessionId = sessionId,
+                        turnId = previousTurnId,
+                        actionId = errorOutcome.actionId,
+                        newState = ConversationState.ERROR,
+                        roleLabel = "ACTIVE_CONVERSATION",
+                        outcome = errorOutcome
+                    )
+                }
+            }
+        }
+        createdJob = job
+        activeNextTurnRecoveryJob = job
+        return job
+    }
+
     private fun cancelActiveTurnStreamsLocked(reason: String) {
         cancelInactivityTimerLocked()
+        cancelPostPlaybackGuardJobLocked()
+        speechGate.cancelAndResetToIdle(resetSessionCounters = false)
+        syncSpeechGateTelemetryLocked()
         activeTimeoutRecoveryJob?.cancel()
         activeTimeoutRecoveryJob = null
+        activeNextTurnRecoveryJob?.cancel()
+        activeNextTurnRecoveryJob = null
         val prevTurn = activeTurn
         activeTurn = null
         prevTurn?.dispose(cancelAllJobs = true)
@@ -3140,11 +3559,6 @@ class ConversationCoordinator(
         return outcome
     }
 
-    /**
-     * Initiates an authenticated Gemini Live WebSocket handshake with bounded backoff for transient
-     * failures through the single [GeminiLiveConnectionAdapter], recording a typed [VerifiedOutcome.LiveConnectionOutcome]
-     * in the coordinator transcript.
-     */
     suspend fun connectLiveSessionWithHandshake(
         actionId: ActionId = idGenerator.nextActionId("connect_live")
     ): VerifiedOutcome.LiveConnectionOutcome {
@@ -3216,12 +3630,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Explicit lifecycle hook when navigating away from the Microphone Setup screen or when
-     * the Activity stops/backgrounds (not a configuration change).
-     * Immediately releases audio hardware, wipes ephemeral self-test audio, flushes active playback,
-     * closes any active live socket, and unregisters connectivity callbacks when disconnecting Live.
-     */
     @Synchronized
     fun onLifecycleReleaseHardware(reason: String, disconnectLive: Boolean = false) {
         val hadActiveHardware = audioCapture.state.value.isCapturing ||
@@ -3268,6 +3676,11 @@ class ConversationCoordinator(
             deferredToCancel?.complete(releaseOutcome)
             recoveryDeferredToCancel?.complete(releaseOutcome)
         } else {
+            cancelPostPlaybackGuardJobLocked()
+            speechGate.cancelAndResetToIdle(resetSessionCounters = false)
+            syncSpeechGateTelemetryLocked()
+            activeNextTurnRecoveryJob?.cancel()
+            activeNextTurnRecoveryJob = null
             audioCapture.stopAndRelease(reason = reason, wipeEphemeral = true)
         }
         syncAudioState()
@@ -3316,10 +3729,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Dispatches a single [CoordinatorCommand] with an explicit [ActionId] to guarantee
-     * exactly-once execution and typed [VerifiedOutcome].
-     */
     @Synchronized
     fun dispatch(
         command: CoordinatorCommand,
@@ -3327,7 +3736,6 @@ class ConversationCoordinator(
     ): VerifiedOutcome {
         val current = _uiState.value
 
-        // Enforce Exactly-Once Effect Invariant
         if (executedActionIds.contains(actionId.value)) {
             val duplicateOutcome = VerifiedOutcome.DuplicateActionRejected(
                 actionId = actionId,
@@ -3345,8 +3753,6 @@ class ConversationCoordinator(
 
         return when (command) {
             CoordinatorCommand.STOP -> {
-                // Large Stop MUST promptly cancel microphone capture, the current model turn, and queued playback,
-                // invalidate playback/socket generations so stopped audio never replays, and close the live socket.
                 isDeliberatelyStopped = true
                 isDeliberatelyPaused = false
                 consecutiveFirstResponseTimeouts = 0
@@ -3365,6 +3771,9 @@ class ConversationCoordinator(
                     resultingState = ConversationState.STOPPED,
                     detail = "STOP command executed with highest precedence (priority ${CoordinatorCommand.STOP.priority}). Microphone capture, model turn, and queued playback cancelled; generation IDs invalidated."
                 )
+                wakeWordState = WakeWordState.STANDBY
+                activeWakeAuthorization = null
+                wakeWordDetector.resetState()
                 _uiState.update { state ->
                     state.copy(
                         activeConversationPhase = ActiveConversationPhase.STOPPED,
@@ -3372,6 +3781,10 @@ class ConversationCoordinator(
                         activeTurnGenerationId = null,
                         isDeliberatelyStopped = true,
                         isDeliberatelyPaused = false,
+                        wakeWordState = WakeWordState.STANDBY,
+                        wakeWordStatusLabel = "STANDBY — SAY “JARVIS”",
+                        wakeAuthorizationActive = false,
+                        lastWakeKeyword = null,
                         lastVoiceTurnSummary = "STOPPED: Microphone capture, model turn, and queued audio playback cancelled."
                     )
                 }
@@ -3424,12 +3837,19 @@ class ConversationCoordinator(
                         resultingState = ConversationState.PAUSED,
                         detail = "PAUSE command executed (priority ${CoordinatorCommand.PAUSE.priority}). Active audio capture, playback, and live socket released; shell paused."
                     )
+                    wakeWordState = WakeWordState.STANDBY
+                    activeWakeAuthorization = null
+                    wakeWordDetector.resetState()
                     _uiState.update { state ->
                         state.copy(
                             activeConversationPhase = ActiveConversationPhase.PAUSED,
                             activeConversationPhaseSequence = updatedPhaseSeq,
                             activeTurnGenerationId = null,
                             isDeliberatelyPaused = true,
+                            wakeWordState = WakeWordState.STANDBY,
+                            wakeWordStatusLabel = "STANDBY — SAY “JARVIS”",
+                            wakeAuthorizationActive = false,
+                            lastWakeKeyword = null,
                             lastVoiceTurnSummary = "PAUSED: Session paused; active capture and playback released."
                         )
                     }
@@ -3500,7 +3920,6 @@ class ConversationCoordinator(
             }
 
             CoordinatorCommand.START -> {
-                // Synchronous START command check: never shows NOT_CONFIGURED when adapters are configured.
                 when (val prereq = checkVoiceTurnPrerequisitesLocked()) {
                     is PrerequisiteCheck.NotConfigured -> {
                         val outcome = VerifiedOutcome.HonestNotConfiguredOutcome(
@@ -3597,7 +4016,8 @@ class ConversationCoordinator(
             CoordinatorCommand.END_SPOKEN_TURN -> {
                 val turn = activeTurn
                 if (current.state == ConversationState.LISTENING && turn != null && !turn.closed && !turn.endOfTurnRequested) {
-                    if (turn.capturedFramesCount <= 0L) {
+                    val jobsToFlush = turn.micSendJobs.filter { it.isActive }
+                    if (turn.capturedFramesCount <= 0L && jobsToFlush.isEmpty()) {
                         turn.endOfTurnRequested = true
                         stopTurnMicrophoneLocked(
                             reason = "No microphone audio captured (Operator END_SPOKEN_TURN)",
@@ -3611,27 +4031,11 @@ class ConversationCoordinator(
                             expectedTurnSeq = turn.turnSeq,
                             expectedTurnGen = turn.turnGen
                         )!!
-                    } else if (turn.nonSilentSpeechFramesCount <= 0L || turn.peakRmsLinear < 0.008f) {
-                        turn.endOfTurnRequested = true
-                        stopTurnMicrophoneLocked(
-                            reason = "Silent turn rejected (Operator END_SPOKEN_TURN)",
-                            cancelQueuedMicSends = true,
-                            turnForTrace = turn
-                        )
-                        appendTurnEventLocked("SILENT_TURN_REJECTED")
-                        failActiveVoiceTurnLocked(
-                            failureCode = "SILENT_AUDIO_CAPTURED",
-                            detail = "Captured microphone audio had no speech signal (capturedFrames=${turn.capturedFramesCount}, peak RMS=${"%.3f".format(turn.peakRmsLinear)}). Refusing to enter PROCESSING.",
-                            expectedSessionId = turn.sessionId,
-                            expectedTurnSeq = turn.turnSeq,
-                            expectedTurnGen = turn.turnGen
-                        )!!
                     } else {
                         turn.endOfTurnRequested = true
                         cancelInactivityTimerLocked()
                         val turnSeq = turn.turnSeq
                         val turnGen = turn.turnGen
-                        val jobsToFlush = turn.micSendJobs.filter { it.isActive }
                         stopTurnMicrophoneLocked(
                             reason = "Operator END_SPOKEN_TURN command",
                             cancelQueuedMicSends = false,
@@ -3654,99 +4058,16 @@ class ConversationCoordinator(
                             outcome = outcome
                         )
                         turnScope.launch(turn.parentJob) {
-                            for (job in jobsToFlush) {
-                                job.join()
-                            }
-                            val readyToSend = synchronized(this@ConversationCoordinator) {
-                                if (activeTurn !== turn ||
-                                    turn.closed ||
-                                    turn.turnSeq != turnSeq ||
-                                    turn.turnGen != turnGen ||
-                                    turn.endOfTurnSubmitted ||
-                                    isDeliberatelyPaused ||
-                                    isDeliberatelyStopped
-                                ) {
-                                    return@synchronized false
-                                }
-                                if (turn.confirmedSentFramesCount <= 0L) {
-                                    val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                                        "NETWORK_UNAVAILABLE"
-                                    } else {
-                                        "NO_AUDIO_FRAMES_SENT"
-                                    }
-                                    failActiveVoiceTurnLocked(
-                                        failureCode = failCode,
-                                        detail = "Captured audio was not confirmed sent to Gemini Live (confirmedSentFrames=0, capturedFrames=${turn.capturedFramesCount}). Refusing to enter PROCESSING.",
-                                        expectedSessionId = turn.sessionId,
-                                        expectedTurnSeq = turnSeq,
-                                        expectedTurnGen = turnGen
-                                    )
-                                    return@synchronized false
-                                }
-                                if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                                    failActiveVoiceTurnLocked(
-                                        failureCode = "NETWORK_UNAVAILABLE",
-                                        detail = "NETWORK_UNAVAILABLE: Validated internet lost before end-of-turn could be submitted.",
-                                        expectedSessionId = turn.sessionId,
-                                        expectedTurnSeq = turnSeq,
-                                        expectedTurnGen = turnGen
-                                    )
-                                    return@synchronized false
-                                }
-                                turn.endOfTurnSubmissionInFlight = true
-                                true
-                            }
-                            if (!readyToSend) return@launch
-                            val signaled = micSendMutex.withLock {
-                                val stillEligible = synchronized(this@ConversationCoordinator) {
-                                    activeTurn === turn &&
-                                        !turn.closed &&
-                                        turn.turnSeq == turnSeq &&
-                                        !turn.endOfTurnSubmitted &&
-                                        !isDeliberatelyPaused &&
-                                        !isDeliberatelyStopped
-                                }
-                                if (!stillEligible) {
-                                    false
-                                } else {
-                                    liveAdapter.signalEndOfSpokenTurn()
-                                }
-                            }
-                            synchronized(this@ConversationCoordinator) {
-                                turn.endOfTurnSubmissionInFlight = false
-                                if (activeTurn !== turn || turn.closed || turn.turnSeq != turnSeq || turn.turnGen != turnGen) {
-                                    return@synchronized
-                                }
-                                if (!signaled) {
-                                    turn.endOfTurnFailed = true
-                                    val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
-                                        "NETWORK_UNAVAILABLE"
-                                    } else {
-                                        "END_OF_TURN_SEND_FAILED"
-                                    }
-                                    failActiveVoiceTurnLocked(
-                                        failureCode = failCode,
-                                        detail = "Failed to send end-of-turn signal to Gemini Live ($failCode). Refusing to remain in PROCESSING.",
-                                        expectedSessionId = turn.sessionId,
-                                        expectedTurnSeq = turnSeq,
-                                        expectedTurnGen = turnGen
-                                    )
-                                    return@synchronized
-                                }
-                                turn.endOfTurnSubmitted = true
-                                promoteToProcessingLocked(
-                                    turn = turn,
-                                    sessionId = turn.sessionId,
-                                    turnId = turn.turnId,
-                                    turnGen = turnGen
-                                )
-                                if (!turn.serverResponseStarted &&
-                                    _uiState.value.state == ConversationState.PROCESSING &&
-                                    !turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE)
-                                ) {
-                                    armFirstResponseWatchdogLocked(turn)
-                                }
-                            }
+                            flushPreRollAndSubmitEndOfTurn(
+                                turn = turn,
+                                turnSeq = turnSeq,
+                                turnGen = turnGen,
+                                sessionId = turn.sessionId,
+                                turnId = turn.turnId,
+                                reason = "Operator END_SPOKEN_TURN",
+                                requireCapturedSpeech = true,
+                                micJobsToFlush = jobsToFlush
+                            )
                         }
                         _uiState.value.lastOutcome ?: outcome
                     }
@@ -3929,6 +4250,8 @@ class ConversationCoordinator(
                 val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
                 activeTimeoutRecoveryDeferred = null
                 cancelActiveTurnStreamsLocked("Session reset to IDLE")
+                speechGate.cancelAndResetToIdle(resetSessionCounters = true)
+                syncSpeechGateTelemetryLocked()
                 liveAdapter.disconnectAndRelease(reason = "Session reset to IDLE")
                 needsSessionRecreationBeforeNextTurn = false
                 val freshSession = idGenerator.nextSessionId()
@@ -3985,10 +4308,6 @@ class ConversationCoordinator(
         }
     }
 
-    /**
-     * Evaluates a batch of concurrent commands and enforces strict Stop/Pause precedence
-     * (STOP > STOP_MIC_SELF_TEST > DISCONNECT_LIVE_SESSION > PAUSE > RESUME > END_SPOKEN_TURN > CONNECT_LIVE_SESSION > START_MIC_SELF_TEST > START).
-     */
     @Synchronized
     fun dispatchWithPrecedence(
         commands: List<CoordinatorCommand>,
@@ -4146,6 +4465,7 @@ class ConversationCoordinator(
                 audioCaptureState = snap,
                 liveConnectionState = liveSnap,
                 playbackState = playSnap,
+                authoritativeSystemInstruction = liveSnap.systemInstruction,
                 lastOutcome = outcome,
                 transcript = (state.transcript + entry).takeLast(maxTranscriptEntries),
                 executedActionCount = state.executedActionCount + 1
@@ -4167,6 +4487,7 @@ class ConversationCoordinator(
         val turn = activeTurn
         return (turn != null && !turn.closed) ||
             activeTimeoutRecoveryJob?.isActive == true ||
+            activeNextTurnRecoveryJob?.isActive == true ||
             currentState == ConversationState.PREPARING ||
             currentState == ConversationState.CONNECTING ||
             currentState == ConversationState.LISTENING ||
@@ -4175,4 +4496,3 @@ class ConversationCoordinator(
             currentState == ConversationState.SPEAKING
     }
 }
-

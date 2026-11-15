@@ -11,6 +11,7 @@ import com.example.audio.AndroidAudioHardwareDriver
 import com.example.audio.AndroidStreamingAudioTrackDriver
 import com.example.audio.AudioCapture
 import com.example.audio.LiveAudioPlaybackAdapter
+import com.example.audio.SileroVadDetector
 import com.example.coordinator.ConversationCoordinator
 import com.example.live.AndroidLiveNetworkMonitor
 import com.example.live.FirebaseAiLiveTransportDriver
@@ -48,12 +49,14 @@ class MainActivity : ComponentActivity() {
                 val playbackAdapter = LiveAudioPlaybackAdapter(
                     driver = AndroidStreamingAudioTrackDriver()
                 )
+                val sileroDetector = SileroVadDetector.fromAndroidContext(appContext)
                 val coordinator = ConversationCoordinator(
                     audioCapture = audioCapture,
                     liveAdapter = liveAdapter,
                     playbackAdapter = playbackAdapter,
                     preferencesStore = com.example.coordinator.SharedPreferencesConversationPreferencesStore(appContext),
-                    backgroundDispatcher = Dispatchers.IO
+                    backgroundDispatcher = Dispatchers.IO,
+                    speechDetector = sileroDetector
                 )
                 return ConversationShellViewModel(
                     coordinator = coordinator,

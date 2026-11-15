@@ -473,6 +473,12 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("state_label_text", useUnmergedTree = true)
             .assertTextEquals("LISTENING")
         assertTrue(viewModel.audioState.value.isCapturing)
+        assertTrue("Main Start button must enable Active Conversation", viewModel.uiState.value.isActiveConversationEnabled)
+
+        // Disable Auto-Continue Turns explicitly to verify single-turn Phase 04 READY completion
+        viewModel.onToggleActiveConversationMode(false)
+        composeTestRule.waitForIdle()
+        assertFalse(viewModel.uiState.value.isActiveConversationEnabled)
 
         // 3. Deliver spoken 16kHz PCM frame and click Send Spoken Question (End Turn) -> PROCESSING -> SPEAKING -> READY
         val activeCaptureGen = viewModel.audioState.value.activeGeneration!!
@@ -752,5 +758,155 @@ class ExampleRobolectricTest {
         assertEquals(1, viewModel.uiState.value.configurationChangePreservedCount)
         assertEquals(LiveConnectionPhase.SETUP_ACCEPTED, viewModel.liveState.value.phase)
     }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w412dp-h892dp-port")
+    fun `phase 06A SharedPreferencesConversationPreferencesStore ignores legacy phase06 language keys and preserves Phase 05 UI without voice selector`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val rawPrefs = context.getSharedPreferences("omnivoice_phase05_conversation_prefs", Context.MODE_PRIVATE)
+        rawPrefs.edit()
+            .clear()
+            .putString("phase06_preferred_language", "ENGLISH")
+            .putString("phase06_verbosity_preference", "DETAILED")
+            .putString("phase06_selected_voice", "Charon")
+            .commit()
+
+        val store = com.example.coordinator.SharedPreferencesConversationPreferencesStore(context)
+        // Test A: Fresh production preference store must default isActiveConversationEnabled to true
+        assertTrue("Fresh SharedPreferencesConversationPreferencesStore must default isActiveConversationEnabled to true", store.isActiveConversationEnabled)
+
+        // Verify explicit user toggle to false persists and can be restored to true
+        store.isActiveConversationEnabled = false
+        assertFalse(store.isActiveConversationEnabled)
+        store.isActiveConversationEnabled = true
+        assertTrue(store.isActiveConversationEnabled)
+
+        val liveDriver = com.example.live.DeterministicTestLiveTransportDriver()
+        val coordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = liveDriver,
+                networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                driver = com.example.audio.DeterministicStreamingAudioTrackDriver(),
+                writeRetryDelayRunner = {},
+                drainPollDelayRunner = {},
+                audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            ),
+            preferencesStore = store
+        )
+        coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val viewModel = ConversationShellViewModel(
+            coordinator = coordinator,
+            workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        )
+
+        composeTestRule.setContent {
+            OmniVoiceRebuildTheme {
+                ConversationShellRoute(viewModel = viewModel)
+            }
+        }
+        composeTestRule.waitForIdle()
+
+        // Start session -> connects with pinned "Kore" voice and authoritative system instruction (legacy SharedPreferences keys ignored)
+        composeTestRule.onNodeWithTag("start_button").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(viewModel.uiState.value.isActiveConversationEnabled)
+        assertEquals("Kore", liveDriver.lastReceivedVoiceName)
+        assertEquals(
+            com.example.live.LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
+            liveDriver.lastReceivedSystemInstruction
+        )
+
+        // Open Settings -> Phase 05 settings remain intact, no voice selector UI is present
+        composeTestRule.onNodeWithTag("settings_placeholder_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("settings_active_conversation_chip").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("settings_voice_selector_row").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("settings_language_selector_row").assertDoesNotExist()
+    }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w412dp-h892dp-port")
+    fun `phase 06B Robolectric Android Context loads bundled silero_vad onnx exposes VAD diagnostics and reports VAD_MODEL_LOAD_FAILED when asset missing`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val realDetector = com.example.audio.SileroVadDetector.fromAndroidContext(context)
+        try {
+            assertTrue("Android AssetManager must load silero_vad.onnx: ${realDetector.loadError}", realDetector.isModelLoaded)
+            assertEquals("Silero VAD", realDetector.detectorName)
+            assertEquals("6.2.3", realDetector.detectorVersion)
+
+            val liveDriver = com.example.live.DeterministicTestLiveTransportDriver()
+            val coordinator = com.example.coordinator.ConversationCoordinator(
+                liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                    driver = liveDriver,
+                    networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                    delayRunner = {}
+                ),
+                playbackAdapter = com.example.audio.LiveAudioPlaybackAdapter(
+                    driver = com.example.audio.DeterministicStreamingAudioTrackDriver(),
+                    writeRetryDelayRunner = {},
+                    drainPollDelayRunner = {},
+                    audioDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+                ),
+                preferencesStore = com.example.coordinator.InMemoryConversationPreferencesStore(isActiveConversationEnabled = true),
+                speechDetector = realDetector
+            )
+            coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+            val viewModel = ConversationShellViewModel(
+                coordinator = coordinator,
+                workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+            )
+
+            composeTestRule.setContent {
+                OmniVoiceRebuildTheme {
+                    ConversationShellRoute(viewModel = viewModel)
+                }
+            }
+            composeTestRule.waitForIdle()
+
+            composeTestRule.onNodeWithTag("speech_vad_detector_chip")
+                .performScrollTo()
+                .assertTextContains("Silero VAD v6.2.3 (LOADED)", substring = true)
+
+            composeTestRule.onNodeWithTag("start_button").performScrollTo().performClick()
+            composeTestRule.waitForIdle()
+
+            composeTestRule.onNodeWithTag("speech_vad_gate_chip")
+                .performScrollTo()
+                .assertTextContains("GATE: WAITING_FOR_SPEECH", substring = true)
+                .assertTextContains("actStart=0", substring = true)
+        } finally {
+            realDetector.close()
+        }
+
+        // Missing model asset must fail recoverably with VAD_MODEL_LOAD_FAILED and zero RMS fallback
+        val missingDetector = com.example.audio.SileroVadDetector.fromAndroidContext(
+            context = context,
+            assetName = "nonexistent_silero.onnx"
+        )
+        assertFalse(missingDetector.isModelLoaded)
+        val brokenCoordinator = com.example.coordinator.ConversationCoordinator(
+            liveAdapter = com.example.live.GeminiLiveConnectionAdapter(
+                driver = com.example.live.DeterministicTestLiveTransportDriver(),
+                networkMonitor = com.example.live.ControllableLiveNetworkMonitor(initialValidated = true),
+                delayRunner = {}
+            ),
+            speechDetector = missingDetector
+        )
+        brokenCoordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        val brokenVm = ConversationShellViewModel(
+            coordinator = brokenCoordinator,
+            workDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        )
+        composeTestRule.runOnUiThread {
+            brokenVm.onStartClicked()
+        }
+        composeTestRule.waitForIdle()
+        assertEquals("VAD_MODEL_LOAD_FAILED", brokenVm.uiState.value.activeVoiceTurnErrorCode)
+        assertEquals(com.example.contract.ConversationState.ERROR, brokenVm.uiState.value.state)
+    }
 }
+
 
