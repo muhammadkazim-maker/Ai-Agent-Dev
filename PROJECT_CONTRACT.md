@@ -5,7 +5,7 @@
 - **Root Project Name**: `omnivoice-rebuild`
 - **Application ID**: `com.kazim.omnivoice.rebuild` (coexists cleanly alongside any legacy OmniVoice installation)
 - **Namespace**: `com.example` (preserved for Android R-class & package stability)
-- **Source / Build Identifier**: `ov-rebuild-p03-20261111` (`versionCode = 3`, `versionName = "0.3.0-phase03"`)
+- **Source / Build Identifier**: Derived per build in `BuildConfig.SOURCE_BUILD_ID` (`versionCode = 7`, `versionName = "0.7.0-phase07"`, reproducible `sha256` source fingerprint, with Git revision reported as `SOURCE_REVISION_UNAVAILABLE` when `.git/HEAD` or `SOURCE_REVISION` is absent)
 - **Signing Identity**: Preserves `debugConfig` (`debug.keystore`) and `release` signing configurations in `app/build.gradle.kts` without modification.
 
 ## 2. Core Architectural & Safety Invariants
@@ -50,5 +50,5 @@
 | **Minimum SDK** | `24` |
 | **Compose BOM** | `2026.03.01` (`material3 = 1.4.0`) |
 | **Firebase BOM** | `34.17.0` (`firebase-ai`, `firebase-appcheck-recaptcha`, `firebase-appcheck-debug`) |
-| **Model Configuration Status** | `PHASE_03_LIVE_HANDSHAKE_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta; AUDIO_PLAYBACK_NOT_CLAIMED; TOOLS=0)` |
-| **Source / Build ID** | `ov-rebuild-p03-20261111` |
+| **Model Configuration Status** | `LIVE_ADAPTER_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta; TOOLS=0)` |
+| **Source / Build ID** | Derived via `BuildConfig.SOURCE_BUILD_ID` (`0.7.0-phase07`, reproducible source fingerprint; `SOURCE_REVISION_UNAVAILABLE` when VCS revision is absent) |

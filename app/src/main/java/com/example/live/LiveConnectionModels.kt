@@ -145,11 +145,44 @@ enum class LiveFailureClassification(
         retryable = true,
         guidance = "Transient network/WebSocket error (HTTP 503 / timeout / socket reset). Bounded backoff retry eligible."
     ),
+    SESSION_EXPIRED_OR_GO_AWAY(
+        wireCode = "SESSION_EXPIRED_OR_GO_AWAY",
+        retryable = true,
+        guidance = "Server notified session going away or session lifetime expired (LiveServerGoAway / session expiry). Bounded reconnect eligible."
+    ),
+    LOCAL_CONFIGURATION_FAILURE(
+        wireCode = "LOCAL_CONFIGURATION_FAILURE",
+        retryable = false,
+        guidance = "Local prerequisite or configuration missing/invalid (FirebaseApp uninitialized, VAD model missing, or invalid local setup). Automatic retries stopped."
+    ),
     CANCELLED_BY_STOP_OR_PAUSE(
         wireCode = "CANCELLED_BY_STOP_OR_PAUSE",
         retryable = false,
         guidance = "Connection halted immediately by operator Stop/Pause or lifecycle release."
     )
+}
+
+/**
+ * Redacted status of Gemini Live session resumption support (never exposes raw handle values).
+ */
+enum class SessionResumptionStatus(val wireCode: String) {
+    NOT_CONFIGURED("NOT_CONFIGURED"),
+    ENABLED_AWAITING_HANDLE("ENABLED_AWAITING_HANDLE"),
+    HANDLE_AVAILABLE_RESUMABLE("HANDLE_AVAILABLE_RESUMABLE"),
+    HANDLE_UNRESUMABLE("HANDLE_UNRESUMABLE"),
+    RESUMED_WITH_SERVER_HANDLE("RESUMED_WITH_SERVER_HANDLE"),
+    HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION("HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION"),
+    CLEARED_ON_STOP_OR_RESET("CLEARED_ON_STOP_OR_RESET")
+}
+
+/**
+ * Honest indicator of whether a connection/reconnection restored server session context via an
+ * accepted resumption handle or established a fresh connection without resumed server context.
+ */
+enum class ContextRestorationStatus(val wireCode: String) {
+    INITIAL_NEW_SESSION("INITIAL_NEW_SESSION"),
+    RESUMED_WITH_SERVER_HANDLE("RESUMED_WITH_SERVER_HANDLE"),
+    NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT("NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT")
 }
 
 /**
@@ -173,25 +206,59 @@ data class BoundedBackoffPolicy(
 }
 
 /**
- * Redacts sensitive tokens, API keys, bearer tokens, and App Check headers from any diagnostic
- * or exception string before storing in state or logs.
+ * Redacts sensitive tokens, API keys, bearer tokens, App Check headers, resumption handles,
+ * contact information, transcripts, raw audio payloads, and unfiltered exception messages
+ * from any diagnostic string before storing in state, logs, or COPY DIAG snapshots.
  */
 object DiagnosticRedactor {
     private val apiKeyRegex = Regex("AIza[0-9A-Za-z\\-_]{20,}")
     private val bearerRegex = Regex("(?i)Bearer\\s+[A-Za-z0-9\\-._~+/]+=*")
     private val appCheckRegex = Regex("(?i)(x-firebase-appcheck\\s*:\\s*)([^\\s,;]+)")
-    private val queryTokenRegex = Regex("(?i)(access_token|key|token|secret)=([^&\\s]+)")
+    private val appCheckParamRegex = Regex("(?i)(app[_-]?check[_-]?token|attestation[_-]?token)\\s*[:=]\\s*[\"']?([^\\s\"',;}]+)[\"']?")
+    private val queryTokenRegex = Regex("(?i)(access_token|api_key|apikey|key|token|secret|password|credential)\\s*[:=]\\s*[\"']?([^&\\s\"',;}]+)[\"']?")
     private val jwtRegex = Regex("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{4,}\\.[A-Za-z0-9_-]{3,}")
+    private val resumptionKeyValRegex = Regex("(?i)(resumption[_-]?handle|session[_-]?resumption[_-]?handle|session[_-]?handle|resume[_-]?token|resumption[_-]?token)\\s*[:=]\\s*[\"']?([^\\s\"',;}]+)[\"']?")
+    private val resumptionTokenLiteralRegex = Regex("(?i)\\b(resumption_handle_[A-Za-z0-9_\\-.]+|resume_handle_[A-Za-z0-9_\\-.]+|sess_resume_[A-Za-z0-9_\\-.]+)\\b")
+    private val emailRegex = Regex("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+    private val phoneRegex = Regex("(?<!\\d)(?:\\+\\d{1,3}[\\s.-]?)?(?:\\(\\d{3}\\)|\\d{3})[\\s.-]\\d{3}[\\s.-]\\d{4}(?!\\d)|(?<!\\d)\\+\\d{1,3}[\\s.-]?\\d{2,4}[\\s.-]?\\d{3,4}[\\s.-]?\\d{3,4}(?!\\d)")
+    private val spokenTranscriptLabelRegex = Regex("(?i)(Heard|Gemini|User|Assistant|inputTranscript|outputTranscript|transcript)\\s*[:=]\\s*\"[^\"]*\"")
+    private val rawPcmOrBase64AudioRegex = Regex("(?i)(pcmBytes|rawAudio|audioBase64|inlineData)\\s*[:=]\\s*\\[?[^\\],;}]+\\]?")
+    private val unfilteredExceptionRegex = Regex("([a-zA-Z0-9_]+\\.)+[A-Za-z0-9_$]*(Exception|Error|Throwable)\\s*:\\s*[^\\n\\r;|]+")
+    private val stackTraceLineRegex = Regex("(?m)^\\s*at\\s+[A-Za-z0-9_$.]+\\([^)]*\\).*$")
 
     fun redact(raw: String?): String {
         if (raw.isNullOrBlank()) return "NONE"
         return raw
             .replace(apiKeyRegex, "[REDACTED_API_KEY]")
             .replace(appCheckRegex, "$1[REDACTED_APP_CHECK_TOKEN]")
+            .replace(appCheckParamRegex, "$1=[REDACTED_APP_CHECK_TOKEN]")
+            .replace(resumptionKeyValRegex, "$1=[REDACTED_RESUMPTION_HANDLE]")
+            .replace(resumptionTokenLiteralRegex, "[REDACTED_RESUMPTION_HANDLE]")
             .replace(bearerRegex, "Bearer [REDACTED_BEARER_TOKEN]")
             .replace(queryTokenRegex, "$1=[REDACTED_API_KEY]")
             .replace(jwtRegex, "[REDACTED_BEARER_TOKEN]")
+            .replace(emailRegex, "[REDACTED_CONTACT_EMAIL]")
+            .replace(phoneRegex, "[REDACTED_CONTACT_PHONE]")
             .take(320)
+    }
+
+    /**
+     * Strict diagnostic redaction for COPY DIAG snapshots and error history entries:
+     * excludes transcripts, raw audio dumps, credentials, App Check tokens, resumption handles,
+     * contact information, and unfiltered exception messages/stack traces.
+     */
+    fun redactForDiagnostics(raw: String?): String {
+        if (raw.isNullOrBlank()) return "NONE"
+        val base = redact(raw)
+        return base
+            .replace(spokenTranscriptLabelRegex, "$1=[REDACTED_TRANSCRIPT]")
+            .replace(rawPcmOrBase64AudioRegex, "$1=[REDACTED_RAW_AUDIO]")
+            .replace(unfilteredExceptionRegex, "[REDACTED_EXCEPTION_DETAIL]")
+            .replace(stackTraceLineRegex, "[REDACTED_STACK_FRAME]")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .ifBlank { "NONE" }
+            .take(280)
     }
 }
 
@@ -204,7 +271,9 @@ sealed interface LiveSocketCallbackEvent {
 
     data class SetupAccepted(
         override val generationId: LiveSessionGenerationId,
-        val serverNote: String = "BidiGenerateContent setup accepted by server"
+        val serverNote: String = "BidiGenerateContent setup accepted by server",
+        val resumedWithServerHandle: Boolean = false,
+        val handleRejectedFallbackUsed: Boolean = false
     ) : LiveSocketCallbackEvent
 
     data class HandshakeFailed(
@@ -216,6 +285,23 @@ sealed interface LiveSocketCallbackEvent {
     data class SocketClosedRemotely(
         override val generationId: LiveSessionGenerationId,
         val reason: String
+    ) : LiveSocketCallbackEvent
+
+    data class ServerGoAwayReceived(
+        override val generationId: LiveSessionGenerationId,
+        val timeLeftMs: Long?,
+        val reason: String
+    ) : LiveSocketCallbackEvent
+
+    /**
+     * Redacted notification that the server sent a [com.google.firebase.ai.type.LiveSessionResumptionUpdate].
+     * Never carries the raw handle string outside the transport driver's private session store.
+     */
+    data class SessionResumptionUpdated(
+        override val generationId: LiveSessionGenerationId,
+        val resumable: Boolean,
+        val hasScopedHandle: Boolean,
+        val lastConsumedClientMessageIndex: Int? = null
     ) : LiveSocketCallbackEvent
 
     data class ServerAudioChunkReceived(
@@ -252,7 +338,7 @@ sealed interface LiveSocketCallbackEvent {
 }
 
 /**
- * Redacted, user-visible and test-verifiable configuration & session diagnostics for Phase 03–06A.
+ * Redacted, user-visible and test-verifiable configuration & session diagnostics for Phase 03–07C.
  */
 data class RedactedLiveDiagnostics(
     val modelId: String = LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID,
@@ -272,6 +358,16 @@ data class RedactedLiveDiagnostics(
     val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: Int = LiveConfigConstants.REGISTERED_ACTION_TOOLS_COUNT,
+    val contextWindowCompressionEnabled: Boolean = true,
+    val sessionResumptionEnabled: Boolean = true,
+    val sessionResumptionStatus: String = SessionResumptionStatus.ENABLED_AWAITING_HANDLE.wireCode,
+    val contextRestorationStatus: String = ContextRestorationStatus.INITIAL_NEW_SESSION.wireCode,
+    val hasScopedResumptionHandle: Boolean = false,
+    val sessionResumptionUpdatesReceived: Int = 0,
+    val sessionResumptionSuccessCount: Int = 0,
+    val sessionResumptionFallbackCount: Int = 0,
+    val serverGoAwayCount: Int = 0,
+    val lastServerGoAwayTimeLeftMs: Long? = null,
     val systemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION,
     val redactedSummary: String = "Live adapter initialized. No credentials in APK/logs. Audio playback not claimed in Phase 03."
 )
@@ -296,6 +392,16 @@ data class LiveConnectionState(
     val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: BooleanOrIntCount = 0,
+    val contextWindowCompressionEnabled: Boolean = true,
+    val sessionResumptionEnabled: Boolean = true,
+    val sessionResumptionStatus: SessionResumptionStatus = SessionResumptionStatus.ENABLED_AWAITING_HANDLE,
+    val contextRestorationStatus: ContextRestorationStatus = ContextRestorationStatus.INITIAL_NEW_SESSION,
+    val hasScopedResumptionHandle: Boolean = false,
+    val sessionResumptionUpdatesReceived: Int = 0,
+    val sessionResumptionSuccessCount: Int = 0,
+    val sessionResumptionFallbackCount: Int = 0,
+    val serverGoAwayCount: Int = 0,
+    val lastServerGoAwayTimeLeftMs: Long? = null,
     val autoRetryStoppedReason: String? = null,
     val statusHeadline: String = "LIVE ADAPTER READY (DISCONNECTED)",
     val statusDetail: String = "Ready to verify ${LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID} handshake via Firebase AI Logic (${LiveConfigConstants.LIVE_API_VERSION}).",
@@ -303,3 +409,4 @@ data class LiveConnectionState(
 )
 
 private typealias BooleanOrIntCount = Int
+

@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.security.MessageDigest
 
 plugins {
   alias(libs.plugins.android.application)
@@ -6,6 +7,52 @@ plugins {
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.secrets)
   alias(libs.plugins.google.services)
+}
+
+fun computeReproducibleSourceFingerprint(projectDir: java.io.File): String {
+  val digest = MessageDigest.getInstance("SHA-256")
+  val sourceFiles = buildList {
+    val mainJava = projectDir.resolve("src/main/java")
+    if (mainJava.exists()) {
+      addAll(
+        mainJava.walkTopDown()
+          .filter { it.isFile && it.extension == "kt" }
+          .sortedBy { it.relativeTo(projectDir).invariantSeparatorsPath }
+          .toList()
+      )
+    }
+    val manifestFile = projectDir.resolve("src/main/AndroidManifest.xml")
+    if (manifestFile.isFile) {
+      add(manifestFile)
+    }
+  }
+  for (file in sourceFiles) {
+    val relPath = file.relativeTo(projectDir).invariantSeparatorsPath
+    digest.update(relPath.toByteArray(Charsets.UTF_8))
+    digest.update(0)
+    val normalizedText = file.readText(Charsets.UTF_8).replace("\r\n", "\n")
+    digest.update(normalizedText.toByteArray(Charsets.UTF_8))
+    digest.update(0)
+  }
+  return digest.digest().take(6).joinToString("") { "%02x".format(it) }
+}
+
+fun resolveGitRevisionOrNull(rootDir: java.io.File): String? {
+  val envRev = System.getenv("SOURCE_REVISION")?.trim()?.takeIf {
+    it.isNotEmpty() && it != "SOURCE_REVISION_UNAVAILABLE"
+  }
+  if (envRev != null) return envRev
+  val headFile = rootDir.resolve(".git/HEAD")
+  if (!headFile.isFile) return null
+  val headContent = headFile.readText(Charsets.UTF_8).trim()
+  if (headContent.isEmpty()) return null
+  return if (headContent.startsWith("ref:")) {
+    val refPath = headContent.removePrefix("ref:").trim()
+    val refFile = rootDir.resolve(".git/$refPath")
+    if (refFile.isFile) refFile.readText(Charsets.UTF_8).trim().take(12).ifEmpty { null } else null
+  } else {
+    headContent.take(12)
+  }
 }
 
 android {
@@ -16,13 +63,25 @@ android {
     applicationId = "com.kazim.omnivoice.rebuild"
     minSdk = 24
     targetSdk = 36
-    versionCode = 3
-    versionName = "0.3.0-phase03"
+    versionCode = 7
+    versionName = "0.7.0-phase07"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-    buildConfigField("String", "SOURCE_BUILD_ID", "\"ov-rebuild-p03-20261111\"")
-    buildConfigField("String", "PHASE_NAME", "\"Phase 03 - Gemini Live Connection Adapter & Diagnostics\"")
+    val sourceFingerprintHex = computeReproducibleSourceFingerprint(projectDir)
+    val sourceFingerprint = "sha256-$sourceFingerprintHex"
+    val gitRev = resolveGitRevisionOrNull(rootDir)
+    val sourceRevision = gitRev ?: "SOURCE_REVISION_UNAVAILABLE"
+    val derivedBuildId = if (gitRev != null) {
+      "ov-rebuild-p07-$versionName-git-$gitRev-$sourceFingerprint"
+    } else {
+      "ov-rebuild-p07-$versionName-$sourceFingerprint"
+    }
+
+    buildConfigField("String", "SOURCE_BUILD_ID", "\"$derivedBuildId\"")
+    buildConfigField("String", "SOURCE_REVISION", "\"$sourceRevision\"")
+    buildConfigField("String", "SOURCE_FINGERPRINT", "\"$sourceFingerprint\"")
+    buildConfigField("String", "PHASE_NAME", "\"Phase 07 - Stabilization, Timing & Bounded Recovery\"")
     buildConfigField("String", "MODEL_CONFIG_STATUS", "\"LIVE_ADAPTER_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta)\"")
     buildConfigField("String", "LIVE_MODEL_ID", "\"gemini-3.1-flash-live-preview\"")
     buildConfigField("String", "LIVE_API_VERSION", "\"v1beta (Firebase AI Logic Managed WebSocket)\"")

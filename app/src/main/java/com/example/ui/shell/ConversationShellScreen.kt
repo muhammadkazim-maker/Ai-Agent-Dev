@@ -2,6 +2,8 @@ package com.example.ui.shell
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -233,6 +235,18 @@ fun ConversationShellRoute(
         baseDensity
     }
 
+    val copyDiagnosticsToClipboard: () -> String = {
+        val redactedSnapshot = viewModel.getRedactedDiagnosticsSnapshot()
+        try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(
+                ClipData.newPlainText("OmniVoice Redacted Diagnostics", redactedSnapshot)
+            )
+        } catch (_: Throwable) {
+        }
+        redactedSnapshot
+    }
+
     CompositionLocalProvider(LocalDensity provides effectiveDensity) {
         when (activeScreen) {
             ActiveScreen.MICROPHONE_SETUP -> {
@@ -266,6 +280,7 @@ fun ConversationShellRoute(
                     onDisconnectLiveSession = { viewModel.onDisconnectLiveSessionClicked() },
                     onLargeStopAll = { viewModel.onStopClicked() },
                     onNavigateBack = viewModel::onNavigateBackFromLiveDiagnostics,
+                    onCopyDiagnostics = { copyDiagnosticsToClipboard() },
                     onScreenActive = viewModel::onLiveDiagnosticsScreenActive,
                     onScreenDisposed = viewModel::onLiveDiagnosticsScreenDisposed,
                     modifier = modifier
@@ -289,6 +304,7 @@ fun ConversationShellRoute(
                     onSelectInactivityTimeout = viewModel::onSelectInactivityTimeout,
                     onOpenMicSetup = viewModel::onOpenMicSetup,
                     onOpenLiveDiagnostics = viewModel::onOpenLiveDiagnostics,
+                    onCopyDiagnostics = copyDiagnosticsToClipboard,
                     onOpenSettings = viewModel::onOpenSettings,
                     onDismissSettings = viewModel::onDismissSettings,
                     onSelectFontScale = viewModel::onSetFontScaleOverride,
@@ -316,6 +332,7 @@ fun ConversationShellScreen(
     onSelectInactivityTimeout: (InactivityTimeoutOption) -> Unit = {},
     onOpenMicSetup: () -> Unit = {},
     onOpenLiveDiagnostics: () -> Unit = {},
+    onCopyDiagnostics: () -> String = { "" },
     onOpenSettings: () -> Unit,
     onDismissSettings: () -> Unit,
     onSelectFontScale: (Float?) -> Unit,
@@ -351,6 +368,7 @@ fun ConversationShellScreen(
                     isLandscapeLayout = isLandscapeLayout,
                     onOpenMicSetup = onOpenMicSetup,
                     onOpenLiveDiagnostics = onOpenLiveDiagnostics,
+                    onCopyDiagnostics = { onCopyDiagnostics() },
                     onOpenSettings = onOpenSettings
                 )
 
@@ -470,6 +488,7 @@ private fun TopTelemetryHeader(
     isLandscapeLayout: Boolean,
     onOpenMicSetup: () -> Unit,
     onOpenLiveDiagnostics: () -> Unit,
+    onCopyDiagnostics: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     Surface(
@@ -528,6 +547,23 @@ private fun TopTelemetryHeader(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
+                    OutlinedButton(
+                        onClick = onCopyDiagnostics,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .semantics {
+                                contentDescription = "Copy redacted Phase 07A diagnostic snapshot to clipboard"
+                            }
+                            .testTag("copy_diag_button")
+                    ) {
+                        Text(
+                            text = stringResource(R.string.action_copy_diag),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
                     IconButton(
                         onClick = onOpenLiveDiagnostics,
                         modifier = Modifier
@@ -997,7 +1033,7 @@ private fun VoiceTurnPipelineCard(
                     tag = "voice_turn_mic_metrics"
                 )
                 TelemetryChip(
-                    label = "AUDIOTRACK: played=${playSnap.hardwarePlaybackHeadFrames}/${playSnap.totalFramesWrittenToHardware} accepted (recv=${playSnap.framesReceivedFromServer}, ${playSnap.chunksReceived} chunks • s=${playSnap.trackState}/p=${playSnap.playState})",
+                    label = "AUDIOTRACK: played=${playSnap.hardwarePlaybackHeadFrames}/${playSnap.totalFramesWrittenToHardware} accepted (recv=${playSnap.framesReceivedFromServer}, q=${playSnap.queuedFrames}, pad=${playSnap.paddingFramesWrittenToHardware}, ${playSnap.chunksReceived} chunks • s=${playSnap.trackState}/p=${playSnap.playState})",
                     tag = "voice_turn_playback_metrics"
                 )
                 TelemetryChip(

@@ -246,6 +246,8 @@ class ConversationShellViewModel(
         coordinator.startLiveNetworkMonitoring()
     }
 
+    fun getRedactedDiagnosticsSnapshot(): String = coordinator.generateRedactedDiagnosticSnapshot()
+
     fun onLiveDiagnosticsScreenDisposed() {
         synchronized(jobLock) {
             activeLiveConnectJob?.cancel()

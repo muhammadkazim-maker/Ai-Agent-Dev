@@ -197,6 +197,8 @@ data class AudioTrackDiagnostics(
     val trackInstanceId: Long = 0L,
     val lastWriteCode: Int = 0,
     val underrunCount: Int = 0,
+    val paddingFramesWritten: Long = 0L,
+    val paddingBytesWritten: Long = 0L,
     val diagnostic: String = "NONE"
 )
 
@@ -221,6 +223,13 @@ object AudioTrackErrorMapper {
 
 /**
  * Immutable state snapshot of the single [LiveAudioPlaybackAdapter].
+ *
+ * Frame accounting invariant:
+ * - [framesReceivedFromServer] (`recv`): Content PCM frames received from Gemini Live.
+ * - [queuedFrames] (`queued`): Content PCM frames currently waiting in the adapter's FIFO queue (`queuedBytes / bytesPerFrame`).
+ * - [totalFramesWrittenToHardware] (`accepted`): Content PCM frames accepted by `AudioTrack.write` (`recv - queued` when no write is in-flight).
+ * - [hardwarePlaybackHeadFrames] (`played`): Hardware playback head frames reported by `AudioTrack.playbackHeadPosition`.
+ * - [paddingFramesWrittenToHardware] (`padding`): Silence cushion/deficit frames written at stream end (`finishStreamForDrain`), tracked strictly separately from [totalFramesWrittenToHardware] and [framesReceivedFromServer].
  */
 data class LiveAudioPlaybackState(
     val activeGeneration: PlaybackGenerationId? = null,
@@ -239,6 +248,9 @@ data class LiveAudioPlaybackState(
     val bytesAcceptedByHardware: Long = 0L,
     val totalFramesWrittenToHardware: Long = 0L,
     val hardwarePlaybackHeadFrames: Long = 0L,
+    val paddingFramesWrittenToHardware: Long = 0L,
+    val paddingBytesWrittenToHardware: Long = 0L,
+    val lastHardwareProgressAtMs: Long = 0L,
     val partialWriteCount: Int = 0,
     val zeroWriteRetryCount: Int = 0,
     val stalePlaybackCallbacksDropped: Int = 0,
@@ -260,4 +272,17 @@ data class LiveAudioPlaybackState(
     val lastProcessedChunkSequence: Long = 0L,
     val lastError: String? = null,
     val statusDetail: String = "Streaming playback adapter idle."
-)
+) {
+    val queuedFrames: Long
+        get() = (framesReceivedFromServer - totalFramesWrittenToHardware).coerceAtLeast(0L)
+
+    val bufferedHardwareFrames: Long
+        get() = (totalFramesWrittenToHardware - hardwarePlaybackHeadFrames).coerceAtLeast(0L)
+
+    val hasPendingLocalPlaybackWork: Boolean
+        get() = queuedBytes > 0L ||
+            queuedFrames > 0L ||
+            (isPlaying && hardwarePlaybackHeadFrames < totalFramesWrittenToHardware) ||
+            isDrainingHardware
+}
+

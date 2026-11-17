@@ -66,6 +66,7 @@ fun LiveDiagnosticsScreen(
     onDisconnectLiveSession: () -> Unit,
     onLargeStopAll: () -> Unit,
     onNavigateBack: () -> Unit,
+    onCopyDiagnostics: () -> Unit = {},
     onScreenActive: () -> Unit = {},
     onScreenDisposed: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -104,7 +105,8 @@ fun LiveDiagnosticsScreen(
             ) {
                 LiveDiagnosticsTopBar(
                     liveState = liveState,
-                    onNavigateBack = onNavigateBack
+                    onNavigateBack = onNavigateBack,
+                    onCopyDiagnostics = onCopyDiagnostics
                 )
 
                 if (isLandscape) {
@@ -174,7 +176,8 @@ fun LiveDiagnosticsScreen(
 @Composable
 private fun LiveDiagnosticsTopBar(
     liveState: LiveConnectionState,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onCopyDiagnostics: () -> Unit
 ) {
     Surface(
         modifier = Modifier
@@ -219,6 +222,18 @@ private fun LiveDiagnosticsTopBar(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                OutlinedButton(
+                    onClick = onCopyDiagnostics,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("live_diag_copy_button")
+                ) {
+                    Text(
+                        text = "COPY DIAG",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
@@ -445,6 +460,20 @@ private fun RedactedDiagnosticsPane(
                 DiagnosticChip(
                     label = "CAND: ${uiState.consecutiveSpeechDurationMs}ms (${uiState.vadCandidateConfirmationCount}w) • ACT_START: ${uiState.activityStartCount}",
                     tag = "live_diag_vad_candidate_label"
+                )
+                DiagnosticChip(
+                    label = "RESUMPTION: ${liveState.sessionResumptionStatus.wireCode} • RESTORE: ${liveState.contextRestorationStatus.wireCode} • GOAWAY: ${liveState.serverGoAwayCount}",
+                    tag = "live_diag_resumption_label"
+                )
+                DiagnosticChip(
+                    label = "STALLS: server=${uiState.serverOutputStallCount}, missingComplete=${uiState.missingTurnCompleteCount}, hw=${uiState.hardwarePlaybackStallCount}",
+                    tag = "live_diag_stall_counts_label"
+                )
+                val perf = uiState.performanceSummary
+                val estMedianText = perf.outputStartLatencyEstimateDistribution.medianValue?.let { "${it}ms" } ?: "UNAVAILABLE"
+                DiagnosticChip(
+                    label = "PERF (n=${perf.recordedWindowTurnCount}/${perf.maxBoundedTurnWindow}): ${perf.roadmapTargetStatus} • estMedian=$estMedianText",
+                    tag = "live_diag_perf_summary_label"
                 )
             }
 

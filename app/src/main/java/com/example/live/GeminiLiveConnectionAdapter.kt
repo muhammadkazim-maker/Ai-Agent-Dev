@@ -5,15 +5,19 @@ import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.ActivityDetectionConfig
 import com.google.firebase.ai.type.AudioTranscriptionConfig
+import com.google.firebase.ai.type.ContextWindowCompressionConfig
 import com.google.firebase.ai.type.GenerativeBackend
 import com.google.firebase.ai.type.InlineData
 import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.LiveServerContent
 import com.google.firebase.ai.type.LiveServerGoAway
 import com.google.firebase.ai.type.LiveServerSetupComplete
+import com.google.firebase.ai.type.LiveSessionResumptionUpdate
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.RealtimeInputConfig
 import com.google.firebase.ai.type.ResponseModality
+import com.google.firebase.ai.type.SessionResumptionConfig
+import com.google.firebase.ai.type.SlidingWindow
 import com.google.firebase.ai.type.SpeechConfig
 import com.google.firebase.ai.type.TextPart
 import com.google.firebase.ai.type.Voice
@@ -64,7 +68,9 @@ import kotlinx.coroutines.yield
 sealed interface LiveHandshakeResult {
     data class Accepted(
         val generationId: LiveSessionGenerationId,
-        val serverNote: String
+        val serverNote: String,
+        val resumedWithServerHandle: Boolean = false,
+        val handleRejectedFallbackUsed: Boolean = false
     ) : LiveHandshakeResult
 
     data class Failed(
@@ -106,6 +112,10 @@ interface LiveTransportDriver {
     fun isReceiverCollectorAttached(
         generationId: LiveSessionGenerationId
     ): Boolean = true
+
+    fun hasScopedResumptionHandle(sessionId: SessionId): Boolean = false
+
+    fun clearScopedResumptionState(sessionId: SessionId? = null) {}
 
     fun closeSocket(generationId: LiveSessionGenerationId?)
 
@@ -190,6 +200,17 @@ object LiveExceptionClassifier {
         return when {
             lower.contains("cancel") || lower.contains("operator_stop") || lower.contains("operator_pause") ->
                 LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE
+            lower.contains("session_expired_or_go_away") ||
+                lower.contains("liveservergoaway") ||
+                lower.contains("go_away") ||
+                lower.contains("goaway") ||
+                lower.contains("session expired") ||
+                lower.contains("session_expired") ||
+                lower.contains("timeleft=") ->
+                LiveFailureClassification.SESSION_EXPIRED_OR_GO_AWAY
+            lower.contains("local_configuration_failure") ||
+                lower.contains("vad_model_load_failed") ->
+                LiveFailureClassification.LOCAL_CONFIGURATION_FAILURE
             hasAuthOrAppCheckIndicator(lower) ->
                 LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK
             hasQuotaIndicator(lower) ->
@@ -371,6 +392,9 @@ class FirebaseAiLiveTransportDriver(
     private var activeReceiveJob: Job? = null
     private val closingGenerations = LinkedHashSet<LiveSessionGenerationId>()
     private val closedSessions = Collections.newSetFromMap(IdentityHashMap<com.google.firebase.ai.type.LiveSession, Boolean>())
+    // Private session-scoped resumption handle store. Never exposed outside this driver.
+    private val scopedResumptionHandles = LinkedHashMap<String, String>()
+    private val scopedResumableStatus = LinkedHashMap<String, Boolean>()
     private val driverScope = CoroutineScope(SupervisorJob() + ioDispatcher)
 
     private fun logDriver(message: String) {
@@ -378,6 +402,47 @@ class FirebaseAiLiveTransportDriver(
             android.util.Log.i("OmniVoiceLive", DiagnosticRedactor.redact(message))
         } catch (_: Throwable) {
         }
+    }
+
+    override fun hasScopedResumptionHandle(sessionId: SessionId): Boolean {
+        return synchronized(lock) {
+            val handle = scopedResumptionHandles[sessionId.value]
+            val resumable = scopedResumableStatus[sessionId.value] ?: true
+            !handle.isNullOrBlank() && resumable
+        }
+    }
+
+    override fun clearScopedResumptionState(sessionId: SessionId?) {
+        synchronized(lock) {
+            if (sessionId == null) {
+                scopedResumptionHandles.clear()
+                scopedResumableStatus.clear()
+            } else {
+                scopedResumptionHandles.remove(sessionId.value)
+                scopedResumableStatus.remove(sessionId.value)
+            }
+        }
+    }
+
+    private fun storeScopedResumptionUpdateLocked(
+        sessionId: SessionId,
+        newHandle: String?,
+        resumable: Boolean?
+    ): Boolean {
+        while (scopedResumptionHandles.size >= 8 && !scopedResumptionHandles.containsKey(sessionId.value)) {
+            val oldestKey = scopedResumptionHandles.keys.firstOrNull() ?: break
+            scopedResumptionHandles.remove(oldestKey)
+            scopedResumableStatus.remove(oldestKey)
+        }
+        val effectiveResumable = resumable ?: (!newHandle.isNullOrBlank())
+        scopedResumableStatus[sessionId.value] = effectiveResumable
+        if (!newHandle.isNullOrBlank() && effectiveResumable) {
+            scopedResumptionHandles[sessionId.value] = newHandle
+        } else if (resumable == false) {
+            scopedResumptionHandles.remove(sessionId.value)
+        }
+        val currentHandle = scopedResumptionHandles[sessionId.value]
+        return !currentHandle.isNullOrBlank() && effectiveResumable
     }
 
     private suspend fun closeSessionOnce(session: com.google.firebase.ai.type.LiveSession?) {
@@ -489,6 +554,9 @@ class FirebaseAiLiveTransportDriver(
                     )
                     inputAudioTranscription = AudioTranscriptionConfig()
                     outputAudioTranscription = AudioTranscriptionConfig()
+                    contextWindowCompression = ContextWindowCompressionConfig(
+                        slidingWindow = SlidingWindow()
+                    )
                     realtimeInputConfig = RealtimeInputConfig.builder()
                         .setActivityHandling(RealtimeInputConfig.ActivityHandling.NO_INTERRUPT)
                         .setAutomaticActivityDetection(ActivityDetectionConfig.disabled())
@@ -504,9 +572,46 @@ class FirebaseAiLiveTransportDriver(
                     systemInstruction = sysInstructionContent
                 )
 
+                val candidateHandle = synchronized(lock) {
+                    val resumable = scopedResumableStatus[generationId.sessionId.value] ?: true
+                    if (resumable) scopedResumptionHandles[generationId.sessionId.value] else null
+                }
+
+                var resumedWithHandle = false
+                var handleRejectedFallbackUsed = false
+
                 val session = withContext(ioDispatcher) {
-                    withTimeout(handshakeTimeoutMs) {
-                        liveModel.connect()
+                    if (!candidateHandle.isNullOrBlank()) {
+                        try {
+                            val connected = withTimeout(handshakeTimeoutMs) {
+                                liveModel.connect(SessionResumptionConfig(handle = candidateHandle))
+                            }
+                            resumedWithHandle = true
+                            connected
+                        } catch (handleErr: Throwable) {
+                            if (handleErr is CancellationException && handleErr !is TimeoutCancellationException) {
+                                throw handleErr
+                            }
+                            val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                            if (!validatedNow) {
+                                throw handleErr
+                            }
+                            // Clear rejected or expired handle and fall back to a clean connection without the handle
+                            synchronized(lock) {
+                                scopedResumptionHandles.remove(generationId.sessionId.value)
+                                scopedResumableStatus.remove(generationId.sessionId.value)
+                            }
+                            resumedWithHandle = false
+                            handleRejectedFallbackUsed = true
+                            logDriver("SESSION_RESUMPTION_HANDLE_REJECTED: Cleared rejected/expired handle for ${generationId.sessionId.value} and falling back to clean connection.")
+                            withTimeout(handshakeTimeoutMs) {
+                                liveModel.connect(SessionResumptionConfig())
+                            }
+                        }
+                    } else {
+                        withTimeout(handshakeTimeoutMs) {
+                            liveModel.connect(SessionResumptionConfig())
+                        }
                     }
                 }
 
@@ -595,15 +700,44 @@ class FirebaseAiLiveTransportDriver(
                                         onSocketEvent(
                                             LiveSocketCallbackEvent.SetupAccepted(
                                                 generationId = generationId,
-                                                serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}"
+                                                serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}",
+                                                resumedWithServerHandle = resumedWithHandle,
+                                                handleRejectedFallbackUsed = handleRejectedFallbackUsed
+                                            )
+                                        )
+                                    }
+                                    is LiveSessionResumptionUpdate -> {
+                                        val hasHandleNow = synchronized(lock) {
+                                            storeScopedResumptionUpdateLocked(
+                                                sessionId = generationId.sessionId,
+                                                newHandle = message.newHandle,
+                                                resumable = message.resumable
+                                            )
+                                        }
+                                        onSocketEvent(
+                                            LiveSocketCallbackEvent.SessionResumptionUpdated(
+                                                generationId = generationId,
+                                                resumable = message.resumable ?: hasHandleNow,
+                                                hasScopedHandle = hasHandleNow,
+                                                lastConsumedClientMessageIndex = message.lastConsumedClientMessageIndex
                                             )
                                         )
                                     }
                                     is LiveServerGoAway -> {
+                                        val goAwayMs = message.timeLeft?.inWholeMilliseconds
+                                        val goAwayReason =
+                                            "SESSION_EXPIRED_OR_GO_AWAY: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${goAwayMs ?: "UNSPECIFIED"})"
+                                        onSocketEvent(
+                                            LiveSocketCallbackEvent.ServerGoAwayReceived(
+                                                generationId = generationId,
+                                                timeLeftMs = goAwayMs,
+                                                reason = goAwayReason
+                                            )
+                                        )
                                         onSocketEvent(
                                             LiveSocketCallbackEvent.SocketClosedRemotely(
                                                 generationId = generationId,
-                                                reason = "LiveServerGoAway received from Gemini Live endpoint (timeLeft=${message.timeLeft})"
+                                                reason = goAwayReason
                                             )
                                         )
                                     }
@@ -666,6 +800,12 @@ class FirebaseAiLiveTransportDriver(
                     ?: immediateFailure.get()
                 if (earlyError != null) {
                     closeAndAwaitSocket(generationId)
+                    if (resumedWithHandle) {
+                        synchronized(lock) {
+                            scopedResumptionHandles.remove(generationId.sessionId.value)
+                            scopedResumableStatus.remove(generationId.sessionId.value)
+                        }
+                    }
                     val validatedNow = networkMonitor?.isInternetValidated() ?: true
                     val classification = LiveExceptionClassifier.classify(
                         throwable = earlyError,
@@ -693,17 +833,26 @@ class FirebaseAiLiveTransportDriver(
                 }
 
                 handshakeReturnedAccepted = true
+                val contextNote = when {
+                    resumedWithHandle -> "context=RESUMED_WITH_SERVER_HANDLE"
+                    handleRejectedFallbackUsed -> "context=NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT(handleRejectedFallback)"
+                    else -> "context=SESSION_RESUMPTION_ENABLED_COMPRESSION_SLIDING_WINDOW"
+                }
                 val acceptedNote =
-                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent ($modelId, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, tools=0, collector=ATTACHED)"
+                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent ($modelId, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, tools=0, collector=ATTACHED, $contextNote)"
                 onSocketEvent(
                     LiveSocketCallbackEvent.SetupAccepted(
                         generationId = generationId,
-                        serverNote = acceptedNote
+                        serverNote = acceptedNote,
+                        resumedWithServerHandle = resumedWithHandle,
+                        handleRejectedFallbackUsed = handleRejectedFallbackUsed
                     )
                 )
                 LiveHandshakeResult.Accepted(
                     generationId = generationId,
-                    serverNote = acceptedNote
+                    serverNote = acceptedNote,
+                    resumedWithServerHandle = resumedWithHandle,
+                    handleRejectedFallbackUsed = handleRejectedFallbackUsed
                 )
             } catch (t: Throwable) {
                 closeAndAwaitSocket(generationId)
@@ -895,6 +1044,80 @@ class DeterministicTestLiveTransportDriver(
 
     private var activeCallback: ((LiveSocketCallbackEvent) -> Unit)? = null
     private var lastConnectedGenId: LiveSessionGenerationId? = null
+    private val scopedResumptionHandles = mutableMapOf<String, String>()
+    private val scopedResumableFlags = mutableMapOf<String, Boolean>()
+    var rejectResumptionHandleOnNextConnect: Boolean = false
+    var resumedConnectCount: Int = 0
+        private set
+    var rejectedHandleFallbackCount: Int = 0
+        private set
+
+    override fun hasScopedResumptionHandle(sessionId: SessionId): Boolean {
+        val handle = scopedResumptionHandles[sessionId.value]
+        val resumable = scopedResumableFlags[sessionId.value] ?: true
+        return !handle.isNullOrBlank() && resumable
+    }
+
+    override fun clearScopedResumptionState(sessionId: SessionId?) {
+        if (sessionId == null) {
+            scopedResumptionHandles.clear()
+            scopedResumableFlags.clear()
+        } else {
+            scopedResumptionHandles.remove(sessionId.value)
+            scopedResumableFlags.remove(sessionId.value)
+        }
+    }
+
+    /**
+     * Simulates the server sending a [LiveSessionResumptionUpdate] while keeping the raw handle
+     * strictly private inside the transport driver.
+     */
+    fun simulateServerResumptionUpdateForTest(
+        generationId: LiveSessionGenerationId,
+        rawHandle: String?,
+        resumable: Boolean = true,
+        lastConsumedClientMessageIndex: Int? = null
+    ) {
+        val sessionKey = generationId.sessionId.value
+        scopedResumableFlags[sessionKey] = resumable
+        if (!rawHandle.isNullOrBlank() && resumable) {
+            scopedResumptionHandles[sessionKey] = rawHandle
+        } else if (!resumable) {
+            scopedResumptionHandles.remove(sessionKey)
+        }
+        val hasHandleNow = hasScopedResumptionHandle(generationId.sessionId)
+        activeCallback?.invoke(
+            LiveSocketCallbackEvent.SessionResumptionUpdated(
+                generationId = generationId,
+                resumable = resumable,
+                hasScopedHandle = hasHandleNow,
+                lastConsumedClientMessageIndex = lastConsumedClientMessageIndex
+            )
+        )
+    }
+
+    /**
+     * Simulates the server sending a [LiveServerGoAway] notice on the active generation.
+     */
+    fun simulateServerGoAwayForTest(
+        generationId: LiveSessionGenerationId,
+        timeLeftMs: Long? = 5_000L
+    ) {
+        val reason = "SESSION_EXPIRED_OR_GO_AWAY: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${timeLeftMs ?: "UNSPECIFIED"})"
+        activeCallback?.invoke(
+            LiveSocketCallbackEvent.ServerGoAwayReceived(
+                generationId = generationId,
+                timeLeftMs = timeLeftMs,
+                reason = reason
+            )
+        )
+        activeCallback?.invoke(
+            LiveSocketCallbackEvent.SocketClosedRemotely(
+                generationId = generationId,
+                reason = reason
+            )
+        )
+    }
 
     override fun isReceiverCollectorAttached(generationId: LiveSessionGenerationId): Boolean {
         return lastConnectedGenId == generationId && isCollectorAttachedForCurrentGen
@@ -917,16 +1140,43 @@ class DeterministicTestLiveTransportDriver(
         receivedSystemInstructions.add(systemInstruction)
         lastReceivedVoiceName = voiceName
         receivedVoiceNames.add(voiceName)
+
+        val hadScopedHandle = hasScopedResumptionHandle(generationId.sessionId)
+        var resumedWithHandle = false
+        var handleRejectedFallback = false
+        if (hadScopedHandle) {
+            if (rejectResumptionHandleOnNextConnect) {
+                rejectResumptionHandleOnNextConnect = false
+                clearScopedResumptionState(generationId.sessionId)
+                handleRejectedFallback = true
+                rejectedHandleFallbackCount += 1
+            } else {
+                resumedWithHandle = true
+                resumedConnectCount += 1
+            }
+        }
+
         val wrappedCallback: (LiveSocketCallbackEvent) -> Unit = { event ->
             if (event is LiveSocketCallbackEvent.SetupAccepted && event.generationId == generationId) {
                 isSetupAcceptedForCurrentGen = true
+                onSocketEvent(
+                    event.copy(
+                        resumedWithServerHandle = event.resumedWithServerHandle || resumedWithHandle,
+                        handleRejectedFallbackUsed = event.handleRejectedFallbackUsed || handleRejectedFallback
+                    )
+                )
+            } else {
+                onSocketEvent(event)
             }
-            onSocketEvent(event)
         }
         activeCallback = wrappedCallback
         val result = scriptedHandler(generationId, modelId, attempt, wrappedCallback)
         if (result is LiveHandshakeResult.Accepted) {
             isSetupAcceptedForCurrentGen = true
+            return result.copy(
+                resumedWithServerHandle = result.resumedWithServerHandle || resumedWithHandle,
+                handleRejectedFallbackUsed = result.handleRejectedFallbackUsed || handleRejectedFallback
+            )
         }
         return result
     }
@@ -1016,6 +1266,15 @@ class GeminiLiveConnectionAdapter(
     private var eligibleForSingleAutoReconnect: Boolean = false
     private var autoReconnectPerformedForOutage: Boolean = false
     private var operatorHalted: Boolean = false
+    private val establishedSessionIds = LinkedHashSet<String>()
+
+    /**
+     * Optional coordinator predicate checked before initiating an automatic network-restore reconnect.
+     * Prevents competing reconnect loops when ConversationCoordinator is paused, stopped, or already
+     * executing a bounded recovery.
+     */
+    @Volatile
+    var canAutoReconnectOnNetworkRestore: () -> Boolean = { true }
 
     private val adapterScope = CoroutineScope(SupervisorJob() + backgroundDispatcher)
 
@@ -1051,6 +1310,30 @@ class GeminiLiveConnectionAdapter(
     private fun updateStateAndNotify(transform: (LiveConnectionState) -> LiveConnectionState) {
         _state.update(transform)
         onStateChanged?.invoke(_state.value)
+    }
+
+    fun clearSessionResumptionState(sessionId: SessionId? = null) {
+        effectiveDriver.clearScopedResumptionState(sessionId)
+        synchronized(lock) {
+            if (sessionId == null) {
+                establishedSessionIds.clear()
+            } else {
+                establishedSessionIds.remove(sessionId.value)
+            }
+            val hasHandle = effectiveDriver.hasScopedResumptionHandle(lastSessionId)
+            updateStateAndNotify { prev ->
+                prev.copy(
+                    sessionResumptionStatus = SessionResumptionStatus.CLEARED_ON_STOP_OR_RESET,
+                    contextRestorationStatus = ContextRestorationStatus.INITIAL_NEW_SESSION,
+                    hasScopedResumptionHandle = hasHandle,
+                    diagnostics = prev.diagnostics.copy(
+                        sessionResumptionStatus = SessionResumptionStatus.CLEARED_ON_STOP_OR_RESET.wireCode,
+                        contextRestorationStatus = ContextRestorationStatus.INITIAL_NEW_SESSION.wireCode,
+                        hasScopedResumptionHandle = hasHandle
+                    )
+                )
+            }
+        }
     }
 
     fun startNetworkMonitoring() {
@@ -1124,6 +1407,11 @@ class GeminiLiveConnectionAdapter(
 
         var shouldTriggerSingleReconnect = false
         val reconnectSessionId: SessionId
+        val coordinatorAllowsAutoReconnect = try {
+            canAutoReconnectOnNetworkRestore()
+        } catch (_: Throwable) {
+            true
+        }
         synchronized(lock) {
             val wasOffline =
                 !lastKnownValidated ||
@@ -1148,11 +1436,28 @@ class GeminiLiveConnectionAdapter(
                 return
             }
 
+            if (operatorHalted || !coordinatorAllowsAutoReconnect) {
+                eligibleForSingleAutoReconnect = false
+                val haltedDetail =
+                    "NETWORK_RESTORED: Validated internet restored while session is paused/stopped or managed by coordinator; automatic reconnect suppressed."
+                updateStateAndNotify { current ->
+                    current.copy(
+                        isInternetValidated = true,
+                        diagnostics = current.diagnostics.copy(
+                            isInternetValidated = true,
+                            redactedSummary = haltedDetail
+                        )
+                    )
+                }
+                return
+            }
+
             shouldTriggerSingleReconnect =
                 autoReconnectOnNetworkRestore &&
                     eligibleForSingleAutoReconnect &&
                     !autoReconnectPerformedForOutage &&
-                    !operatorHalted
+                    !operatorHalted &&
+                    coordinatorAllowsAutoReconnect
 
             if (shouldTriggerSingleReconnect) {
                 eligibleForSingleAutoReconnect = false
@@ -1279,6 +1584,38 @@ class GeminiLiveConnectionAdapter(
                         val collectorAttached =
                             effectiveDriver.isReceiverCollectorAttached(currentActive) &&
                                 onServerEventListener != null
+                        val sessionKey = currentActive.sessionId.value
+                        val hadPreviousConnectionInSession =
+                            establishedSessionIds.contains(sessionKey) &&
+                                _state.value.lastCompletedGeneration?.let {
+                                    it != currentActive && it.sessionId.value == sessionKey
+                                } == true
+                        while (establishedSessionIds.size >= 16 && !establishedSessionIds.contains(sessionKey)) {
+                            val oldest = establishedSessionIds.iterator().next()
+                            establishedSessionIds.remove(oldest)
+                        }
+                        establishedSessionIds.add(sessionKey)
+
+                        val hasScopedHandleNow = effectiveDriver.hasScopedResumptionHandle(currentActive.sessionId)
+                        val newContextStatus = when {
+                            event.resumedWithServerHandle ->
+                                ContextRestorationStatus.RESUMED_WITH_SERVER_HANDLE
+                            event.handleRejectedFallbackUsed || hadPreviousConnectionInSession ->
+                                ContextRestorationStatus.NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT
+                            else ->
+                                ContextRestorationStatus.INITIAL_NEW_SESSION
+                        }
+                        val newResumptionStatus = when {
+                            event.resumedWithServerHandle ->
+                                SessionResumptionStatus.RESUMED_WITH_SERVER_HANDLE
+                            event.handleRejectedFallbackUsed ->
+                                SessionResumptionStatus.HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION
+                            hasScopedHandleNow ->
+                                SessionResumptionStatus.HANDLE_AVAILABLE_RESUMABLE
+                            else ->
+                                SessionResumptionStatus.ENABLED_AWAITING_HANDLE
+                        }
+
                         updateStateAndNotify { prev ->
                             val preservedPhase = if (
                                 prev.phase == LiveConnectionPhase.ACTIVE &&
@@ -1287,6 +1624,17 @@ class GeminiLiveConnectionAdapter(
                                 LiveConnectionPhase.ACTIVE
                             } else {
                                 LiveConnectionPhase.SETUP_ACCEPTED
+                            }
+                            val alreadyCountedThisGen = prev.handshakeVerified && prev.activeGeneration == currentActive
+                            val newResumedCount = if (!alreadyCountedThisGen && event.resumedWithServerHandle) {
+                                prev.sessionResumptionSuccessCount + 1
+                            } else {
+                                prev.sessionResumptionSuccessCount
+                            }
+                            val newFallbackCount = if (!alreadyCountedThisGen && event.handleRejectedFallbackUsed) {
+                                prev.sessionResumptionFallbackCount + 1
+                            } else {
+                                prev.sessionResumptionFallbackCount
                             }
                             prev.copy(
                                 phase = preservedPhase,
@@ -1301,6 +1649,11 @@ class GeminiLiveConnectionAdapter(
                                 isReceiverCollectorAttached = collectorAttached,
                                 audioPlaybackClaimed = prev.audioPlaybackClaimed,
                                 registeredActionToolsCount = 0,
+                                sessionResumptionStatus = newResumptionStatus,
+                                contextRestorationStatus = newContextStatus,
+                                hasScopedResumptionHandle = hasScopedHandleNow,
+                                sessionResumptionSuccessCount = newResumedCount,
+                                sessionResumptionFallbackCount = newFallbackCount,
                                 statusHeadline = "LIVE HANDSHAKE VERIFIED (SETUP_ACCEPTED)",
                                 statusDetail = safeNote,
                                 diagnostics = prev.diagnostics.copy(
@@ -1315,7 +1668,51 @@ class GeminiLiveConnectionAdapter(
                                     isReceiverCollectorAttached = collectorAttached,
                                     audioPlaybackClaimed = prev.audioPlaybackClaimed,
                                     registeredActionToolsCount = 0,
+                                    sessionResumptionStatus = newResumptionStatus.wireCode,
+                                    contextRestorationStatus = newContextStatus.wireCode,
+                                    hasScopedResumptionHandle = hasScopedHandleNow,
+                                    sessionResumptionSuccessCount = newResumedCount,
+                                    sessionResumptionFallbackCount = newFallbackCount,
                                     redactedSummary = safeNote
+                                )
+                            )
+                        }
+                    }
+
+                    is LiveSocketCallbackEvent.SessionResumptionUpdated -> {
+                        closeGenAfterCallback = null
+                        val newStatus = if (event.resumable && event.hasScopedHandle) {
+                            SessionResumptionStatus.HANDLE_AVAILABLE_RESUMABLE
+                        } else if (!event.resumable) {
+                            SessionResumptionStatus.HANDLE_UNRESUMABLE
+                        } else {
+                            SessionResumptionStatus.ENABLED_AWAITING_HANDLE
+                        }
+                        updateStateAndNotify { prev ->
+                            val newUpdates = prev.sessionResumptionUpdatesReceived + 1
+                            prev.copy(
+                                sessionResumptionStatus = newStatus,
+                                hasScopedResumptionHandle = event.hasScopedHandle,
+                                sessionResumptionUpdatesReceived = newUpdates,
+                                diagnostics = prev.diagnostics.copy(
+                                    sessionResumptionStatus = newStatus.wireCode,
+                                    hasScopedResumptionHandle = event.hasScopedHandle,
+                                    sessionResumptionUpdatesReceived = newUpdates
+                                )
+                            )
+                        }
+                    }
+
+                    is LiveSocketCallbackEvent.ServerGoAwayReceived -> {
+                        closeGenAfterCallback = null
+                        updateStateAndNotify { prev ->
+                            val newGoAwayCount = prev.serverGoAwayCount + 1
+                            prev.copy(
+                                serverGoAwayCount = newGoAwayCount,
+                                lastServerGoAwayTimeLeftMs = event.timeLeftMs,
+                                diagnostics = prev.diagnostics.copy(
+                                    serverGoAwayCount = newGoAwayCount,
+                                    lastServerGoAwayTimeLeftMs = event.timeLeftMs
                                 )
                             )
                         }
@@ -1448,7 +1845,9 @@ class GeminiLiveConnectionAdapter(
         }
         if (event is LiveSocketCallbackEvent.ServerAudioChunkReceived ||
             event is LiveSocketCallbackEvent.ServerTurnCompleted ||
-            event is LiveSocketCallbackEvent.ServerTranscriptionReceived
+            event is LiveSocketCallbackEvent.ServerTranscriptionReceived ||
+            event is LiveSocketCallbackEvent.ServerGoAwayReceived ||
+            event is LiveSocketCallbackEvent.SessionResumptionUpdated
         ) {
             onServerEventListener?.invoke(event)
         }
@@ -1623,6 +2022,9 @@ class GeminiLiveConnectionAdapter(
         var joinedWasAutoOnly = false
 
         synchronized(lock) {
+            if (lastSessionId != sessionId) {
+                effectiveDriver.clearScopedResumptionState(lastSessionId)
+            }
             lastSessionId = sessionId
             operatorHalted = false
 
@@ -1850,7 +2252,9 @@ class GeminiLiveConnectionAdapter(
                             onSocketCallback(
                                 LiveSocketCallbackEvent.SetupAccepted(
                                     generationId = genId,
-                                    serverNote = result.serverNote
+                                    serverNote = result.serverNote,
+                                    resumedWithServerHandle = result.resumedWithServerHandle,
+                                    handleRejectedFallbackUsed = result.handleRejectedFallbackUsed
                                 )
                             )
                             return@withLock _state.value
@@ -2109,3 +2513,4 @@ class GeminiLiveConnectionAdapter(
         return connectWithBoundedRetry(sessionId, reuseIfHealthy = false)
     }
 }
+

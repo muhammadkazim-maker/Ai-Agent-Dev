@@ -36,7 +36,9 @@ data class SpeechGateTelemetry(
     val falseStartsRejected: Int = 0,
     val activityStartCount: Int = 0,
     val activityEndCount: Int = 0,
-    val isPostPlaybackGuardActive: Boolean = false
+    val isPostPlaybackGuardActive: Boolean = false,
+    val lastUserSpeechSampleAtMs: Long? = null,
+    val speechEndDetectedAtMs: Long? = null
 )
 
 sealed interface SpeechGateDecision {
@@ -74,11 +76,11 @@ sealed interface SpeechGateDecision {
 class SpeechActivityGate(
     private val speechDetector: SpeechNeuralDetector = DefaultNoContextSyntheticSpeechDetector(),
     private val sampleRateHz: Int = PcmResampler.TARGET_SAMPLE_RATE_HZ,
-    private val preRollTargetMs: Long = 300L,
-    private val speechConfirmDurationMs: Long = if (speechDetector.requiresLoadedModel) 160L else 120L,
+    private val preRollTargetMs: Long = if (speechDetector.requiresLoadedModel) 480L else 300L,
+    private val speechConfirmDurationMs: Long = if (speechDetector.requiresLoadedModel) 256L else 120L,
     private val speechOnsetProbabilityThreshold: Float = 0.55f,
     private val speechContinuityProbabilityThreshold: Float = 0.35f,
-    private val minConsecutiveSpeechWindows: Int = if (speechDetector.requiresLoadedModel) 5 else 3,
+    private val minConsecutiveSpeechWindows: Int = if (speechDetector.requiresLoadedModel) 8 else 3,
     private val trailingSilenceDurationMs: Long = 700L,
     private val postPlaybackEchoGuardMs: Long = 500L,
     private val baseMinThresholdRms: Float = 0.012f,
@@ -92,6 +94,12 @@ class SpeechActivityGate(
     private data class PreRollFrame(
         val sampleCount: Int,
         val pcmBytes: ByteArray
+    )
+
+    private data class EvaluatedWindow(
+        val vadResult: NeuralVadInferenceResult,
+        val windowRms: Float,
+        val zeroCrossings: Int
     )
 
     private val windowSizeSamples: Int = speechDetector.windowSizeSamples.coerceAtLeast(1)
@@ -117,12 +125,20 @@ class SpeechActivityGate(
     private var consecutiveVoiceSamples: Long = 0L
     private var consecutiveSpeechDurationMs: Long = 0L
     private var hadPositiveSpeechInWaiting: Boolean = false
+    private var streakMaxWindowRms: Float = 0f
+    private var streakMinActiveWindowRms: Float = Float.MAX_VALUE
+    private var streakMaxZeroCrossings: Int = 0
+    private var streakHighZcrWindowCount: Int = 0
+    private var recentNonSpeechBlastWindows: Int = 0
+    private var quietWindowsSinceNonSpeechBlast: Int = 0
 
     private var lastSpeechDecision: Boolean = false
     private var lastSpeechProbability: Float = 0f
     private var lastCompletedActiveDecisionWasSpeech: Boolean = true
 
+    private var lastWaitingPositiveFrameMs: Long? = null
     private var lastVoiceFrameMs: Long? = null
+    private var speechEndDetectedAtMs: Long? = null
     private var trailingSilenceStartMs: Long? = null
     private var trailingSilenceSamples: Long = 0L
     private var trailingSilenceElapsedMs: Long = 0L
@@ -230,7 +246,8 @@ class SpeechActivityGate(
             val windowResults = evaluateAlignedWindowsLocked(samples16kHz, rmsLinear)
             if (windowResults.isNotEmpty()) {
                 var sawContinuitySpeech = false
-                for (res in windowResults) {
+                for (eval in windowResults) {
+                    val res = eval.vadResult
                     lastSpeechProbability = res.speechProbability
                     val isSpeechCont = isContinuitySpeechWindow(res)
                     lastSpeechDecision = isSpeechCont
@@ -261,6 +278,7 @@ class SpeechActivityGate(
                 val shouldEnd = !endOfSpeechTriggered && trailingSilenceElapsedMs >= trailingSilenceDurationMs
                 if (shouldEnd) {
                     endOfSpeechTriggered = true
+                    speechEndDetectedAtMs = nowMs
                     sessionActivityEndCount += 1
                 }
                 return SpeechGateDecision.StreamActiveFrame(
@@ -299,7 +317,8 @@ class SpeechActivityGate(
         }
 
         var confirmedThisCallback = false
-        for (res in windowResults) {
+        for (eval in windowResults) {
+            val res = eval.vadResult
             lastSpeechProbability = res.speechProbability
             val isOnsetPositive = isOnsetSpeechWindow(res)
             lastSpeechDecision = isOnsetPositive
@@ -316,8 +335,17 @@ class SpeechActivityGate(
 
             if (isOnsetPositive) {
                 hadPositiveSpeechInWaiting = true
+                lastWaitingPositiveFrameMs = nowMs
                 consecutiveSpeechWindows += 1
                 consecutiveVoiceSamples += windowSizeSamples.toLong()
+                streakMaxWindowRms = max(streakMaxWindowRms, eval.windowRms)
+                if (eval.windowRms >= 0.004f) {
+                    streakMinActiveWindowRms = min(streakMinActiveWindowRms, eval.windowRms)
+                }
+                streakMaxZeroCrossings = max(streakMaxZeroCrossings, eval.zeroCrossings)
+                if (eval.zeroCrossings >= 78) {
+                    streakHighZcrWindowCount += 1
+                }
                 val streakStart = speechStreakStartMs ?: (prevWaitingEnd ?: (nowMs - frameDurationMs))
                 speechStreakStartMs = streakStart
                 val sampleDurationMs = (consecutiveVoiceSamples * 1000L) / sampleRateHz.toLong()
@@ -327,9 +355,25 @@ class SpeechActivityGate(
                 if (sampleDurationMs >= speechConfirmDurationMs &&
                     consecutiveSpeechWindows >= minConsecutiveSpeechWindows
                 ) {
-                    confirmedThisCallback = true
+                    if (speechDetector.requiresLoadedModel && isCoughOrThroatClearCandidateStreakLocked()) {
+                        falseStartsRejected += 1
+                        resetCandidateStreakLocked()
+                    } else {
+                        confirmedThisCallback = true
+                    }
                 }
             } else {
+                if (speechDetector.requiresLoadedModel) {
+                    if (eval.windowRms >= 0.08f && res.speechProbability < 0.35f) {
+                        recentNonSpeechBlastWindows += 1
+                        quietWindowsSinceNonSpeechBlast = 0
+                    } else if (eval.windowRms < 0.025f) {
+                        quietWindowsSinceNonSpeechBlast += 1
+                        if (quietWindowsSinceNonSpeechBlast >= 12) {
+                            recentNonSpeechBlastWindows = 0
+                        }
+                    }
+                }
                 if (consecutiveSpeechWindows > 0 || consecutiveSpeechDurationMs > 0L) {
                     falseStartsRejected += 1
                 }
@@ -394,21 +438,27 @@ class SpeechActivityGate(
      * that has not yet crossed the automatic onset confirmation duration.
      */
     @Synchronized
-    fun consumePreRollForManualSubmit(): List<ByteArray> {
+    fun consumePreRollForManualSubmit(submittedAtMs: Long = monotonicClockMs()): List<ByteArray> {
         if (gateState != SpeechGateState.WAITING_FOR_SPEECH) {
             return emptyList()
         }
         val chunks = drainPreRollChunksLocked()
         gateState = SpeechGateState.SPEECH_ACTIVE
+        if (lastVoiceFrameMs == null) {
+            lastVoiceFrameMs = lastWaitingPositiveFrameMs ?: submittedAtMs
+        }
         sessionActivityStartCount += 1
         return chunks
     }
 
     @Synchronized
-    fun recordManualEndOfSpeech() {
+    fun recordManualEndOfSpeech(endedAtMs: Long = monotonicClockMs()) {
         if (!endOfSpeechTriggered) {
             endOfSpeechTriggered = true
             sessionActivityEndCount += 1
+        }
+        if (speechEndDetectedAtMs == null) {
+            speechEndDetectedAtMs = endedAtMs
         }
         gateState = SpeechGateState.IDLE
     }
@@ -439,7 +489,9 @@ class SpeechActivityGate(
             falseStartsRejected = falseStartsRejected,
             activityStartCount = sessionActivityStartCount,
             activityEndCount = sessionActivityEndCount,
-            isPostPlaybackGuardActive = gateState == SpeechGateState.POST_PLAYBACK_ECHO_GUARD
+            isPostPlaybackGuardActive = gateState == SpeechGateState.POST_PLAYBACK_ECHO_GUARD,
+            lastUserSpeechSampleAtMs = lastVoiceFrameMs ?: lastWaitingPositiveFrameMs,
+            speechEndDetectedAtMs = speechEndDetectedAtMs
         )
     }
 
@@ -462,8 +514,8 @@ class SpeechActivityGate(
     private fun evaluateAlignedWindowsLocked(
         samples16kHz: ShortArray,
         rmsLinear: Float
-    ): List<NeuralVadInferenceResult> {
-        val results = mutableListOf<NeuralVadInferenceResult>()
+    ): List<EvaluatedWindow> {
+        val results = mutableListOf<EvaluatedWindow>()
         var srcOffset = 0
         while (srcOffset < samples16kHz.size) {
             val needed = windowSizeSamples - reframerFilled
@@ -474,26 +526,72 @@ class SpeechActivityGate(
             srcOffset += toCopy
 
             if (reframerFilled == windowSizeSamples) {
+                val (winRms, zc) = computeWindowAcoustics(reframerBuffer)
                 val res = speechDetector.inferWindow(reframerBuffer, rmsLinear)
-                results.add(res)
+                results.add(
+                    EvaluatedWindow(
+                        vadResult = res,
+                        windowRms = winRms,
+                        zeroCrossings = zc
+                    )
+                )
                 reframerFilled = 0
             }
         }
         return results
     }
 
+    private fun computeWindowAcoustics(window: ShortArray): Pair<Float, Int> {
+        if (window.isEmpty()) return 0f to 0
+        var sumSq = 0.0
+        var zc = 0
+        for (i in window.indices) {
+            val v = window[i].toInt()
+            val norm = v / 32768.0
+            sumSq += norm * norm
+            if (i > 0 && ((v >= 0) != (window[i - 1].toInt() >= 0))) {
+                zc += 1
+            }
+        }
+        val rms = kotlin.math.sqrt(sumSq / window.size.toDouble()).toFloat()
+        return rms to zc
+    }
+
+    private fun isCoughOrThroatClearCandidateStreakLocked(): Boolean {
+        val minActiveRms = if (streakMinActiveWindowRms < Float.MAX_VALUE) {
+            streakMinActiveWindowRms.coerceAtLeast(0.001f)
+        } else {
+            streakMaxWindowRms.coerceAtLeast(0.001f)
+        }
+        val dynamicRatio = streakMaxWindowRms / minActiveRms
+        val precededByExplosiveCoughBlast =
+            recentNonSpeechBlastWindows >= 3 && streakMaxWindowRms >= 0.12f
+        val precededByGlottalScrapeImpulse =
+            recentNonSpeechBlastWindows >= 2 &&
+                streakMaxWindowRms >= 0.14f &&
+                (dynamicRatio >= 4.0f || streakMaxZeroCrossings >= 75)
+        return precededByExplosiveCoughBlast || precededByGlottalScrapeImpulse
+    }
+
     private fun resetReframerAndDetectorLocked() {
         reframerFilled = 0
         reframerBuffer.fill(0)
+        recentNonSpeechBlastWindows = 0
+        quietWindowsSinceNonSpeechBlast = 0
         speechDetector.resetState()
     }
 
     private fun resetCandidateStreakLocked() {
         speechStreakStartMs = null
+        lastWaitingPositiveFrameMs = null
         consecutiveSpeechWindows = 0
         consecutiveVoiceSamples = 0L
         consecutiveSpeechDurationMs = 0L
         hadPositiveSpeechInWaiting = false
+        streakMaxWindowRms = 0f
+        streakMinActiveWindowRms = Float.MAX_VALUE
+        streakMaxZeroCrossings = 0
+        streakHighZcrWindowCount = 0
     }
 
     private fun computeThreshold(floorRms: Float): Float {
@@ -557,6 +655,7 @@ class SpeechActivityGate(
         lastSpeechProbability = 0f
         lastCompletedActiveDecisionWasSpeech = true
         lastVoiceFrameMs = null
+        speechEndDetectedAtMs = null
         trailingSilenceStartMs = null
         trailingSilenceSamples = 0L
         trailingSilenceElapsedMs = 0L

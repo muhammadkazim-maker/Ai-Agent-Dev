@@ -88,6 +88,12 @@ class TurnRuntimeState(
     var serverResponseStarted: Boolean = false
     var firstResponseWatchdogArmed: Boolean = false
     var firstResponseTimeoutFired: Boolean = false
+    var tLastServerProgressMs: Long? = null
+    var tLastPlaybackProgressMs: Long? = null
+    var tAllReceivedAudioPlayedMs: Long? = null
+    var serverAudioChunksReceivedCount: Int = 0
+    var watchdogFailureCode: String? = null
+    var outcomeRecordedInSummary: Boolean = false
 
     var completionHandled: Boolean = false
     var closed: Boolean = false
@@ -153,6 +159,91 @@ class TurnRuntimeState(
     fun cancelWatchdog() {
         firstResponseWatchdogJob?.cancel()
         firstResponseWatchdogJob = null
+    }
+
+    var captureGenWireId: String = "NONE"
+    var liveGenWireId: String = "NONE"
+
+    var tStartRequestedMs: Long? = null
+    var tSetupAcceptedMs: Long? = null
+    var tMicReadyMs: Long? = null
+    var tLastUserSpeechMs: Long? = null
+    var tSpeechEndMs: Long? = null
+    var tEndSubmittedMs: Long? = null
+    var tServerInputAckMs: Long? = null
+    var tFirstResponseMs: Long? = null
+    var tFirstAudioReceivedMs: Long? = null
+    var tFirstHardwareWriteMs: Long? = null
+    var tPlaybackDrainedMs: Long? = null
+    var tNextMicReadyMs: Long? = null
+    var redactedOutputWordCount: Int = 0
+    var latchedPlaybackFramesReceived: Long = 0L
+    var latchedPlaybackBytesReceived: Long = 0L
+    var latchedPlaybackChunksReceived: Int = 0
+    var latchedPlaybackFramesQueued: Long = 0L
+    var latchedPlaybackBytesQueued: Long = 0L
+    var latchedPlaybackFramesAccepted: Long = 0L
+    var latchedPlaybackBytesAccepted: Long = 0L
+    var latchedPlaybackFramesPlayed: Long = 0L
+    var latchedPlaybackPaddingFrames: Long = 0L
+    var latchedPlaybackPaddingBytes: Long = 0L
+    var latchedPlaybackSampleRateHz: Int = 0
+
+    fun startupDurationMs(): Long? = safeMonotonicDurationMs(tStartRequestedMs, tMicReadyMs)
+    fun speechEndpointingDelayMs(): Long? = safeMonotonicDurationMs(tLastUserSpeechMs, tSpeechEndMs)
+    fun serverAudioWaitMs(): Long? = safeMonotonicDurationMs(tEndSubmittedMs, tFirstAudioReceivedMs ?: tFirstResponseMs)
+    fun outputStartLatencyEstimateMs(): Long? = safeMonotonicDurationMs(tSpeechEndMs, tFirstHardwareWriteMs)
+    fun playbackDurationMs(): Long? = safeMonotonicDurationMs(tFirstHardwareWriteMs, tPlaybackDrainedMs)
+    fun captureRestorationDelayMs(): Long? = safeMonotonicDurationMs(tPlaybackDrainedMs, tNextMicReadyMs)
+
+    @Synchronized
+    fun toTimingSnapshot(
+        framesReceived: Long = latchedPlaybackFramesReceived,
+        bytesReceived: Long = latchedPlaybackBytesReceived,
+        chunksReceived: Int = latchedPlaybackChunksReceived,
+        framesQueued: Long = latchedPlaybackFramesQueued,
+        bytesQueued: Long = latchedPlaybackBytesQueued,
+        framesAccepted: Long = latchedPlaybackFramesAccepted,
+        bytesAccepted: Long = latchedPlaybackBytesAccepted,
+        framesPlayed: Long = latchedPlaybackFramesPlayed,
+        paddingFramesWritten: Long = latchedPlaybackPaddingFrames,
+        paddingBytesWritten: Long = latchedPlaybackPaddingBytes,
+        sampleRateHz: Int = latchedPlaybackSampleRateHz,
+        isSyntheticOrTestMeasurement: Boolean = false
+    ): Phase07TurnTimingSnapshot {
+        return Phase07TurnTimingSnapshot(
+            sessionId = sessionId.value,
+            turnId = turnId.value,
+            turnGenerationWireId = turnGen.wireId,
+            liveSessionGenerationWireId = liveGenWireId,
+            captureGenerationWireId = captureGenWireId,
+            playbackGenerationWireId = playbackGen?.wireId ?: "NONE",
+            tStartRequestedMs = tStartRequestedMs,
+            tSetupAcceptedMs = tSetupAcceptedMs,
+            tMicReadyMs = tMicReadyMs,
+            tLastUserSpeechMs = tLastUserSpeechMs,
+            tSpeechEndMs = tSpeechEndMs,
+            tEndSubmittedMs = tEndSubmittedMs,
+            tServerInputAckMs = tServerInputAckMs,
+            tFirstResponseMs = tFirstResponseMs,
+            tFirstAudioReceivedMs = tFirstAudioReceivedMs,
+            tFirstHardwareWriteMs = tFirstHardwareWriteMs,
+            tPlaybackDrainedMs = tPlaybackDrainedMs,
+            tNextMicReadyMs = tNextMicReadyMs,
+            framesReceivedFromServer = framesReceived,
+            bytesReceivedFromServer = bytesReceived,
+            chunksReceivedFromServer = chunksReceived,
+            framesQueuedInAdapter = framesQueued,
+            bytesQueuedInAdapter = bytesQueued,
+            framesAcceptedByHardware = framesAccepted,
+            bytesAcceptedByHardware = bytesAccepted,
+            framesPlayedByHardware = framesPlayed,
+            paddingFramesWrittenToHardware = paddingFramesWritten,
+            paddingBytesWrittenToHardware = paddingBytesWritten,
+            verifiedSampleRateHz = sampleRateHz,
+            redactedOutputWordCount = redactedOutputWordCount,
+            isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurement
+        )
     }
 
     @Synchronized

@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">OmniVoice Rebuild</string>
-    <string name="shell_subtitle">PHASE 06 // SHARED LANGUAGE POLICY &amp; NATIVE VOICE</string>
+    <string name="shell_subtitle">PHASE 07 // STABILIZATION, RECOVERY &amp; NATIVE VOICE</string>
     <string name="state_idle">IDLE</string>
     <string name="state_not_configured">NOT_CONFIGURED</string>
     <string name="state_paused">PAUSED</string>
@@ -15,13 +15,13 @@
     <string name="action_verify_precedence">Test Stop/Pause Precedence</string>
     <string name="action_open_mic_setup">Microphone Setup &amp; Self-Test</string>
     <string name="action_open_live_diagnostics">Gemini Live Handshake &amp; Diagnostics</string>
-    <string name="settings_placeholder_title">Settings (Phase 06 Voice, Language &amp; Active Session)</string>
-    <string name="settings_placeholder_desc">Phase 06 enforces one shared calm, friendly, direct policy across all turns with user-selected native-audio voice, explicit language priority (requested &gt; spoken &gt; stored across English, Urdu, Roman Urdu, and mixed speech), concise default with detail on request, and clean session rebuilds without old-session interference.</string>
+    <string name="settings_placeholder_title">Settings (Phase 07 Stabilization, Language &amp; Active Session)</string>
+    <string name="settings_placeholder_desc">Phase 07 enforces one shared calm, friendly, direct policy across all turns with user-selected native-audio voice, explicit language priority (requested &gt; spoken &gt; stored across English, Urdu, Roman Urdu, and mixed speech), bounded progress-aware recovery, and clean session rebuilds without old-session interference.</string>
     <string name="transcript_header">CONVERSATION TRANSCRIPT &amp; VERIFIED OUTCOMES</string>
     <string name="transcript_empty_hint">Press Start to verify microphone &amp; internet, connect Gemini Live, and hold an active multi-turn voice conversation.</string>
     <string name="controls_header">COMMAND DECK (ACTIVE CONVERSATION COORDINATOR)</string>
     <string name="telemetry_header">COORDINATOR TELEMETRY</string>
-    <string name="cd_settings_button">Open Phase 06 Settings and Diagnostics</string>
+    <string name="cd_settings_button">Open Phase 07 Settings and Diagnostics</string>
     <string name="cd_mic_setup_button">Open Microphone Setup and Self-Test Screen</string>
     <string name="cd_live_diag_button">Open Gemini Live Connection and Diagnostics Screen</string>
     <string name="cd_start_button">Start conversation session</string>
@@ -32,4 +32,6 @@
     <string name="mic_rationale_title">Why Microphone Access (`RECORD_AUDIO`) Is Needed</string>
     <string name="mic_rationale_body">OmniVoice Rebuild needs microphone access to capture 16,000 Hz 16-bit mono PCM audio frames for Gemini Live voice turns and local hardware verification. Temporary self-test clips never leave the device and are deleted immediately after verification or Stop.</string>
     <string name="mic_honest_disclaimer">HONESTY BOUNDARY: Microphone self-test verifies local acoustic capture &amp; intelligible playback only. Use the main Start button on the Conversation Shell for real Gemini Live native-audio voice turns.</string>
+    <string name="action_copy_diag">COPY DIAG</string>
+    <string name="cd_copy_diag_button">Copy redacted Phase 07A diagnostic snapshot to clipboard</string>
 </resources>

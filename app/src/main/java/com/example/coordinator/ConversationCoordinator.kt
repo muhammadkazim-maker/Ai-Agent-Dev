@@ -179,11 +179,20 @@ data class ConversationUiState(
     val wakeWordState: WakeWordState = WakeWordState.COMMAND_LISTENING,
     val wakeWordStatusLabel: String = "LISTENING (NATURAL SPEECH ACTIVE)",
     val wakeAuthorizationActive: Boolean = true,
-    val lastWakeKeyword: String? = null
+    val lastWakeKeyword: String? = null,
+    val startupTimingSnapshot: Phase07StartupTimingSnapshot = Phase07StartupTimingSnapshot(),
+    val activeTurnTimingSnapshot: Phase07TurnTimingSnapshot? = null,
+    val lastCompletedTurnTimingSnapshot: Phase07TurnTimingSnapshot? = null,
+    val currentActiveDiagnosticError: RedactedDiagnosticErrorEntry? = null,
+    val previousDiagnosticErrors: List<RedactedDiagnosticErrorEntry> = emptyList(),
+    val serverOutputStallCount: Int = 0,
+    val missingTurnCompleteCount: Int = 0,
+    val hardwarePlaybackStallCount: Int = 0,
+    val performanceSummary: Phase07PerformanceSummary = Phase07PerformanceSummary()
 )
 
 /**
- * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 through Phase 06B).
+ * Single ConversationCoordinator for OmniVoice Rebuild (Phase 01 through Phase 07).
  */
 class ConversationCoordinator(
     private val idGenerator: ContractIdGenerator = ContractIdGenerator(),
@@ -201,6 +210,11 @@ class ConversationCoordinator(
     val maxTranscriptEntries: Int = 24,
     val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
     val firstResponseTimeoutMs: Long = 12_000L,
+    val firstAudioAfterResponseTimeoutMs: Long = firstResponseTimeoutMs,
+    val serverOutputStallTimeoutMs: Long = max(firstResponseTimeoutMs, 10_000L),
+    val missingTurnCompleteTimeoutMs: Long = minOf(max(firstResponseTimeoutMs, 10_000L), 5_000L),
+    val maxTurnResponseHardBoundMs: Long = 90_000L,
+    val hardwarePlaybackStallTimeoutMs: Long = 5_000L,
     private val monotonicClockMs: () -> Long = { System.nanoTime() / 1_000_000L },
     val preRollDurationMs: Long = 300L,
     val speechConfirmDurationMs: Long = 120L,
@@ -211,7 +225,10 @@ class ConversationCoordinator(
     val speechDetector: SpeechNeuralDetector = DefaultNoContextSyntheticSpeechDetector(
         energyThresholdRms = max(0.012f, speechRmsThreshold)
     ),
-    val wakeWordDetector: WakeWordDetector = FakeWakeWordDetector()
+    val wakeWordDetector: WakeWordDetector = FakeWakeWordDetector(),
+    val isRealDeviceMeasurementMode: Boolean =
+        speechDetector.requiresLoadedModel &&
+            playbackAdapter.driver is com.example.audio.AndroidStreamingAudioTrackDriver
 ) {
     private sealed interface PrerequisiteCheck {
         data object Passed : PrerequisiteCheck
@@ -219,13 +236,19 @@ class ConversationCoordinator(
         data class MissingPrerequisite(val code: String, val detail: String) : PrerequisiteCheck
     }
 
+    private val isSyntheticOrTestMeasurementMode: Boolean
+        get() = !isRealDeviceMeasurementMode
+
+    private val effectivePreRollDurationMs: Long =
+        if (speechDetector.requiresLoadedModel && preRollDurationMs == 300L) 480L else preRollDurationMs
+
     private val effectiveSpeechConfirmDurationMs: Long =
-        if (speechDetector.requiresLoadedModel && speechConfirmDurationMs == 120L) 160L else speechConfirmDurationMs
+        if (speechDetector.requiresLoadedModel && speechConfirmDurationMs == 120L) 256L else speechConfirmDurationMs
 
     val speechGate: SpeechActivityGate = SpeechActivityGate(
         speechDetector = speechDetector,
         sampleRateHz = PcmResampler.TARGET_SAMPLE_RATE_HZ,
-        preRollTargetMs = preRollDurationMs,
+        preRollTargetMs = effectivePreRollDurationMs,
         speechConfirmDurationMs = effectiveSpeechConfirmDurationMs,
         trailingSilenceDurationMs = trailingSilenceDurationMs,
         postPlaybackEchoGuardMs = postPlaybackEchoGuardMs,
@@ -267,8 +290,215 @@ class ConversationCoordinator(
     @Volatile
     private var activeWakeAuthorization: WakeAuthorization? = null
 
+    private val maxErrorHistoryEntries = 10
+    private val diagnosticErrorSequence = AtomicLong(0L)
+    private val previousDiagnosticErrorsHistory = ArrayDeque<RedactedDiagnosticErrorEntry>()
+    @Volatile
+    private var currentActiveDiagnosticErrorEntry: RedactedDiagnosticErrorEntry? = null
+    @Volatile
+    private var lastCompletedTurnRuntime: TurnRuntimeState? = null
+    @Volatile
+    private var latestStartupTiming: Phase07StartupTimingSnapshot = Phase07StartupTimingSnapshot(
+        isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
+    )
+
+    private val recordedTurnOutcomes = ArrayDeque<Phase07TurnOutcomeRecord>()
+    private var totalAttemptedTurnsCounter: Int = 0
+    private var totalCompletedTurnsCounter: Int = 0
+    private var totalFailedTurnsCounter: Int = 0
+    private var totalInterruptedTurnsCounter: Int = 0
+    private var totalTimedOutTurnsCounter: Int = 0
+    private var totalNoSpeechRejectedTurnsCounter: Int = 0
+
     private fun ensureWakeAuthorizationValid(turn: TurnRuntimeState?): Boolean {
         return true
+    }
+
+    private fun recordDiagnosticErrorLocked(
+        stage: String,
+        errorCode: String,
+        rawSummary: String,
+        sessionId: SessionId = _uiState.value.sessionId,
+        turnId: TurnId = _uiState.value.currentTurnId,
+        generationWireId: String = activeTurn?.turnGen?.wireId
+            ?: liveAdapter.state.value.activeGeneration?.wireId
+            ?: "NONE"
+    ) {
+        val prevActive = currentActiveDiagnosticErrorEntry
+        if (prevActive != null) {
+            while (previousDiagnosticErrorsHistory.size >= maxErrorHistoryEntries) {
+                previousDiagnosticErrorsHistory.removeFirst()
+            }
+            previousDiagnosticErrorsHistory.addLast(prevActive)
+        }
+        val newEntry = RedactedDiagnosticErrorEntry(
+            sequenceNumber = diagnosticErrorSequence.incrementAndGet(),
+            timestampMonotonicMs = monotonicClockMs(),
+            sessionId = sessionId.value,
+            turnId = turnId.value,
+            generationWireId = generationWireId,
+            stage = stage,
+            errorCode = errorCode,
+            redactedSummary = DiagnosticRedactor.redactForDiagnostics(rawSummary)
+        )
+        currentActiveDiagnosticErrorEntry = newEntry
+        val historyList = previousDiagnosticErrorsHistory.toList()
+        _uiState.update { state ->
+            state.copy(
+                currentActiveDiagnosticError = newEntry,
+                previousDiagnosticErrors = historyList
+            )
+        }
+    }
+
+    private fun archiveActiveDiagnosticErrorLocked() {
+        val prevActive = currentActiveDiagnosticErrorEntry ?: return
+        while (previousDiagnosticErrorsHistory.size >= maxErrorHistoryEntries) {
+            previousDiagnosticErrorsHistory.removeFirst()
+        }
+        previousDiagnosticErrorsHistory.addLast(prevActive)
+        currentActiveDiagnosticErrorEntry = null
+        val historyList = previousDiagnosticErrorsHistory.toList()
+        _uiState.update { state ->
+            state.copy(
+                currentActiveDiagnosticError = null,
+                previousDiagnosticErrors = historyList
+            )
+        }
+    }
+
+    private fun actionVerbForFailureCode(
+        failureCode: String,
+        isTimeoutEnd: Boolean = false
+    ): String = when {
+        failureCode == "FIRST_RESPONSE_TIMEOUT" ->
+            if (isTimeoutEnd) "first_response_timeout_end" else "first_response_timeout"
+        failureCode == "SERVER_OUTPUT_STALL_TIMEOUT" ->
+            if (isTimeoutEnd) "server_output_stall_end" else "server_output_stall"
+        failureCode == "MISSING_SERVER_TURN_COMPLETE" ->
+            if (isTimeoutEnd) "missing_turn_complete_end" else "missing_turn_complete"
+        failureCode == "HARDWARE_PLAYBACK_STALL" ||
+            failureCode == "HARDWARE_DRAIN_INCOMPLETE" ||
+            failureCode == "AUDIO_TRACK_WRITE_FAILED" ||
+            failureCode == "AUDIO_PLAYBACK_WRITE_FAILED" ||
+            failureCode == "AUDIO_PLAYBACK_DRAIN_FAILED" ->
+            "playback_stall"
+        failureCode == "NETWORK_UNAVAILABLE" ||
+            failureCode.startsWith("LIVE_") ||
+            failureCode == "TRANSIENT_NETWORK_OR_SOCKET" ||
+            failureCode == "SESSION_EXPIRED_OR_GO_AWAY" ||
+            failureCode == "NETWORK_ERROR" ->
+            "transport_disconnected"
+        else -> "turn_error"
+    }
+
+    private fun latchPlaybackSnapshotIntoTurnLocked(
+        turn: TurnRuntimeState,
+        playSnap: LiveAudioPlaybackState = playbackAdapter.state.value
+    ) {
+        val matchesTurnPlayback = turn.playbackGen != null && (
+            playSnap.activeGeneration == turn.playbackGen ||
+                (playSnap.activeGeneration == null && playSnap.lastCompletedGeneration == turn.playbackGen)
+            )
+        if (matchesTurnPlayback) {
+            turn.latchedPlaybackFramesReceived = playSnap.framesReceivedFromServer
+            turn.latchedPlaybackBytesReceived = playSnap.audioBytesReceived
+            turn.latchedPlaybackChunksReceived = playSnap.chunksReceived
+            turn.latchedPlaybackFramesQueued = playSnap.queuedFrames
+            turn.latchedPlaybackBytesQueued = playSnap.queuedBytes
+            turn.latchedPlaybackFramesAccepted = playSnap.totalFramesWrittenToHardware
+            turn.latchedPlaybackBytesAccepted = playSnap.bytesAcceptedByHardware
+            turn.latchedPlaybackFramesPlayed = playSnap.hardwarePlaybackHeadFrames
+            turn.latchedPlaybackPaddingFrames = playSnap.paddingFramesWrittenToHardware
+            turn.latchedPlaybackPaddingBytes = playSnap.paddingBytesWrittenToHardware
+            turn.latchedPlaybackSampleRateHz = playSnap.verifiedSampleRateHz
+        }
+    }
+
+    private fun buildTurnTimingSnapshotLocked(turn: TurnRuntimeState): Phase07TurnTimingSnapshot {
+        latchPlaybackSnapshotIntoTurnLocked(turn, playbackAdapter.state.value)
+        return turn.toTimingSnapshot(
+            isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
+        )
+    }
+
+    private fun recordTurnOutcomeLocked(
+        turn: TurnRuntimeState,
+        category: Phase07TurnOutcomeCategory,
+        outcomeCode: String
+    ) {
+        if (turn.outcomeRecordedInSummary) {
+            refreshTurnOutcomeSnapshotLocked(turn)
+            return
+        }
+        turn.outcomeRecordedInSummary = true
+        totalAttemptedTurnsCounter += 1
+        when (category) {
+            Phase07TurnOutcomeCategory.COMPLETED -> totalCompletedTurnsCounter += 1
+            Phase07TurnOutcomeCategory.FAILED -> totalFailedTurnsCounter += 1
+            Phase07TurnOutcomeCategory.INTERRUPTED -> totalInterruptedTurnsCounter += 1
+            Phase07TurnOutcomeCategory.TIMED_OUT -> totalTimedOutTurnsCounter += 1
+            Phase07TurnOutcomeCategory.NO_SPEECH_REJECTED -> totalNoSpeechRejectedTurnsCounter += 1
+        }
+        val timingSnap = buildTurnTimingSnapshotLocked(turn)
+        while (recordedTurnOutcomes.size >= Phase07PerformanceSummary.MAX_BOUNDED_TURN_RECORDS) {
+            recordedTurnOutcomes.removeFirst()
+        }
+        recordedTurnOutcomes.addLast(
+            Phase07TurnOutcomeRecord(
+                sessionId = turn.sessionId.value,
+                turnId = turn.turnId.value,
+                turnGenerationWireId = turn.turnGen.wireId,
+                category = category,
+                outcomeCode = outcomeCode,
+                timingSnapshot = timingSnap,
+                isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
+            )
+        )
+    }
+
+    private fun refreshTurnOutcomeSnapshotLocked(turn: TurnRuntimeState) {
+        val updatedSnap = buildTurnTimingSnapshotLocked(turn)
+        val idx = recordedTurnOutcomes.indexOfLast { it.turnGenerationWireId == turn.turnGen.wireId }
+        if (idx >= 0) {
+            val existing = recordedTurnOutcomes[idx]
+            recordedTurnOutcomes[idx] = existing.copy(timingSnapshot = updatedSnap)
+        }
+    }
+
+    private fun buildPerformanceSummaryLocked(): Phase07PerformanceSummary {
+        val liveSnap = liveAdapter.state.value
+        return Phase07PerformanceSummary.fromTurnRecords(
+            startupSnapshot = latestStartupTiming,
+            records = recordedTurnOutcomes.toList(),
+            totalAttemptedTurns = totalAttemptedTurnsCounter,
+            completedTurns = totalCompletedTurnsCounter,
+            failedTurns = totalFailedTurnsCounter,
+            interruptedTurns = totalInterruptedTurnsCounter,
+            timedOutTurns = totalTimedOutTurnsCounter,
+            noSpeechRejectedTurns = totalNoSpeechRejectedTurnsCounter,
+            runtimeModelId = liveAdapter.configuredModelId,
+            configuredVoice = LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE,
+            contextWindowCompressionActive = liveSnap.contextWindowCompressionEnabled,
+            sessionResumptionStatus = liveSnap.sessionResumptionStatus.wireCode,
+            contextRestorationStatus = liveSnap.contextRestorationStatus.wireCode
+        )
+    }
+
+    private fun syncTimingSnapshotsLocked() {
+        val activeSnap = activeTurn?.let { buildTurnTimingSnapshotLocked(it) }
+        val completedSnap = lastCompletedTurnRuntime?.let { buildTurnTimingSnapshotLocked(it) }
+            ?: _uiState.value.lastCompletedTurnTimingSnapshot
+        val startupSnap = latestStartupTiming
+        val perfSummary = buildPerformanceSummaryLocked()
+        _uiState.update { state ->
+            state.copy(
+                startupTimingSnapshot = startupSnap,
+                activeTurnTimingSnapshot = activeSnap,
+                lastCompletedTurnTimingSnapshot = completedSnap,
+                performanceSummary = perfSummary
+            )
+        }
     }
 
     private val turnScope = CoroutineScope(SupervisorJob() + backgroundDispatcher)
@@ -315,6 +545,13 @@ class ConversationCoordinator(
 
     init {
         recordActionId(initialActionId)
+        playbackAdapter.hardwarePlaybackStallTimeoutMs = hardwarePlaybackStallTimeoutMs
+        liveAdapter.canAutoReconnectOnNetworkRestore = {
+            !isDeliberatelyPaused &&
+                !isDeliberatelyStopped &&
+                activeTimeoutRecoveryJob?.isActive != true &&
+                activeNextTurnRecoveryJob?.isActive != true
+        }
         liveAdapter.onStateChanged = { onLiveAdapterStateUpdated() }
         liveAdapter.onServerEventListener = { event -> onServerSocketEvent(event) }
         playbackAdapter.onStateChanged = { syncPlaybackState() }
@@ -470,6 +707,40 @@ class ConversationCoordinator(
                     !isCompletingInterruptionRecovery &&
                     (liveSnap.phase == LiveConnectionPhase.FAILED || liveSnap.phase == LiveConnectionPhase.DISCONNECTED)
                 ) {
+                    val isSilentWaitingInListening =
+                        currentState == ConversationState.LISTENING &&
+                            !turn.activityStartSent &&
+                            !turn.endOfTurnSubmitted
+                    val isGoAwayOrProactiveExpiry =
+                        liveSnap.failureClassification == LiveFailureClassification.SESSION_EXPIRED_OR_GO_AWAY ||
+                            needsSessionRecreationBeforeNextTurn
+                    if (isSilentWaitingInListening &&
+                        isGoAwayOrProactiveExpiry &&
+                        _uiState.value.isActiveConversationEnabled &&
+                        !isDeliberatelyPaused &&
+                        !isDeliberatelyStopped
+                    ) {
+                        cancelInactivityTimerLocked()
+                        cancelPostPlaybackGuardJobLocked()
+                        speechGate.cancelAndResetToIdle(resetSessionCounters = false)
+                        syncSpeechGateTelemetryLocked()
+                        activeTurn = null
+                        turn.dispose(cancelAllJobs = true)
+                        audioCapture.stopAndRelease(
+                            reason = "Session rotating after ServerGoAway / session expiry while waiting silently",
+                            wipeEphemeral = true
+                        )
+                        playbackAdapter.stopAndFlush(reason = "Session rotating after ServerGoAway")
+                        liveAdapter.setAudioPlaybackClaimed(false)
+                        needsSessionRecreationBeforeNextTurn = false
+                        val job = prepareNextTurnSessionRecoveryLocked(
+                            sessionId = turn.sessionId,
+                            previousTurnId = turn.turnId,
+                            completedTurn = turn
+                        )
+                        job?.start()
+                        return
+                    }
                     val failCode = liveSnap.failureClassification
                         .takeIf { it != LiveFailureClassification.NONE }
                         ?.wireCode
@@ -501,6 +772,27 @@ class ConversationCoordinator(
 
     fun onLiveSocketCallback(event: LiveSocketCallbackEvent): Boolean {
         val accepted = liveAdapter.onSocketCallback(event)
+        if (accepted && event is LiveSocketCallbackEvent.SetupAccepted) {
+            synchronized(this) {
+                val setupAtMs = monotonicClockMs()
+                val liveGenWire = event.generationId.wireId
+                activeTurn?.let { turn ->
+                    if (!turn.closed) {
+                        if (turn.tSetupAcceptedMs == null) {
+                            turn.tSetupAcceptedMs = setupAtMs
+                        }
+                        turn.liveGenWireId = liveGenWire
+                    }
+                }
+                if (latestStartupTiming.tSetupAcceptedMs == null) {
+                    latestStartupTiming = latestStartupTiming.copy(
+                        liveSessionGenerationWireId = liveGenWire,
+                        tSetupAcceptedMs = setupAtMs
+                    )
+                }
+                syncTimingSnapshotsLocked()
+            }
+        }
         syncLiveState()
         return accepted
     }
@@ -938,6 +1230,13 @@ class ConversationCoordinator(
 
             when (val prereq = checkVoiceTurnPrerequisitesLocked()) {
                 is PrerequisiteCheck.NotConfigured -> {
+                    recordDiagnosticErrorLocked(
+                        stage = "PREREQUISITE_CHECK",
+                        errorCode = "NOT_CONFIGURED",
+                        rawSummary = prereq.detail,
+                        sessionId = sessionId,
+                        turnId = turnId
+                    )
                     val outcome = VerifiedOutcome.HonestNotConfiguredOutcome(
                         actionId = actionId,
                         sessionId = sessionId,
@@ -960,6 +1259,13 @@ class ConversationCoordinator(
                     if (prereq.code == "NETWORK_UNAVAILABLE") {
                         liveAdapter.onNetworkValidatedChanged(false)
                     }
+                    recordDiagnosticErrorLocked(
+                        stage = "PREREQUISITE_CHECK",
+                        errorCode = prereq.code,
+                        rawSummary = prereq.detail,
+                        sessionId = sessionId,
+                        turnId = turnId
+                    )
                     val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
                     val outcome = VerifiedOutcome.PrerequisiteFailureOutcome(
                         actionId = actionId,
@@ -990,6 +1296,7 @@ class ConversationCoordinator(
                 }
 
                 is PrerequisiteCheck.Passed -> {
+                    archiveActiveDiagnosticErrorLocked()
                     isDeliberatelyPaused = false
                     isDeliberatelyStopped = false
                     consecutiveFirstResponseTimeouts = 0
@@ -998,6 +1305,7 @@ class ConversationCoordinator(
                     liveAdapter.onStateChanged = { onLiveAdapterStateUpdated() }
                     liveAdapter.onServerEventListener = { event -> onServerSocketEvent(event) }
 
+                    val startRequestedAtMs = monotonicClockMs()
                     turnSeq = voiceTurnCounter.incrementAndGet()
                     turnGen = TurnGenerationId(
                         turnSeq = turnSeq,
@@ -1011,12 +1319,32 @@ class ConversationCoordinator(
                         turnGen = turnGen,
                         createdAtLabel = clockProvider()
                     )
+                    freshTurn.tStartRequestedMs = startRequestedAtMs
                     activeTurn = freshTurn
+                    latestStartupTiming = Phase07StartupTimingSnapshot(
+                        sessionId = sessionId.value,
+                        initialTurnId = turnId.value,
+                        turnGenerationWireId = turnGen.wireId,
+                        tStartRequestedMs = startRequestedAtMs,
+                        isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
+                    )
+                    syncTimingSnapshotsLocked()
                     liveAdapter.startNetworkMonitoring()
 
                     alreadySetupAccepted =
                         !needsSessionRecreationBeforeNextTurn &&
                             liveAdapter.isSessionReadyForAudio()
+                    if (alreadySetupAccepted) {
+                        val existingSetupMs = monotonicClockMs()
+                        val existingLiveGen = liveAdapter.state.value.activeGeneration?.wireId ?: "NONE"
+                        freshTurn.tSetupAcceptedMs = existingSetupMs
+                        freshTurn.liveGenWireId = existingLiveGen
+                        latestStartupTiming = latestStartupTiming.copy(
+                            liveSessionGenerationWireId = existingLiveGen,
+                            tSetupAcceptedMs = existingSetupMs
+                        )
+                        syncTimingSnapshotsLocked()
+                    }
 
                     val initialTrace = listOf(
                         "BUTTON_PRESS",
@@ -1148,6 +1476,14 @@ class ConversationCoordinator(
                 }
                 val failDetail =
                     "Gemini Live connection failed [$failCode]: ${DiagnosticRedactor.redact(finalLiveState.statusDetail)}"
+                recordDiagnosticErrorLocked(
+                    stage = "LIVE_CONNECTION_SETUP",
+                    errorCode = failCode,
+                    rawSummary = failDetail,
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    generationWireId = finalLiveState.activeGeneration?.wireId ?: turnGen.wireId
+                )
                 val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
                 val failOutcome = VerifiedOutcome.PrerequisiteFailureOutcome(
                     actionId = idGenerator.nextActionId("live_fail"),
@@ -1179,6 +1515,15 @@ class ConversationCoordinator(
                 return@synchronized failOutcome
             }
 
+            val setupAcceptedAtMs = turn.tSetupAcceptedMs ?: monotonicClockMs()
+            val liveGenWire = finalLiveState.activeGeneration?.wireId ?: liveAdapter.state.value.activeGeneration?.wireId
+            turn.tSetupAcceptedMs = setupAcceptedAtMs
+            turn.liveGenWireId = liveGenWire ?: "NONE"
+            latestStartupTiming = latestStartupTiming.copy(
+                liveSessionGenerationWireId = liveGenWire ?: "NONE",
+                tSetupAcceptedMs = setupAcceptedAtMs
+            )
+
             appendTurnEventLocked("SETUP_ACCEPTED")
             appendFirstTurnLifecycleLocked("SETUP_ACCEPTED")
             appendReadinessOrderLocked("SETUP_ACCEPTED")
@@ -1191,7 +1536,6 @@ class ConversationCoordinator(
             liveAdapter.setAudioPlaybackClaimed(true)
 
             appendFirstTurnLifecycleLocked("AUDIO_RECORD_START")
-            val liveGenWire = finalLiveState.activeGeneration?.wireId ?: liveAdapter.state.value.activeGeneration?.wireId
             turn.recordStep(
                 step = TurnTraceStep.LISTENING_STARTED,
                 timestampLabel = clockProvider(),
@@ -1253,6 +1597,14 @@ class ConversationCoordinator(
                 liveAdapter.setAudioPlaybackClaimed(false)
                 val failCode = audioSnap.anomaly.wireCode
                 val failDetail = "Microphone capture failed [$failCode]: ${audioSnap.statusDetail}"
+                recordDiagnosticErrorLocked(
+                    stage = "AUDIO_CAPTURE_START",
+                    errorCode = failCode,
+                    rawSummary = failDetail,
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    generationWireId = captureGen.wireId
+                )
                 val errPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
                 val failOutcome = VerifiedOutcome.PrerequisiteFailureOutcome(
                     actionId = idGenerator.nextActionId("mic_fail"),
@@ -1283,6 +1635,15 @@ class ConversationCoordinator(
                 turn.completionDeferred.complete(failOutcome)
                 return@synchronized failOutcome
             }
+
+            val micReadyAtMs = monotonicClockMs()
+            turn.captureGenWireId = captureGen.wireId
+            turn.tMicReadyMs = micReadyAtMs
+            latestStartupTiming = latestStartupTiming.copy(
+                captureGenerationWireId = captureGen.wireId,
+                tMicReadyMs = micReadyAtMs
+            )
+            syncTimingSnapshotsLocked()
 
             armInactivityTimerLocked(sessionId, turn.turnGen)
 
@@ -1318,10 +1679,23 @@ class ConversationCoordinator(
     private fun autoRestoreCaptureForNextTurnLocked(
         previousTurnId: TurnId,
         completedTurn: TurnRuntimeState? = null,
-        allowRestoreAfterTimeoutRecovery: Boolean = false
+        allowRestoreAfterTimeoutRecovery: Boolean = false,
+        recoveryReasonCode: String? = null
     ): VerifiedOutcome {
         val current = _uiState.value
         val sessionId = current.sessionId
+        if (isDeliberatelyPaused || isDeliberatelyStopped || !current.isActiveConversationEnabled) {
+            return failActiveVoiceTurnLocked(
+                failureCode = "RESTORE_BLOCKED_BY_OPERATOR",
+                detail = "Refused to auto-restore LISTENING while paused/stopped or active conversation disabled."
+            )!!
+        }
+        if (!liveAdapter.isSessionReadyForAudio()) {
+            return failActiveVoiceTurnLocked(
+                failureCode = "SESSION_NOT_READY_FOR_CAPTURE",
+                detail = "Refused to auto-restore LISTENING before a usable Gemini Live session was verified."
+            )!!
+        }
         val playSnapBeforeRestore = playbackAdapter.state.value
         if (playSnapBeforeRestore.isPlaying ||
             playSnapBeforeRestore.isDrainingHardware ||
@@ -1381,18 +1755,10 @@ class ConversationCoordinator(
             detail = "turn=${nextTurnId.value} (autoRestore)"
         )
 
-        val updatedTurnSeq = appendTurnStateLocked(ConversationState.LISTENING)
-        val updatedReadiness = appendReadinessOrderLocked("LISTENING")
-        val listeningPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.LISTENING)
         _uiState.update { state ->
             state.copy(
                 currentTurnId = nextTurnId,
-                state = ConversationState.LISTENING,
-                activeConversationPhase = ActiveConversationPhase.LISTENING,
-                activeConversationPhaseSequence = listeningPhaseSeq,
                 activeTurnGenerationId = turnGen,
-                voiceTurnStateSequence = updatedTurnSeq,
-                voiceTurnReadinessOrder = updatedReadiness,
                 turnEventTrace = listOf("AUTO_RESTORE_PREPARING", "SETUP_ACCEPTED"),
                 lastCompletedTurnTrace = completedTurn?.structuredTraceEntries?.toList() ?: state.lastCompletedTurnTrace,
                 lastCompletedTurnEarliestMissingStep = completedTurn?.earliestMissingStep() ?: state.lastCompletedTurnEarliestMissingStep,
@@ -1440,6 +1806,24 @@ class ConversationCoordinator(
             )!!
         }
 
+        val nextMicReadyAtMs = monotonicClockMs()
+        nextTurn.captureGenWireId = captureGen.wireId
+        nextTurn.liveGenWireId = liveGenWire ?: "NONE"
+        nextTurn.tSetupAcceptedMs = completedTurn?.tSetupAcceptedMs ?: latestStartupTiming.tSetupAcceptedMs
+        nextTurn.tMicReadyMs = nextMicReadyAtMs
+        if (completedTurn != null && (completedTurn.completionHandled || completedTurn.tEndSubmittedMs != null)) {
+            if (completedTurn.tNextMicReadyMs == null) {
+                completedTurn.tNextMicReadyMs = nextMicReadyAtMs
+            }
+            lastCompletedTurnRuntime = completedTurn
+            refreshTurnOutcomeSnapshotLocked(completedTurn)
+        }
+        syncTimingSnapshotsLocked()
+
+        val updatedTurnSeq = appendTurnStateLocked(ConversationState.LISTENING)
+        val updatedReadiness = appendReadinessOrderLocked("LISTENING")
+        val listeningPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.LISTENING)
+
         if (!allowRestoreAfterTimeoutRecovery && postPlaybackEchoGuardMs > 0L) {
             cancelPostPlaybackGuardJobLocked()
             postPlaybackGuardJob = turnScope.launch(nextTurn.parentJob) {
@@ -1463,7 +1847,13 @@ class ConversationCoordinator(
         armInactivityTimerLocked(sessionId, turnGen)
 
         val detail = if (allowRestoreAfterTimeoutRecovery) {
-            "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation automatically restored after clean recovery from FIRST_RESPONSE_TIMEOUT."
+            val codeLabel = recoveryReasonCode ?: completedTurn?.watchdogFailureCode ?: "TURN_RECOVERY"
+            if (codeLabel == "MISSING_SERVER_TURN_COMPLETE") {
+                val playedFrames = completedTurn?.latchedPlaybackFramesPlayed ?: 0L
+                "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Previous reply finished playing ($playedFrames frames) without server turnComplete ($codeLabel); recovered session cleanly and resumed listening."
+            } else {
+                "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation automatically restored after clean recovery from $codeLabel."
+            }
         } else {
             "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation restored (post-playback echo guard -> silent waiting)."
         }
@@ -1481,8 +1871,11 @@ class ConversationCoordinator(
         )
         _uiState.update { state ->
             state.copy(
+                state = ConversationState.LISTENING,
                 activeConversationPhase = ActiveConversationPhase.LISTENING,
                 activeConversationPhaseSequence = listeningPhaseSeq,
+                voiceTurnStateSequence = updatedTurnSeq,
+                voiceTurnReadinessOrder = updatedReadiness,
                 lastVoiceTurnSummary = detail
             )
         }
@@ -1632,8 +2025,9 @@ class ConversationCoordinator(
                     }
 
                     if (decision is SpeechGateDecision.SpeechConfirmedStart) {
+                        val gateSnap = speechGate.telemetrySnapshot()
+                        turn.tLastUserSpeechMs = gateSnap.lastUserSpeechSampleAtMs
                         if (!turn.hasStep(TurnTraceStep.USER_SPEECH_DETECTED)) {
-                            val gateSnap = speechGate.telemetrySnapshot()
                             turn.recordStep(
                                 step = TurnTraceStep.USER_SPEECH_DETECTED,
                                 timestampLabel = clockProvider(),
@@ -1641,9 +2035,14 @@ class ConversationCoordinator(
                                 detail = "vad=${gateSnap.detectorName}(p=${"%.2f".format(gateSnap.lastSpeechProbability)}), preRollBytes=${decision.preRollTotalBytes}"
                             )
                         }
+                        syncTimingSnapshotsLocked()
                         armInactivityTimerLocked(turn.sessionId, turnGen)
-                    } else if (decision is SpeechGateDecision.StreamActiveFrame && decision.trailingSilenceDurationMs == 0L) {
-                        armInactivityTimerLocked(turn.sessionId, turnGen)
+                    } else if (decision is SpeechGateDecision.StreamActiveFrame) {
+                        val gateSnap = speechGate.telemetrySnapshot()
+                        gateSnap.lastUserSpeechSampleAtMs?.let { turn.tLastUserSpeechMs = it }
+                        if (decision.trailingSilenceDurationMs == 0L) {
+                            armInactivityTimerLocked(turn.sessionId, turnGen)
+                        }
                     }
 
                     val snap = audioCapture.state.value
@@ -1665,6 +2064,10 @@ class ConversationCoordinator(
                             !turn.autoEndTriggered
                     if (shouldTriggerAutoEnd) {
                         turn.autoEndTriggered = true
+                        val gateSnap = speechGate.telemetrySnapshot()
+                        turn.tLastUserSpeechMs = gateSnap.lastUserSpeechSampleAtMs ?: turn.tLastUserSpeechMs
+                        turn.tSpeechEndMs = gateSnap.speechEndDetectedAtMs ?: capturedAtMs
+                        syncTimingSnapshotsLocked()
                     }
                     trailingSilenceMsForLog =
                         (decision as? SpeechGateDecision.StreamActiveFrame)?.trailingSilenceDurationMs ?: 0L
@@ -2098,14 +2501,32 @@ class ConversationCoordinator(
             return
         }
 
+        var submissionStartedAtMs: Long? = null
         val signaled = micSendMutex.withLock {
             val stillEligible = synchronized(this@ConversationCoordinator) {
-                activeTurn === turn &&
+                val eligible = activeTurn === turn &&
                     !turn.closed &&
                     turn.turnSeq == turnSeq &&
                     !turn.endOfTurnSubmitted &&
                     !isDeliberatelyPaused &&
                     !isDeliberatelyStopped
+                if (eligible) {
+                    val nowMs = monotonicClockMs()
+                    submissionStartedAtMs = nowMs
+                    if (!turn.autoEndTriggered) {
+                        speechGate.recordManualEndOfSpeech(nowMs)
+                        syncSpeechGateTelemetryLocked()
+                    }
+                    val gateSnapBeforeEnd = speechGate.telemetrySnapshot()
+                    if (turn.tLastUserSpeechMs == null) {
+                        turn.tLastUserSpeechMs = gateSnapBeforeEnd.lastUserSpeechSampleAtMs
+                    }
+                    if (turn.tSpeechEndMs == null) {
+                        turn.tSpeechEndMs = gateSnapBeforeEnd.speechEndDetectedAtMs
+                    }
+                    turn.tEndSubmittedMs = nowMs
+                }
+                eligible
             }
             if (!stillEligible) {
                 false
@@ -2120,6 +2541,7 @@ class ConversationCoordinator(
                 return@synchronized
             }
             if (!signaled) {
+                turn.tEndSubmittedMs = null
                 turn.endOfTurnFailed = true
                 val failCode = if (!liveAdapter.networkMonitor.isInternetValidated()) {
                     "NETWORK_UNAVAILABLE"
@@ -2137,19 +2559,25 @@ class ConversationCoordinator(
             }
 
             turn.endOfTurnSubmitted = true
-            if (!turn.autoEndTriggered) {
-                speechGate.recordManualEndOfSpeech()
-                syncSpeechGateTelemetryLocked()
+            if (turn.tEndSubmittedMs == null) {
+                turn.tEndSubmittedMs = submissionStartedAtMs ?: monotonicClockMs()
             }
+            val gateSnapAfterEnd = speechGate.telemetrySnapshot()
+            if (turn.tLastUserSpeechMs == null) {
+                turn.tLastUserSpeechMs = gateSnapAfterEnd.lastUserSpeechSampleAtMs
+            }
+            if (turn.tSpeechEndMs == null) {
+                turn.tSpeechEndMs = gateSnapAfterEnd.speechEndDetectedAtMs
+            }
+            syncTimingSnapshotsLocked()
             promoteToProcessingLocked(
                 turn = turn,
                 sessionId = sessionId,
                 turnId = turnId,
                 turnGen = turnGen
             )
-            if (!turn.serverResponseStarted &&
-                _uiState.value.state == ConversationState.PROCESSING &&
-                !turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE)
+            if (!turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE) &&
+                (_uiState.value.state == ConversationState.PROCESSING || _uiState.value.state == ConversationState.SPEAKING)
             ) {
                 armFirstResponseWatchdogLocked(turn)
             }
@@ -2210,20 +2638,237 @@ class ConversationCoordinator(
     }
 
     private fun armFirstResponseWatchdogLocked(turn: TurnRuntimeState) {
-        if (turn.closed || turn.serverResponseStarted || turn.firstResponseWatchdogArmed) return
+        if (turn.closed || !turn.endOfTurnSubmitted || turn.tEndSubmittedMs == null || turn.firstResponseWatchdogArmed) return
         val timeoutMs = firstResponseTimeoutMs
         if (timeoutMs <= 0L) return
         turn.firstResponseWatchdogArmed = true
         val expectedSeq = turn.turnSeq
         val expectedTurnGen = turn.turnGen
         turn.firstResponseWatchdogJob = turnScope.launch(turn.parentJob) {
-            delay(timeoutMs)
-            turnScope.launch {
-                handleFirstResponseTimeout(
-                    expectedTurnSeq = expectedSeq,
-                    expectedTurnGen = expectedTurnGen,
-                    timeoutMs = timeoutMs
-                )
+            var accumulatedWaitMs = 0L
+            var accumulatedWaitSinceResponseMs = 0L
+            var accumulatedWaitSinceLastAudioProgressMs = 0L
+            var accumulatedWaitSinceLocalPlaybackIdleMs = 0L
+            var lastSeenAudioChunkCount = 0
+            var lastSeenResponseStarted = false
+            var lastSeenBytesAccepted = 0L
+            var lastSeenPlaybackHeadFrames = 0L
+
+            while (true) {
+                var waitStepMs = 10L
+                var triggerTimeout = false
+                var triggerTimeoutMs = timeoutMs
+                var triggerFailureCode = "FIRST_RESPONSE_TIMEOUT"
+                var triggerFailureReason = ""
+                var shouldCountResponseWait = false
+                var shouldCountServerAudioIdleWait = false
+                var shouldCountPostPlaybackCompletionWait = false
+
+                synchronized(this@ConversationCoordinator) {
+                    if (activeTurn !== turn ||
+                        turn.closed ||
+                        turn.turnSeq != expectedSeq ||
+                        turn.turnGen != expectedTurnGen ||
+                        turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE) ||
+                        isDeliberatelyPaused ||
+                        isDeliberatelyStopped
+                    ) {
+                        return@launch
+                    }
+
+                    val nowMs = monotonicClockMs()
+                    val submittedAtMs = turn.tEndSubmittedMs ?: nowMs
+                    val firstRespMs = turn.tFirstResponseMs
+                    val firstAudioMs = turn.tFirstAudioReceivedMs
+                    val lastProgMs = turn.tLastServerProgressMs
+                    val audioChunks = turn.serverAudioChunksReceivedCount
+                    val playSnap = playbackAdapter.state.value
+                    val isTurnPlaybackActive =
+                        turn.playbackGen != null && playSnap.activeGeneration == turn.playbackGen
+                    val bytesAccepted = if (isTurnPlaybackActive) playSnap.bytesAcceptedByHardware else 0L
+                    val framesAccepted = if (isTurnPlaybackActive) playSnap.totalFramesWrittenToHardware else 0L
+                    val headFrames = if (isTurnPlaybackActive) playSnap.hardwarePlaybackHeadFrames else 0L
+                    val queuedBytes = if (isTurnPlaybackActive) playSnap.queuedBytes else 0L
+                    val isPlaying = isTurnPlaybackActive && playSnap.isPlaying
+
+                    if (firstRespMs != null && !lastSeenResponseStarted) {
+                        lastSeenResponseStarted = true
+                        accumulatedWaitSinceResponseMs = 0L
+                    }
+                    if (audioChunks > lastSeenAudioChunkCount) {
+                        lastSeenAudioChunkCount = audioChunks
+                        accumulatedWaitSinceLastAudioProgressMs = 0L
+                        turn.tAllReceivedAudioPlayedMs = null
+                        accumulatedWaitSinceLocalPlaybackIdleMs = 0L
+                    }
+                    if (bytesAccepted > lastSeenBytesAccepted || headFrames > lastSeenPlaybackHeadFrames) {
+                        lastSeenBytesAccepted = bytesAccepted
+                        lastSeenPlaybackHeadFrames = headFrames
+                        turn.tLastPlaybackProgressMs = maxOf(
+                            turn.tLastPlaybackProgressMs ?: 0L,
+                            nowMs,
+                            playSnap.lastHardwareProgressAtMs
+                        )
+                        accumulatedWaitSinceLocalPlaybackIdleMs = 0L
+                    }
+
+                    val totalElapsedMs = max((nowMs - submittedAtMs).coerceAtLeast(0L), accumulatedWaitMs)
+
+                    if (firstRespMs == null && firstAudioMs == null) {
+                        if (totalElapsedMs >= timeoutMs) {
+                            triggerTimeout = true
+                            triggerTimeoutMs = timeoutMs
+                            triggerFailureCode = "FIRST_RESPONSE_TIMEOUT"
+                            triggerFailureReason = "No server response within ${timeoutMs}ms after end-of-turn submission"
+                        } else {
+                            waitStepMs = (timeoutMs - totalElapsedMs).coerceAtLeast(10L)
+                        }
+                    } else if (firstAudioMs == null) {
+                        shouldCountResponseWait = true
+                        val audioWaitLimitMs = firstAudioAfterResponseTimeoutMs.coerceAtLeast(timeoutMs)
+                        val hardBoundMs = maxTurnResponseHardBoundMs.coerceAtLeast(audioWaitLimitMs)
+                        val elapsedSinceRespMs = max(
+                            (nowMs - (firstRespMs ?: submittedAtMs)).coerceAtLeast(0L),
+                            accumulatedWaitSinceResponseMs
+                        )
+                        if (elapsedSinceRespMs >= audioWaitLimitMs || totalElapsedMs >= hardBoundMs) {
+                            triggerTimeout = true
+                            triggerTimeoutMs = if (totalElapsedMs >= hardBoundMs && elapsedSinceRespMs < audioWaitLimitMs) {
+                                hardBoundMs
+                            } else {
+                                audioWaitLimitMs
+                            }
+                            triggerFailureCode = "FIRST_RESPONSE_TIMEOUT"
+                            triggerFailureReason =
+                                "Text-only server response received without any audio chunk within ${triggerTimeoutMs}ms (TEXT_ONLY_NO_AUDIO_RECEIVED)"
+                        } else {
+                            waitStepMs = minOf(
+                                audioWaitLimitMs - elapsedSinceRespMs,
+                                hardBoundMs - totalElapsedMs
+                            ).coerceAtLeast(10L)
+                        }
+                    } else {
+                        val stallLimitMs = serverOutputStallTimeoutMs.coerceAtLeast(100L)
+                        val completionWaitLimitMs = missingTurnCompleteTimeoutMs.coerceAtLeast(100L)
+                        val hardBoundMs = maxTurnResponseHardBoundMs.coerceAtLeast(
+                            maxOf(stallLimitMs, completionWaitLimitMs)
+                        )
+                        val refProgMs = lastProgMs ?: firstAudioMs
+                        val isActivelyPlayingLocalAudio =
+                            isTurnPlaybackActive &&
+                                isPlaying &&
+                                framesAccepted > 0L &&
+                                (queuedBytes > 0L || headFrames < framesAccepted)
+                        val allReceivedAudioPlayed =
+                            isTurnPlaybackActive &&
+                                isPlaying &&
+                                queuedBytes == 0L &&
+                                framesAccepted > 0L &&
+                                headFrames >= framesAccepted
+
+                        if (isActivelyPlayingLocalAudio) {
+                            turn.tAllReceivedAudioPlayedMs = null
+                            accumulatedWaitSinceLocalPlaybackIdleMs = 0L
+                            accumulatedWaitSinceLastAudioProgressMs = 0L
+                            if (totalElapsedMs >= hardBoundMs) {
+                                triggerTimeout = true
+                                triggerTimeoutMs = hardBoundMs
+                                triggerFailureCode = "SERVER_OUTPUT_STALL_TIMEOUT"
+                                triggerFailureReason =
+                                    "Server response exceeded hard upper bound of ${hardBoundMs}ms without turnComplete (audioChunks=$audioChunks, accepted=$framesAccepted frames, played=$headFrames frames)"
+                            } else {
+                                waitStepMs = minOf(
+                                    100L,
+                                    hardBoundMs - totalElapsedMs
+                                ).coerceAtLeast(10L)
+                            }
+                        } else if (allReceivedAudioPlayed) {
+                            shouldCountPostPlaybackCompletionWait = true
+                            accumulatedWaitSinceLastAudioProgressMs = 0L
+                            if (turn.tAllReceivedAudioPlayedMs == null) {
+                                turn.tAllReceivedAudioPlayedMs = maxOf(
+                                    nowMs,
+                                    playSnap.lastHardwareProgressAtMs,
+                                    refProgMs
+                                )
+                            }
+                            val playedDoneAtMs = turn.tAllReceivedAudioPlayedMs!!
+                            val idleAfterPlaybackMs = max(
+                                (nowMs - playedDoneAtMs).coerceAtLeast(0L),
+                                accumulatedWaitSinceLocalPlaybackIdleMs
+                            )
+                            if (totalElapsedMs >= hardBoundMs) {
+                                triggerTimeout = true
+                                triggerTimeoutMs = hardBoundMs
+                                triggerFailureCode = "MISSING_SERVER_TURN_COMPLETE"
+                                triggerFailureReason =
+                                    "All $audioChunks audio chunk(s) ($headFrames/$framesAccepted frames) finished playing without server turnComplete before hard bound of ${hardBoundMs}ms"
+                            } else if (idleAfterPlaybackMs >= completionWaitLimitMs) {
+                                triggerTimeout = true
+                                triggerTimeoutMs = completionWaitLimitMs
+                                triggerFailureCode = "MISSING_SERVER_TURN_COMPLETE"
+                                triggerFailureReason =
+                                    "All $audioChunks audio chunk(s) ($headFrames/$framesAccepted frames) finished playing, but server turnComplete did not arrive within ${completionWaitLimitMs}ms"
+                            } else {
+                                waitStepMs = minOf(
+                                    completionWaitLimitMs - idleAfterPlaybackMs,
+                                    hardBoundMs - totalElapsedMs
+                                ).coerceAtLeast(10L)
+                            }
+                        } else {
+                            turn.tAllReceivedAudioPlayedMs = null
+                            accumulatedWaitSinceLocalPlaybackIdleMs = 0L
+                            shouldCountServerAudioIdleWait = true
+                            val idleSinceProgressMs = max(
+                                (nowMs - refProgMs).coerceAtLeast(0L),
+                                accumulatedWaitSinceLastAudioProgressMs
+                            )
+                            if (totalElapsedMs >= hardBoundMs) {
+                                triggerTimeout = true
+                                triggerTimeoutMs = hardBoundMs
+                                triggerFailureCode = "SERVER_OUTPUT_STALL_TIMEOUT"
+                                triggerFailureReason =
+                                    "Server response exceeded hard upper bound of ${hardBoundMs}ms without turnComplete (audioChunks=$audioChunks)"
+                            } else if (idleSinceProgressMs >= stallLimitMs) {
+                                triggerTimeout = true
+                                triggerTimeoutMs = stallLimitMs
+                                triggerFailureCode = "SERVER_OUTPUT_STALL_TIMEOUT"
+                                triggerFailureReason =
+                                    "Server audio output stalled for ${stallLimitMs}ms mid-response after $audioChunks audio chunk(s) without turnComplete (queued=${playSnap.queuedFrames} frames, accepted=$framesAccepted frames, played=$headFrames frames)"
+                            } else {
+                                waitStepMs = minOf(
+                                    stallLimitMs - idleSinceProgressMs,
+                                    hardBoundMs - totalElapsedMs
+                                ).coerceAtLeast(10L)
+                            }
+                        }
+                    }
+                }
+
+                if (triggerTimeout) {
+                    turnScope.launch {
+                        handleFirstResponseTimeout(
+                            expectedTurnSeq = expectedSeq,
+                            expectedTurnGen = expectedTurnGen,
+                            timeoutMs = triggerTimeoutMs,
+                            failureCode = triggerFailureCode,
+                            failureDetailReason = triggerFailureReason
+                        )
+                    }
+                    return@launch
+                }
+
+                delay(waitStepMs)
+                accumulatedWaitMs += waitStepMs
+                if (shouldCountResponseWait) {
+                    accumulatedWaitSinceResponseMs += waitStepMs
+                }
+                if (shouldCountServerAudioIdleWait) {
+                    accumulatedWaitSinceLastAudioProgressMs += waitStepMs
+                }
+                if (shouldCountPostPlaybackCompletionWait) {
+                    accumulatedWaitSinceLocalPlaybackIdleMs += waitStepMs
+                }
             }
         }
     }
@@ -2231,7 +2876,9 @@ class ConversationCoordinator(
     private suspend fun handleFirstResponseTimeout(
         expectedTurnSeq: Long,
         expectedTurnGen: TurnGenerationId,
-        timeoutMs: Long
+        timeoutMs: Long,
+        failureCode: String = "FIRST_RESPONSE_TIMEOUT",
+        failureDetailReason: String = ""
     ) {
         val turn: TurnRuntimeState
         val missingStep: String
@@ -2239,23 +2886,28 @@ class ConversationCoordinator(
         val activeConvEnabled: Boolean
         val sessionId: SessionId
         val deferredToResolve: CompletableDeferred<VerifiedOutcome>
+        val preCleanupFrameSummary: String
         val recoveryJob: Job? = kotlin.coroutines.coroutineContext[Job]
 
         synchronized(this) {
             val currentTurn = activeTurn
             val currentUi = _uiState.value
+            val isStaleForFailureKind = if (failureCode == "FIRST_RESPONSE_TIMEOUT") {
+                currentTurn?.tFirstAudioReceivedMs != null || currentUi.state != ConversationState.PROCESSING
+            } else {
+                currentUi.state != ConversationState.PROCESSING && currentUi.state != ConversationState.SPEAKING
+            }
             if (currentTurn == null ||
                 currentTurn.closed ||
                 currentTurn.turnSeq != expectedTurnSeq ||
                 currentTurn.turnGen != expectedTurnGen ||
-                currentTurn.serverResponseStarted ||
+                isStaleForFailureKind ||
                 currentTurn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE) ||
-                currentUi.state != ConversationState.PROCESSING ||
                 isDeliberatelyPaused ||
                 isDeliberatelyStopped
             ) {
                 logTurnLifecycleEventLocked(
-                    "STALE_CALLBACK_DROPPED: Dropped stale first-response timeout for ${expectedTurnGen.wireId} " +
+                    "STALE_CALLBACK_DROPPED: Dropped stale watchdog timeout [$failureCode] for ${expectedTurnGen.wireId} " +
                         "(active=${currentTurn?.turnGen?.wireId ?: "none"}, state=${currentUi.state.wireLabel})."
                 )
                 _uiState.update { state ->
@@ -2265,12 +2917,33 @@ class ConversationCoordinator(
             }
 
             turn = currentTurn
+            val preCleanupPlaySnap = playbackAdapter.state.value
+            latchPlaybackSnapshotIntoTurnLocked(turn, preCleanupPlaySnap)
+            preCleanupFrameSummary =
+                "recv=${preCleanupPlaySnap.framesReceivedFromServer}, " +
+                    "queued=${preCleanupPlaySnap.queuedFrames}, " +
+                    "accepted=${preCleanupPlaySnap.totalFramesWrittenToHardware}, " +
+                    "played=${preCleanupPlaySnap.hardwarePlaybackHeadFrames}, " +
+                    "padding=${preCleanupPlaySnap.paddingFramesWrittenToHardware}, " +
+                    "chunks=${turn.serverAudioChunksReceivedCount}"
+
             turn.firstResponseTimeoutFired = true
+            turn.watchdogFailureCode = failureCode
             turn.completionHandled = true
             missingStep = turn.earliestMissingStep()
             previousTurnEarliestMissingStep = missingStep
             consecutiveFirstResponseTimeouts += 1
             val newTimeoutCount = currentUi.firstResponseTimeoutCount + 1
+            val newServerStallCount = if (failureCode == "SERVER_OUTPUT_STALL_TIMEOUT") {
+                currentUi.serverOutputStallCount + 1
+            } else {
+                currentUi.serverOutputStallCount
+            }
+            val newMissingTurnCompleteCount = if (failureCode == "MISSING_SERVER_TURN_COMPLETE") {
+                currentUi.missingTurnCompleteCount + 1
+            } else {
+                currentUi.missingTurnCompleteCount
+            }
             activeConvEnabled = currentUi.isActiveConversationEnabled
             sessionId = turn.sessionId
             deferredToResolve = turn.completionDeferred
@@ -2282,26 +2955,43 @@ class ConversationCoordinator(
                     isOnline
 
             logTurnLifecycleEventLocked(
-                "FIRST_RESPONSE_TIMEOUT[${turn.turnId.value} @ ${turn.turnGen.wireId}]: missing=$missingStep " +
+                "$failureCode[${turn.turnId.value} @ ${turn.turnGen.wireId}]: missing=$missingStep " +
                     "consecutive=$consecutiveFirstResponseTimeouts canRecover=$canAttemptSingleRecovery " +
+                    "frames=[$preCleanupFrameSummary] reason=$failureDetailReason " +
                     "trace=[${turn.structuredTraceEntries.joinToString(" -> ")}]"
             )
 
             cancelInactivityTimerLocked()
             activeTurn = null
             turn.dispose(cancelAllJobs = true)
-            audioCapture.stopAndRelease(reason = "FIRST_RESPONSE_TIMEOUT on ${turn.turnId.value}", wipeEphemeral = true)
-            playbackAdapter.stopAndFlush(reason = "FIRST_RESPONSE_TIMEOUT on ${turn.turnId.value}")
+            audioCapture.stopAndRelease(reason = "$failureCode on ${turn.turnId.value}", wipeEphemeral = true)
+            playbackAdapter.stopAndFlush(reason = "$failureCode on ${turn.turnId.value}")
             liveAdapter.setAudioPlaybackClaimed(false)
 
-            appendTurnEventLocked("FIRST_RESPONSE_TIMEOUT")
+            appendTurnEventLocked(failureCode)
+            recordTurnOutcomeLocked(
+                turn = turn,
+                category = Phase07TurnOutcomeCategory.TIMED_OUT,
+                outcomeCode = failureCode
+            )
 
             if (!canAttemptSingleRecovery) {
-                val failCode = if (!isOnline) "NETWORK_UNAVAILABLE" else "FIRST_RESPONSE_TIMEOUT"
+                val failCode = if (!isOnline) "NETWORK_UNAVAILABLE" else failureCode
+                val livePhaseNow = liveAdapter.state.value.phase
+                if (livePhaseNow == LiveConnectionPhase.ACTIVE ||
+                    livePhaseNow == LiveConnectionPhase.SETUP_ACCEPTED ||
+                    livePhaseNow == LiveConnectionPhase.CONNECTING ||
+                    livePhaseNow == LiveConnectionPhase.RECONNECTING
+                ) {
+                    liveAdapter.disconnectAndRelease(
+                        reason = "Terminal $failCode on ${turn.turnId.value} ($preCleanupFrameSummary)"
+                    )
+                }
+                val reasonSuffix = if (failureDetailReason.isNotBlank()) " [$failureDetailReason | $preCleanupFrameSummary]" else " [$preCleanupFrameSummary]"
                 val detailMsg =
-                    "$failCode after ${timeoutMs}ms waiting in PROCESSING (earliestMissing=$missingStep, " +
-                        "timeouts=$consecutiveFirstResponseTimeouts). Stopped without infinite retries; press Start to try again."
-                val actId = idGenerator.nextActionId("first_response_timeout")
+                    "$failCode after ${timeoutMs}ms waiting in ${currentUi.state.wireLabel} (earliestMissing=$missingStep, " +
+                        "timeouts=$consecutiveFirstResponseTimeouts)$reasonSuffix. Stopped without infinite retries; press Start to try again."
+                val actId = idGenerator.nextActionId(actionVerbForFailureCode(failCode, isTimeoutEnd = false))
                 val updatedSeq = appendTurnStateLocked(ConversationState.ERROR)
                 val updatedReadiness = appendReadinessOrderLocked("ERROR")
                 val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
@@ -2313,6 +3003,16 @@ class ConversationCoordinator(
                     failureCode = failCode,
                     detail = detailMsg
                 )
+                lastCompletedTurnRuntime = turn
+                recordDiagnosticErrorLocked(
+                    stage = "${currentUi.state.wireLabel}_WATCHDOG",
+                    errorCode = failCode,
+                    rawSummary = detailMsg,
+                    sessionId = sessionId,
+                    turnId = turn.turnId,
+                    generationWireId = turn.turnGen.wireId
+                )
+                syncTimingSnapshotsLocked()
                 _uiState.update { state ->
                     state.copy(
                         currentTurnId = turn.turnId,
@@ -2326,6 +3026,8 @@ class ConversationCoordinator(
                         structuredTurnTrace = turn.structuredTraceEntries.toList(),
                         activeTurnEarliestMissingStep = missingStep,
                         firstResponseTimeoutCount = newTimeoutCount,
+                        serverOutputStallCount = newServerStallCount,
+                        missingTurnCompleteCount = newMissingTurnCompleteCount,
                         activeVoiceTurnErrorCode = failCode,
                         activeVoiceTurnErrorDetail = detailMsg,
                         lastVoiceTurnSummary = "ERROR [$failCode]: $detailMsg"
@@ -2346,8 +3048,9 @@ class ConversationCoordinator(
             activeTimeoutRecoveryJob = recoveryJob
             activeTimeoutRecoveryDeferred = deferredToResolve
             val preparingPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.PREPARING)
+            val reasonSuffix = if (failureDetailReason.isNotBlank()) " [$failureDetailReason | $preCleanupFrameSummary]" else " [$preCleanupFrameSummary]"
             val recoveryStatus =
-                "FIRST_RESPONSE_TIMEOUT after ${timeoutMs}ms (missing=$missingStep). Performing 1 clean Gemini Live session recovery..."
+                "$failureCode after ${timeoutMs}ms (missing=$missingStep)$reasonSuffix. Performing 1 clean Gemini Live session recovery..."
             _uiState.update { state ->
                 state.copy(
                     currentTurnId = turn.turnId,
@@ -2359,7 +3062,9 @@ class ConversationCoordinator(
                     structuredTurnTrace = turn.structuredTraceEntries.toList(),
                     activeTurnEarliestMissingStep = missingStep,
                     firstResponseTimeoutCount = newTimeoutCount,
-                    activeVoiceTurnErrorCode = "FIRST_RESPONSE_TIMEOUT",
+                    serverOutputStallCount = newServerStallCount,
+                    missingTurnCompleteCount = newMissingTurnCompleteCount,
+                    activeVoiceTurnErrorCode = failureCode,
                     activeVoiceTurnErrorDetail = recoveryStatus,
                     lastVoiceTurnSummary = recoveryStatus
                 )
@@ -2370,7 +3075,7 @@ class ConversationCoordinator(
             withContext(backgroundDispatcher) {
                 liveAdapter.recreateSessionAfterInterruption(
                     sessionId = sessionId,
-                    reason = "Single clean recovery after FIRST_RESPONSE_TIMEOUT (missing=$missingStep)"
+                    reason = "Single clean recovery after $failureCode (missing=$missingStep)"
                 )
             }
         } catch (t: Throwable) {
@@ -2407,14 +3112,24 @@ class ConversationCoordinator(
 
             if (isRecovered && activeConvEnabled) {
                 val actId = idGenerator.nextActionId("timeout_recovered")
+                val reasonSuffix = if (failureDetailReason.isNotBlank()) " [$failureDetailReason | $preCleanupFrameSummary]" else " [$preCleanupFrameSummary]"
                 val recoveryOutcome = VerifiedOutcome.PrerequisiteFailureOutcome(
                     actionId = actId,
                     sessionId = sessionId,
                     turnId = turn.turnId,
                     resultingState = ConversationState.LISTENING,
-                    failureCode = "FIRST_RESPONSE_TIMEOUT",
-                    detail = "FIRST_RESPONSE_TIMEOUT after ${timeoutMs}ms (missing=$missingStep). Clean Live recovery succeeded (${recoveredLiveState.activeGeneration?.wireId ?: "live"}); resuming LISTENING automatically."
+                    failureCode = failureCode,
+                    detail = "$failureCode after ${timeoutMs}ms (missing=$missingStep)$reasonSuffix. Clean Live recovery succeeded (${recoveredLiveState.activeGeneration?.wireId ?: "live"}); resuming LISTENING automatically."
                 )
+                recordDiagnosticErrorLocked(
+                    stage = "RECOVERED_TURN_HISTORY",
+                    errorCode = failureCode,
+                    rawSummary = recoveryOutcome.detail,
+                    sessionId = sessionId,
+                    turnId = turn.turnId,
+                    generationWireId = turn.turnGen.wireId
+                )
+                archiveActiveDiagnosticErrorLocked()
                 _uiState.update { state ->
                     state.copy(
                         firstResponseRecoveryCount = state.firstResponseRecoveryCount + 1
@@ -2423,7 +3138,8 @@ class ConversationCoordinator(
                 autoRestoreCaptureForNextTurnLocked(
                     previousTurnId = turn.turnId,
                     completedTurn = turn,
-                    allowRestoreAfterTimeoutRecovery = true
+                    allowRestoreAfterTimeoutRecovery = true,
+                    recoveryReasonCode = failureCode
                 )
                 _uiState.update { state ->
                     state.copy(activeTurnEarliestMissingStep = missingStep)
@@ -2437,14 +3153,27 @@ class ConversationCoordinator(
                     recoveredLiveState.phase == LiveConnectionPhase.NETWORK_UNAVAILABLE -> "NETWORK_UNAVAILABLE"
                 !isRecovered && recoveredLiveState.failureClassification != LiveFailureClassification.NONE ->
                     recoveredLiveState.failureClassification.wireCode
-                else -> "FIRST_RESPONSE_TIMEOUT"
+                else -> failureCode
             }
+            val postRecoveryLivePhase = liveAdapter.state.value.phase
+            if (!isRecovered && (
+                    postRecoveryLivePhase == LiveConnectionPhase.ACTIVE ||
+                        postRecoveryLivePhase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                        postRecoveryLivePhase == LiveConnectionPhase.CONNECTING ||
+                        postRecoveryLivePhase == LiveConnectionPhase.RECONNECTING
+                    )
+            ) {
+                liveAdapter.disconnectAndRelease(
+                    reason = "Recovery incomplete for $failCode on ${turn.turnId.value}"
+                )
+            }
+            val reasonSuffix = if (failureDetailReason.isNotBlank()) " [$failureDetailReason | $preCleanupFrameSummary]" else " [$preCleanupFrameSummary]"
             val detailMsg = if (isRecovered) {
-                "FIRST_RESPONSE_TIMEOUT after ${timeoutMs}ms (missing=$missingStep). Clean Live recovery succeeded for next turn; press Start to speak again."
+                "$failureCode after ${timeoutMs}ms (missing=$missingStep)$reasonSuffix. Clean Live recovery succeeded for next turn; press Start to speak again."
             } else {
-                "$failCode: First-response timed out after ${timeoutMs}ms (missing=$missingStep) and single Live recovery failed (${DiagnosticRedactor.redact(recoveredLiveState.statusDetail)})."
+                "$failCode: Timed out ($failureCode) after ${timeoutMs}ms (missing=$missingStep)$reasonSuffix and single Live recovery failed (${DiagnosticRedactor.redact(recoveredLiveState.statusDetail)})."
             }
-            val actId = idGenerator.nextActionId("first_response_timeout_end")
+            val actId = idGenerator.nextActionId(actionVerbForFailureCode(failCode, isTimeoutEnd = true))
             val updatedSeq = appendTurnStateLocked(ConversationState.ERROR)
             val updatedReadiness = appendReadinessOrderLocked("ERROR")
             val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
@@ -2456,6 +3185,16 @@ class ConversationCoordinator(
                 failureCode = failCode,
                 detail = detailMsg
             )
+            lastCompletedTurnRuntime = turn
+            recordDiagnosticErrorLocked(
+                stage = "${_uiState.value.state.wireLabel}_WATCHDOG",
+                errorCode = failCode,
+                rawSummary = detailMsg,
+                sessionId = sessionId,
+                turnId = turn.turnId,
+                generationWireId = turn.turnGen.wireId
+            )
+            syncTimingSnapshotsLocked()
             _uiState.update { state ->
                 state.copy(
                     currentTurnId = turn.turnId,
@@ -2515,6 +3254,12 @@ class ConversationCoordinator(
             when (event) {
                 is PlaybackCallbackEvent.BytesAcceptedByHardware -> {
                     if (event.totalBytesAccepted > 0L) {
+                        val nowMs = monotonicClockMs()
+                        turn.tLastPlaybackProgressMs = maxOf(turn.tLastPlaybackProgressMs ?: 0L, nowMs)
+                        if (turn.tFirstHardwareWriteMs == null) {
+                            turn.tFirstHardwareWriteMs = nowMs
+                            syncTimingSnapshotsLocked()
+                        }
                         transitionToSpeakingLocked(turn, activePlaybackGen)
                     }
                 }
@@ -2546,6 +3291,12 @@ class ConversationCoordinator(
     ) {
         if (turn.closed || playbackAdapter.state.value.bytesAcceptedByHardware <= 0L) {
             return
+        }
+        val nowMs = monotonicClockMs()
+        turn.tLastPlaybackProgressMs = maxOf(turn.tLastPlaybackProgressMs ?: 0L, nowMs)
+        if (turn.tFirstHardwareWriteMs == null) {
+            turn.tFirstHardwareWriteMs = nowMs
+            syncTimingSnapshotsLocked()
         }
         appendTurnEventLocked("AUDIO_TRACK_WRITES")
         appendFirstTurnLifecycleLocked("PLAYBACK")
@@ -2663,8 +3414,12 @@ class ConversationCoordinator(
                         }
                         return
                     }
+                    val eventAtMs = monotonicClockMs()
                     val liveGenWire = liveAdapter.state.value.activeGeneration?.wireId
                     if (!event.inputTranscript.isNullOrBlank()) {
+                        if (turn.tServerInputAckMs == null) {
+                            turn.tServerInputAckMs = eventAtMs
+                        }
                         turn.recordStep(
                             step = TurnTraceStep.SERVER_INPUT_TRANSCRIPTION,
                             timestampLabel = clockProvider(),
@@ -2681,8 +3436,11 @@ class ConversationCoordinator(
                                 turnGen = turn.turnGen
                             )
                         }
+                        if (turn.tFirstResponseMs == null) {
+                            turn.tFirstResponseMs = eventAtMs
+                        }
+                        turn.tLastServerProgressMs = eventAtMs
                         turn.serverResponseStarted = true
-                        turn.cancelWatchdog()
                         if (!turn.hasStep(TurnTraceStep.SERVER_RESPONSE_START)) {
                             turn.recordStep(
                                 step = TurnTraceStep.SERVER_RESPONSE_START,
@@ -2697,6 +3455,12 @@ class ConversationCoordinator(
                     val current = _uiState.value
                     val updatedUser = mergeTranscriptFragment(current.currentTurnUserTranscript, event.inputTranscript)
                     val updatedModel = mergeTranscriptFragment(current.currentTurnModelTranscript, event.outputTranscript)
+                    if (updatedModel.isNotBlank()) {
+                        turn.redactedOutputWordCount = updatedModel.trim()
+                            .split(Regex("\\s+"))
+                            .count { it.isNotEmpty() }
+                    }
+                    syncTimingSnapshotsLocked()
                     val summaryParts = buildList {
                         if (updatedUser.isNotBlank()) add("Heard: \"$updatedUser\"")
                         if (updatedModel.isNotBlank()) add("Gemini: \"$updatedModel\"")
@@ -2742,6 +3506,7 @@ class ConversationCoordinator(
                     turnGen = turn.turnGen
                     playbackGen = currentPlaybackGen
 
+                    val audioChunkAtMs = monotonicClockMs()
                     val liveGenWire = liveAdapter.state.value.activeGeneration?.wireId
                     if (_uiState.value.state == ConversationState.LISTENING) {
                         cancelInactivityTimerLocked()
@@ -2762,8 +3527,16 @@ class ConversationCoordinator(
                         )
                     }
 
+                    if (turn.tFirstResponseMs == null) {
+                        turn.tFirstResponseMs = audioChunkAtMs
+                    }
+                    if (turn.tFirstAudioReceivedMs == null) {
+                        turn.tFirstAudioReceivedMs = audioChunkAtMs
+                    }
+                    turn.tLastServerProgressMs = audioChunkAtMs
+                    turn.tAllReceivedAudioPlayedMs = null
+                    turn.serverAudioChunksReceivedCount += 1
                     turn.serverResponseStarted = true
-                    turn.cancelWatchdog()
                     if (!turn.hasStep(TurnTraceStep.SERVER_RESPONSE_START)) {
                         turn.recordStep(
                             step = TurnTraceStep.SERVER_RESPONSE_START,
@@ -2780,6 +3553,13 @@ class ConversationCoordinator(
                             detail = "bytes=${event.pcmBytes.size}"
                         )
                     }
+                    if (turn.endOfTurnSubmitted &&
+                        !turn.firstResponseWatchdogArmed &&
+                        !turn.hasStep(TurnTraceStep.SERVER_TURN_COMPLETE)
+                    ) {
+                        armFirstResponseWatchdogLocked(turn)
+                    }
+                    syncTimingSnapshotsLocked()
                     appendTurnEventLocked("SERVER_RESPONSE_START")
                     appendTurnEventLocked("AUDIO_CHUNKS_RECEIVED")
                     appendFirstTurnLifecycleLocked("SERVER_RESPONSE")
@@ -2789,84 +3569,83 @@ class ConversationCoordinator(
                             activeTurnEarliestMissingStep = turn.earliestMissingStep()
                         )
                     }
+                }
 
-                    val writeJob = turnScope.launch(turn.parentJob) {
-                        val writeOutcome = playbackAdapter.verifyAndWritePcmChunk(
-                            generationId = playbackGen,
-                            rawMimeType = event.mimeType,
-                            pcmBytes = event.pcmBytes,
-                            onEvent = { pbEvent ->
-                                onTurnBoundPlaybackCallback(pbEvent)
-                            }
+                // Synchronous non-blocking FIFO enqueue into LiveAudioPlaybackAdapter so the
+                // receive collector never builds a fragile coroutine join chain or blocks on AudioTrack.write.
+                val writeOutcome = playbackAdapter.enqueueVerifiedPcmChunk(
+                    generationId = playbackGen,
+                    rawMimeType = event.mimeType,
+                    pcmBytes = event.pcmBytes,
+                    onEvent = { pbEvent ->
+                        onTurnBoundPlaybackCallback(pbEvent)
+                    }
+                )
+                syncPlaybackState()
+
+                synchronized(this) {
+                    if (activeTurn !== turn ||
+                        turn.closed ||
+                        turn.turnSeq != turnSeq ||
+                        turn.turnGen != turnGen ||
+                        turn.playbackGen != playbackGen ||
+                        _uiState.value.sessionId != turnGen.sessionId ||
+                        isDeliberatelyPaused ||
+                        isDeliberatelyStopped
+                    ) {
+                        logTurnLifecycleEventLocked(
+                            "STALE_CALLBACK_DROPPED: Ignored late enqueue outcome for ${turnGen.wireId}/${playbackGen.wireId} " +
+                                "(active=${activeTurn?.turnGen?.wireId ?: "none"}/${activeTurn?.playbackGen?.wireId ?: "none"})."
                         )
-                        syncPlaybackState()
-
-                        synchronized(this@ConversationCoordinator) {
-                            if (activeTurn !== turn ||
-                                turn.closed ||
-                                turn.turnSeq != turnSeq ||
-                                turn.turnGen != turnGen ||
-                                turn.playbackGen != playbackGen ||
-                                _uiState.value.sessionId != turnGen.sessionId ||
-                                isDeliberatelyPaused ||
-                                isDeliberatelyStopped
-                            ) {
-                                logTurnLifecycleEventLocked(
-                                    "STALE_CALLBACK_DROPPED: Ignored late write callback for ${turnGen.wireId}/${playbackGen.wireId} " +
-                                        "(active=${activeTurn?.turnGen?.wireId ?: "none"}/${activeTurn?.playbackGen?.wireId ?: "none"})."
-                                )
-                                _uiState.update { state ->
-                                    state.copy(staleTurnCallbacksDropped = state.staleTurnCallbacksDropped + 1)
-                                }
-                                return@launch
-                            }
-                            if (writeOutcome is PcmChunkWriteOutcome.DroppedStaleGeneration) {
-                                logTurnLifecycleEventLocked(
-                                    "STALE_CALLBACK_DROPPED: Dropped stale playback write outcome for ${playbackGen.wireId} " +
-                                        "(active=${writeOutcome.activeGenerationId?.wireId ?: "none"})."
-                                )
-                                _uiState.update { state ->
-                                    state.copy(staleTurnCallbacksDropped = state.staleTurnCallbacksDropped + 1)
-                                }
-                                return@launch
-                            }
-                            when (writeOutcome) {
-                                is PcmChunkWriteOutcome.WrittenToHardware -> {
-                                    if (playbackAdapter.state.value.bytesAcceptedByHardware > 0L) {
-                                        transitionToSpeakingLocked(turn, playbackGen)
-                                    }
-                                }
-                                is PcmChunkWriteOutcome.RejectedMime -> {
-                                    failActiveVoiceTurnLocked(
-                                        failureCode = "UNSUPPORTED_AUDIO_MIME",
-                                        detail = "Native-audio playback failed [UNSUPPORTED_AUDIO_MIME] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
-                                        expectedSessionId = turnGen.sessionId,
-                                        expectedTurnSeq = turnSeq,
-                                        expectedTurnGen = turnGen,
-                                        expectedPlaybackGen = playbackGen
-                                    )
-                                }
-                                is PcmChunkWriteOutcome.FailedWrite -> {
-                                    val code = if (writeOutcome.reason.startsWith("PLAYBACK_TRACK_INIT_FAILED")) {
-                                        "AUDIO_PLAYBACK_WRITE_FAILED"
-                                    } else {
-                                        "AUDIO_TRACK_WRITE_FAILED"
-                                    }
-                                    failActiveVoiceTurnLocked(
-                                        failureCode = code,
-                                        detail = "Native-audio playback failed [$code] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
-                                        expectedSessionId = turnGen.sessionId,
-                                        expectedTurnSeq = turnSeq,
-                                        expectedTurnGen = turnGen,
-                                        expectedPlaybackGen = playbackGen
-                                    )
-                                }
-                                is PcmChunkWriteOutcome.DroppedStaleGeneration -> Unit
+                        _uiState.update { state ->
+                            state.copy(staleTurnCallbacksDropped = state.staleTurnCallbacksDropped + 1)
+                        }
+                        return
+                    }
+                    if (writeOutcome is PcmChunkWriteOutcome.DroppedStaleGeneration) {
+                        logTurnLifecycleEventLocked(
+                            "STALE_CALLBACK_DROPPED: Dropped stale playback enqueue outcome for ${playbackGen.wireId} " +
+                                "(active=${writeOutcome.activeGenerationId?.wireId ?: "none"})."
+                        )
+                        _uiState.update { state ->
+                            state.copy(staleTurnCallbacksDropped = state.staleTurnCallbacksDropped + 1)
+                        }
+                        return
+                    }
+                    when (writeOutcome) {
+                        is PcmChunkWriteOutcome.WrittenToHardware -> {
+                            syncTimingSnapshotsLocked()
+                            if (playbackAdapter.state.value.bytesAcceptedByHardware > 0L) {
+                                transitionToSpeakingLocked(turn, playbackGen)
                             }
                         }
+                        is PcmChunkWriteOutcome.RejectedMime -> {
+                            failActiveVoiceTurnLocked(
+                                failureCode = "UNSUPPORTED_AUDIO_MIME",
+                                detail = "Native-audio playback failed [UNSUPPORTED_AUDIO_MIME] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
+                                expectedSessionId = turnGen.sessionId,
+                                expectedTurnSeq = turnSeq,
+                                expectedTurnGen = turnGen,
+                                expectedPlaybackGen = playbackGen
+                            )
+                        }
+                        is PcmChunkWriteOutcome.FailedWrite -> {
+                            val code = if (writeOutcome.reason.startsWith("PLAYBACK_TRACK_INIT_FAILED")) {
+                                "AUDIO_PLAYBACK_WRITE_FAILED"
+                            } else {
+                                "AUDIO_TRACK_WRITE_FAILED"
+                            }
+                            failActiveVoiceTurnLocked(
+                                failureCode = code,
+                                detail = "Native-audio playback failed [$code] on ${turnGen.turnIdValue}: ${writeOutcome.reason}",
+                                expectedSessionId = turnGen.sessionId,
+                                expectedTurnSeq = turnSeq,
+                                expectedTurnGen = turnGen,
+                                expectedPlaybackGen = playbackGen
+                            )
+                        }
+                        is PcmChunkWriteOutcome.DroppedStaleGeneration -> Unit
                     }
-                    turn.writeJobs.removeAll { it.isCompleted }
-                    turn.writeJobs.add(writeJob)
                 }
             }
 
@@ -2899,6 +3678,10 @@ class ConversationCoordinator(
                     turnSeq = turn.turnSeq
                     turnGen = turn.turnGen
                     playbackGen = currentPlaybackGen
+                    val completedAtMs = monotonicClockMs()
+                    if (turn.tFirstResponseMs == null) {
+                        turn.tFirstResponseMs = completedAtMs
+                    }
                     turn.serverResponseStarted = true
                     turn.cancelWatchdog()
 
@@ -2918,6 +3701,7 @@ class ConversationCoordinator(
                         liveGenWireId = liveGenWire,
                         detail = "interrupted=${event.interrupted}"
                     )
+                    syncTimingSnapshotsLocked()
                     cancelInactivityTimerLocked()
                     if (_uiState.value.state == ConversationState.LISTENING || audioCapture.state.value.isCapturing) {
                         stopTurnMicrophoneLocked(
@@ -2957,7 +3741,20 @@ class ConversationCoordinator(
                         }
 
                         val preDrainSnap = playbackAdapter.state.value
-                        val drained = if (preDrainSnap.activeGeneration == playbackGen) {
+                        val isSilentNoAudioTurnComplete =
+                            !event.interrupted &&
+                                synchronized(this@ConversationCoordinator) { turn.serverAudioChunksReceivedCount == 0 } &&
+                                preDrainSnap.chunksReceived == 0 &&
+                                preDrainSnap.framesReceivedFromServer == 0L &&
+                                preDrainSnap.lastError == null
+
+                        val drained = if (isSilentNoAudioTurnComplete) {
+                            playbackAdapter.stopAndFlush(
+                                reason = "Server completed turn with 0 audio chunks (no-response/noise ignored)",
+                                expectedGenerationId = playbackGen
+                            )
+                            false
+                        } else if (preDrainSnap.activeGeneration == playbackGen) {
                             playbackAdapter.awaitHardwareDrainAfterServerTurnComplete(playbackGen)
                         } else {
                             false
@@ -3063,6 +3860,87 @@ class ConversationCoordinator(
                             recordHandledCompletionTurnGenLocked(turnGen.wireId)
                             appendTurnEventLocked("SERVER_TURN_COMPLETE")
                             val playSnap = playbackAdapter.state.value
+                            if (isSilentNoAudioTurnComplete) {
+                                appendTurnEventLocked("NO_AUDIO_RESPONSE_IGNORED")
+                                appendTurnEventLocked("READY")
+                                consecutiveFirstResponseTimeouts = 0
+                                turn.completionHandled = true
+                                turn.drainJob = null
+                                lastCompletedTurnRuntime = turn
+                                activeTurn = null
+                                liveAdapter.setAudioPlaybackClaimed(false)
+                                recordTurnOutcomeLocked(
+                                    turn = turn,
+                                    category = Phase07TurnOutcomeCategory.NO_SPEECH_REJECTED,
+                                    outcomeCode = "NO_RESPONSE_TURN_IGNORED"
+                                )
+                                syncTimingSnapshotsLocked()
+
+                                val current = _uiState.value
+                                val updatedSeq = appendTurnStateLocked(ConversationState.READY)
+                                val updatedReadiness = appendReadinessOrderLocked("READY")
+                                val noAudioSummary =
+                                    "READY: Server completed ${current.currentTurnId.value} with 0 audio chunks (unintelligible/noise ignored); returning to listening."
+                                readyOutcome = VerifiedOutcome.VoiceTurnOutcome(
+                                    actionId = idGenerator.nextActionId("turn_no_response_ignored"),
+                                    sessionId = current.sessionId,
+                                    turnId = current.currentTurnId,
+                                    resultingState = ConversationState.READY,
+                                    stateSequence = updatedSeq,
+                                    micFramesSent = current.voiceTurnFramesSent,
+                                    playbackFramesDrained = 0L,
+                                    isPlaybackDrained = false,
+                                    code = "NO_RESPONSE_TURN_IGNORED",
+                                    detail = noAudioSummary
+                                )
+                                val wantsAutoRestore =
+                                    _uiState.value.isActiveConversationEnabled &&
+                                        !isDeliberatelyPaused &&
+                                        !isDeliberatelyStopped
+                                val sessionReadyNow =
+                                    liveAdapter.isSessionReadyForAudio() && !needsSessionRecreationBeforeNextTurn
+
+                                _uiState.update { state ->
+                                    state.copy(
+                                        activeConversationPhase = ActiveConversationPhase.IDLE,
+                                        activeTurnGenerationId = null,
+                                        voiceTurnStateSequence = updatedSeq,
+                                        voiceTurnReadinessOrder = updatedReadiness,
+                                        lastCompletedTurnTrace = turn.structuredTraceEntries.toList(),
+                                        lastCompletedTurnEarliestMissingStep = turn.earliestMissingStep(),
+                                        structuredTurnTrace = turn.structuredTraceEntries.toList(),
+                                        activeTurnEarliestMissingStep = turn.earliestMissingStep(),
+                                        lastVoiceTurnSummary = noAudioSummary
+                                    )
+                                }
+                                applyVerifiedOutcome(
+                                    sessionId = current.sessionId,
+                                    turnId = current.currentTurnId,
+                                    actionId = readyOutcome!!.actionId,
+                                    newState = ConversationState.READY,
+                                    roleLabel = "VOICE_TURN_COORDINATOR",
+                                    outcome = readyOutcome!!
+                                )
+
+                                if (wantsAutoRestore && sessionReadyNow) {
+                                    autoRestoreCaptureForNextTurnLocked(
+                                        previousTurnId = current.currentTurnId,
+                                        completedTurn = turn,
+                                        allowRestoreAfterTimeoutRecovery = true
+                                    )
+                                } else if (wantsAutoRestore) {
+                                    recoveryJobToStart = prepareNextTurnSessionRecoveryLocked(
+                                        sessionId = current.sessionId,
+                                        previousTurnId = current.currentTurnId,
+                                        completedTurn = turn
+                                    )
+                                } else {
+                                    logTurnLifecycleEventLocked(
+                                        "TurnNoAudioComplete[${turn.turnId.value}]: ${turn.structuredTraceEntries.joinToString(" -> ")}"
+                                    )
+                                }
+                                return@synchronized
+                            }
                             if (!drained || !playSnap.isPlaybackDrained || playSnap.totalFramesWrittenToHardware <= 0L) {
                                 val failCode = when {
                                     playSnap.totalFramesWrittenToHardware <= 0L ->
@@ -3089,6 +3967,10 @@ class ConversationCoordinator(
                                 return@launch
                             }
 
+                            val drainedAtMs = monotonicClockMs()
+                            if (turn.tPlaybackDrainedMs == null) {
+                                turn.tPlaybackDrainedMs = drainedAtMs
+                            }
                             val liveGenWire = liveAdapter.state.value.activeGeneration?.wireId
                             turn.recordStep(
                                 step = TurnTraceStep.AUDIOTRACK_FRAMES_DRAINED,
@@ -3104,8 +3986,15 @@ class ConversationCoordinator(
 
                             turn.completionHandled = true
                             turn.drainJob = null
+                            lastCompletedTurnRuntime = turn
                             activeTurn = null
                             liveAdapter.setAudioPlaybackClaimed(false)
+                            recordTurnOutcomeLocked(
+                                turn = turn,
+                                category = Phase07TurnOutcomeCategory.COMPLETED,
+                                outcomeCode = "VOICE_TURN_COMPLETED_DRAINED"
+                            )
+                            syncTimingSnapshotsLocked()
 
                             val current = _uiState.value
                             val updatedSeq = appendTurnStateLocked(ConversationState.READY)
@@ -3157,7 +4046,8 @@ class ConversationCoordinator(
                                 _uiState.value.isActiveConversationEnabled &&
                                     !isDeliberatelyPaused &&
                                     !isDeliberatelyStopped
-                            val sessionReadyNow = liveAdapter.isSessionReadyForAudio()
+                            val sessionReadyNow =
+                                liveAdapter.isSessionReadyForAudio() && !needsSessionRecreationBeforeNextTurn
 
                             _uiState.update { state ->
                                 state.copy(
@@ -3222,6 +4112,24 @@ class ConversationCoordinator(
                     if (activeTurn === turn && !turn.closed && turn.turnSeq == turnSeq) {
                         turn.drainJob = drainJob
                     }
+                }
+            }
+
+            is LiveSocketCallbackEvent.SessionResumptionUpdated -> {
+                synchronized(this) {
+                    syncLiveState()
+                    syncTimingSnapshotsLocked()
+                }
+            }
+
+            is LiveSocketCallbackEvent.ServerGoAwayReceived -> {
+                synchronized(this) {
+                    needsSessionRecreationBeforeNextTurn = true
+                    logTurnLifecycleEventLocked(
+                        "SERVER_GO_AWAY_RECEIVED: timeLeftMs=${event.timeLeftMs} gen=${event.generationId.wireId}"
+                    )
+                    syncLiveState()
+                    syncTimingSnapshotsLocked()
                 }
             }
 
@@ -3379,10 +4287,22 @@ class ConversationCoordinator(
 
         var createdJob: Job? = null
         val job = turnScope.launch(start = CoroutineStart.LAZY) {
+            val needsExplicitRecreate = synchronized(this@ConversationCoordinator) {
+                val flag = needsSessionRecreationBeforeNextTurn
+                needsSessionRecreationBeforeNextTurn = false
+                flag
+            }
             val recoveredState = try {
                 withContext(backgroundDispatcher) {
                     withTimeoutOrNull(connectionTimeoutMs) {
-                        liveAdapter.ensureConnectedSession(sessionId)
+                        if (needsExplicitRecreate) {
+                            liveAdapter.recreateSessionAfterInterruption(
+                                sessionId = sessionId,
+                                reason = "Proactive session rotation before next turn (ServerGoAway or interruption)"
+                            )
+                        } else {
+                            liveAdapter.ensureConnectedSession(sessionId)
+                        }
                     }
                 }
             } catch (c: CancellationException) {
@@ -3418,7 +4338,8 @@ class ConversationCoordinator(
                 if (recoveredState != null && liveAdapter.isSessionReadyForAudio()) {
                     autoRestoreCaptureForNextTurnLocked(
                         previousTurnId = previousTurnId,
-                        completedTurn = completedTurn
+                        completedTurn = completedTurn,
+                        allowRestoreAfterTimeoutRecovery = completedTurn.tPlaybackDrainedMs == null
                     )
                 } else {
                     val rawDiagnostic =
@@ -3440,6 +4361,14 @@ class ConversationCoordinator(
                         resultingState = ConversationState.ERROR,
                         failureCode = failureCode,
                         detail = failureDetail
+                    )
+                    recordDiagnosticErrorLocked(
+                        stage = "NEXT_TURN_RECOVERY",
+                        errorCode = failureCode,
+                        rawSummary = failureDetail,
+                        sessionId = sessionId,
+                        turnId = previousTurnId,
+                        generationWireId = completedTurn.turnGen.wireId
                     )
                     _uiState.update { state ->
                         state.copy(
@@ -3517,8 +4446,32 @@ class ConversationCoordinator(
         val savedTrace = turn?.structuredTraceEntries?.toList() ?: _uiState.value.structuredTurnTrace
         val missingStep = turn?.earliestMissingStep() ?: _uiState.value.activeTurnEarliestMissingStep
         previousTurnEarliestMissingStep = missingStep
+        val isHardwareStall = failureCode == "HARDWARE_PLAYBACK_STALL" || failureCode == "HARDWARE_DRAIN_INCOMPLETE"
+        if (turn != null) {
+            latchPlaybackSnapshotIntoTurnLocked(turn, playbackAdapter.state.value)
+            lastCompletedTurnRuntime = turn
+            val category = when {
+                failureCode == "SERVER_TURN_INTERRUPTED" -> Phase07TurnOutcomeCategory.INTERRUPTED
+                failureCode.contains("TIMEOUT") || failureCode.contains("STALL") -> Phase07TurnOutcomeCategory.TIMED_OUT
+                else -> Phase07TurnOutcomeCategory.FAILED
+            }
+            recordTurnOutcomeLocked(
+                turn = turn,
+                category = category,
+                outcomeCode = failureCode
+            )
+        }
+        recordDiagnosticErrorLocked(
+            stage = current.state.wireLabel,
+            errorCode = failureCode,
+            rawSummary = detail,
+            sessionId = current.sessionId,
+            turnId = failingTurnId,
+            generationWireId = expectedTurnGen?.wireId ?: turn?.turnGen?.wireId ?: "NONE"
+        )
         cancelActiveTurnStreamsLocked(reason = "Voice turn failed [$failureCode]")
-        val actId = idGenerator.nextActionId("turn_error")
+        syncTimingSnapshotsLocked()
+        val actId = idGenerator.nextActionId(actionVerbForFailureCode(failureCode))
         val updatedSeq = appendTurnStateLocked(ConversationState.ERROR)
         val updatedReadiness = appendReadinessOrderLocked("ERROR")
         val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
@@ -3542,6 +4495,7 @@ class ConversationCoordinator(
                 lastCompletedTurnTrace = if (savedTrace.isNotEmpty()) savedTrace else state.lastCompletedTurnTrace,
                 lastCompletedTurnEarliestMissingStep = missingStep,
                 activeTurnEarliestMissingStep = missingStep,
+                hardwarePlaybackStallCount = if (isHardwareStall) state.hardwarePlaybackStallCount + 1 else state.hardwarePlaybackStallCount,
                 activeVoiceTurnErrorCode = failureCode,
                 activeVoiceTurnErrorDetail = detail,
                 lastVoiceTurnSummary = "ERROR [$failureCode]: $detail"
@@ -3760,6 +4714,7 @@ class ConversationCoordinator(
                 val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
                 activeTimeoutRecoveryDeferred = null
                 cancelActiveTurnStreamsLocked("Immediate operator STOP command")
+                liveAdapter.clearSessionResumptionState(current.sessionId)
                 liveAdapter.disconnectAndRelease(reason = "Immediate operator STOP command")
                 val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.STOPPED)
 
@@ -3944,6 +4899,13 @@ class ConversationCoordinator(
                         if (prereq.code == "NETWORK_UNAVAILABLE") {
                             liveAdapter.onNetworkValidatedChanged(false)
                         }
+                        recordDiagnosticErrorLocked(
+                            stage = "PREREQUISITE_CHECK",
+                            errorCode = prereq.code,
+                            rawSummary = prereq.detail,
+                            sessionId = current.sessionId,
+                            turnId = nextTurn
+                        )
                         val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
                         val outcome = VerifiedOutcome.PrerequisiteFailureOutcome(
                             actionId = actionId,
@@ -3974,6 +4936,7 @@ class ConversationCoordinator(
                     }
 
                     is PrerequisiteCheck.Passed -> {
+                        archiveActiveDiagnosticErrorLocked()
                         isDeliberatelyPaused = false
                         isDeliberatelyStopped = false
                         preferencesStore.hasCompletedFirstUseConsentAndConfig = true
@@ -4242,6 +5205,7 @@ class ConversationCoordinator(
             }
 
             CoordinatorCommand.RESET_IDLE -> {
+                archiveActiveDiagnosticErrorLocked()
                 isDeliberatelyPaused = false
                 isDeliberatelyStopped = false
                 consecutiveFirstResponseTimeouts = 0
@@ -4252,8 +5216,20 @@ class ConversationCoordinator(
                 cancelActiveTurnStreamsLocked("Session reset to IDLE")
                 speechGate.cancelAndResetToIdle(resetSessionCounters = true)
                 syncSpeechGateTelemetryLocked()
+                liveAdapter.clearSessionResumptionState()
                 liveAdapter.disconnectAndRelease(reason = "Session reset to IDLE")
                 needsSessionRecreationBeforeNextTurn = false
+                recordedTurnOutcomes.clear()
+                totalAttemptedTurnsCounter = 0
+                totalCompletedTurnsCounter = 0
+                totalFailedTurnsCounter = 0
+                totalInterruptedTurnsCounter = 0
+                totalTimedOutTurnsCounter = 0
+                totalNoSpeechRejectedTurnsCounter = 0
+                lastCompletedTurnRuntime = null
+                latestStartupTiming = Phase07StartupTimingSnapshot(
+                    isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
+                )
                 val freshSession = idGenerator.nextSessionId()
                 val outcome = VerifiedOutcome.StateTransitionVerified(
                     actionId = actionId,
@@ -4282,6 +5258,9 @@ class ConversationCoordinator(
                         activeTurnEarliestMissingStep = null,
                         firstResponseTimeoutCount = 0,
                         firstResponseRecoveryCount = 0,
+                        serverOutputStallCount = 0,
+                        missingTurnCompleteCount = 0,
+                        hardwarePlaybackStallCount = 0,
                         debouncedStartCount = 0,
                         activeVoiceTurnErrorCode = null,
                         activeVoiceTurnErrorDetail = null,
@@ -4290,6 +5269,10 @@ class ConversationCoordinator(
                         voiceTurnBytesSent = 0L,
                         voiceTurnPeakRmsLinear = 0f,
                         interruptionRecoveryCount = 0,
+                        startupTimingSnapshot = Phase07StartupTimingSnapshot(),
+                        activeTurnTimingSnapshot = null,
+                        lastCompletedTurnTimingSnapshot = null,
+                        performanceSummary = Phase07PerformanceSummary(),
                         lastVoiceTurnSummary = "Ready. Press Start to begin a verified Gemini Live voice conversation."
                     )
                 }
@@ -4333,6 +5316,7 @@ class ConversationCoordinator(
                 isDeliberatelyStopped = true
                 isDeliberatelyPaused = false
                 consecutiveFirstResponseTimeouts = 0
+                liveAdapter.clearSessionResumptionState(current.sessionId)
             } else if (current.state != ConversationState.STOPPED && !isDeliberatelyStopped) {
                 isDeliberatelyPaused = true
             }
@@ -4495,4 +5479,151 @@ class ConversationCoordinator(
             currentState == ConversationState.PROCESSING ||
             currentState == ConversationState.SPEAKING
     }
+
+    /**
+     * Constructs a dedicated [RedactedDiagnosticSnapshot] on demand when `COPY DIAG` is tapped.
+     * Excludes transcripts, raw audio, credentials, App Check tokens, resumption handles,
+     * contact information, and unfiltered exception messages.
+     */
+    @Synchronized
+    fun buildRedactedDiagnosticSnapshot(): RedactedDiagnosticSnapshot {
+        syncTimingSnapshotsLocked()
+        val ui = _uiState.value
+        val audioSnap = audioCapture.state.value
+        val liveSnap = liveAdapter.state.value
+        val playSnap = playbackAdapter.state.value
+        val gateSnap = speechGate.telemetrySnapshot()
+        val turn = activeTurn
+        val completedTurn = lastCompletedTurnRuntime
+
+        return RedactedDiagnosticSnapshot(
+            capturedAtMonotonicMs = monotonicClockMs(),
+            sessionId = ui.sessionId.value,
+            currentTurnId = ui.currentTurnId.value,
+            activeTurnGenerationId = turn?.turnGen?.wireId ?: ui.activeTurnGenerationId?.wireId ?: "NONE",
+            liveSessionGenerationId = liveSnap.activeGeneration?.wireId
+                ?: liveSnap.lastCompletedGeneration?.wireId
+                ?: "NONE",
+            captureGenerationId = audioSnap.activeGeneration?.wireId
+                ?: audioSnap.lastCompletedGeneration?.wireId
+                ?: "NONE",
+            playbackGenerationId = playSnap.activeGeneration?.wireId
+                ?: playSnap.lastCompletedGeneration?.wireId
+                ?: "NONE",
+            runtimeModelId = liveAdapter.configuredModelId,
+            apiVersion = liveSnap.diagnostics.apiVersion,
+            endpointFamily = liveSnap.diagnostics.endpointFamily,
+            authRoute = liveSnap.diagnostics.authRoute,
+            configuredVoice = LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE,
+            conversationState = ui.state.wireLabel,
+            activeConversationPhase = ui.activeConversationPhase.wireLabel,
+            isActiveConversationEnabled = ui.isActiveConversationEnabled,
+            completedTurnsInSession = ui.completedTurnsInSession,
+            voiceTurnStateSequence = ui.voiceTurnStateSequence.map { it.wireLabel },
+            activeConversationPhaseSequence = ui.activeConversationPhaseSequence.map { it.wireLabel },
+            voiceTurnReadinessOrder = ui.voiceTurnReadinessOrder,
+            structuredTurnTrace = ui.structuredTurnTrace.map { DiagnosticRedactor.redactForDiagnostics(it) },
+            lastCompletedTurnTrace = ui.lastCompletedTurnTrace.map { DiagnosticRedactor.redactForDiagnostics(it) },
+            activeTurnEarliestMissingStep = ui.activeTurnEarliestMissingStep ?: "NONE",
+            lastCompletedTurnEarliestMissingStep = ui.lastCompletedTurnEarliestMissingStep ?: "NONE",
+            liveConnectionPhase = liveSnap.phase.wireCode,
+            handshakeVerified = liveSnap.handshakeVerified,
+            isInternetValidated = liveSnap.isInternetValidated,
+            isReceiverCollectorAttached = liveSnap.isReceiverCollectorAttached,
+            staleTurnCallbacksDropped = ui.staleTurnCallbacksDropped,
+            staleSocketCallbacksDropped = liveSnap.staleSocketCallbacksDropped,
+            staleCaptureCallbacksDropped = audioSnap.staleCallbacksDropped,
+            stalePlaybackCallbacksDropped = playSnap.stalePlaybackCallbacksDropped,
+            startupTiming = latestStartupTiming,
+            activeTurnTiming = turn?.let { buildTurnTimingSnapshotLocked(it) },
+            lastCompletedTurnTiming = completedTurn?.let { buildTurnTimingSnapshotLocked(it) }
+                ?: ui.lastCompletedTurnTimingSnapshot,
+            captureOwner = audioSnap.owner.name,
+            isCapturing = audioSnap.isCapturing,
+            micPermissionState = audioSnap.permissionState.wireLabel,
+            hardwareSampleRateHz = audioSnap.hardwareSampleRateHz,
+            targetSampleRateHz = audioSnap.targetSampleRateHz,
+            resamplingActive = audioSnap.resamplingActive,
+            capturedFramesCount = audioSnap.capturedFrameCount,
+            capturedDurationMs = audioSnap.capturedDurationMs,
+            voiceTurnFramesSent = ui.voiceTurnFramesSent,
+            voiceTurnBytesSent = ui.voiceTurnBytesSent,
+            voiceTurnChunksSent = ui.voiceTurnChunksSent,
+            speechGateState = gateSnap.gateState.name,
+            vadDetectorName = gateSnap.detectorName,
+            vadDetectorVersion = gateSnap.detectorVersion,
+            vadModelLoaded = gateSnap.isModelLoaded,
+            falseStartsRejectedCount = gateSnap.falseStartsRejected,
+            activityStartCount = gateSnap.activityStartCount,
+            activityEndCount = gateSnap.activityEndCount,
+            playbackIsTrackOpen = playSnap.isTrackOpen || playSnap.isPlaying || playSnap.isDrainingHardware,
+            playbackIsPlaying = playSnap.isPlaying,
+            playbackIsDraining = playSnap.isDrainingHardware,
+            playbackIsDrained = playSnap.isPlaybackDrained,
+            playbackVerifiedMimeType = playSnap.verifiedMimeType.ifBlank { "NONE" },
+            playbackVerifiedSampleRateHz = playSnap.verifiedSampleRateHz,
+            playbackFramesReceivedFromServer = playSnap.framesReceivedFromServer,
+            playbackBytesReceivedFromServer = playSnap.audioBytesReceived,
+            playbackChunksReceived = playSnap.chunksReceived,
+            playbackFramesAcceptedByHardware = playSnap.totalFramesWrittenToHardware,
+            playbackBytesAcceptedByHardware = playSnap.bytesAcceptedByHardware,
+            playbackFramesPlayedByHardwareHead = playSnap.hardwarePlaybackHeadFrames,
+            playbackQueuedBytes = playSnap.queuedBytes,
+            playbackMaxQueuedBytes = playSnap.maximumQueuedBytes,
+            playbackPrebufferTargetBytes = playSnap.prebufferTargetBytes,
+            playbackStartedAfterBufferedBytes = playSnap.playbackStartedAfterBufferedBytes,
+            playbackPartialWriteCount = playSnap.partialWriteCount,
+            playbackZeroWriteRetryCount = playSnap.zeroWriteRetryCount,
+            playbackUnderrunCount = playSnap.underrunCount,
+            playbackTrackRecreationCount = playSnap.trackRecreationCount,
+            currentActiveError = currentActiveDiagnosticErrorEntry,
+            previousErrorHistory = previousDiagnosticErrorsHistory.toList(),
+            connectionTimeoutMs = connectionTimeoutMs,
+            firstResponseTimeoutMs = firstResponseTimeoutMs,
+            inactivityTimeoutOptionLabel = ui.inactivityTimeoutOption.label,
+            inactivityTimeoutMs = ui.inactivityTimeoutMs,
+            speechConfirmDurationMs = effectiveSpeechConfirmDurationMs,
+            trailingSilenceDurationMs = trailingSilenceDurationMs,
+            preRollDurationMs = preRollDurationMs,
+            postPlaybackEchoGuardMs = postPlaybackEchoGuardMs,
+            liveBackoffMaxAttempts = liveAdapter.backoffPolicy.maxAttempts,
+            liveBackoffInitialDelayMs = liveAdapter.backoffPolicy.initialDelayMs,
+            liveBackoffMultiplier = liveAdapter.backoffPolicy.multiplier,
+            liveBackoffMaxDelayMs = liveAdapter.backoffPolicy.maxDelayMs,
+            liveAttemptCount = liveSnap.attemptCount,
+            liveRetryCount = liveSnap.retryCount,
+            liveAutoReconnectCount = liveSnap.autoReconnectCount,
+            liveLastBackoffDelayMs = liveSnap.lastBackoffDelayMs,
+            firstResponseTimeoutCount = ui.firstResponseTimeoutCount,
+            firstResponseRecoveryCount = ui.firstResponseRecoveryCount,
+            interruptionRecoveryCount = ui.interruptionRecoveryCount,
+            firstAudioAfterResponseTimeoutMs = firstAudioAfterResponseTimeoutMs,
+            serverOutputStallTimeoutMs = serverOutputStallTimeoutMs,
+            missingTurnCompleteTimeoutMs = missingTurnCompleteTimeoutMs,
+            maxTurnResponseHardBoundMs = maxTurnResponseHardBoundMs,
+            hardwarePlaybackStallTimeoutMs = hardwarePlaybackStallTimeoutMs,
+            serverOutputStallCount = ui.serverOutputStallCount,
+            missingTurnCompleteCount = ui.missingTurnCompleteCount,
+            hardwarePlaybackStallCount = ui.hardwarePlaybackStallCount,
+            playbackPaddingFramesWritten = playSnap.paddingFramesWrittenToHardware,
+            playbackPaddingBytesWritten = playSnap.paddingBytesWrittenToHardware,
+            sessionResumptionStatus = liveSnap.sessionResumptionStatus.wireCode,
+            contextRestorationStatus = liveSnap.contextRestorationStatus.wireCode,
+            hasValidResumptionHandle = liveSnap.hasScopedResumptionHandle,
+            resumptionUpdateCount = liveSnap.sessionResumptionUpdatesReceived,
+            resumedConnectionCount = liveSnap.sessionResumptionSuccessCount,
+            rejectedResumptionHandleCount = liveSnap.sessionResumptionFallbackCount,
+            serverGoAwayCount = liveSnap.serverGoAwayCount,
+            lastServerGoAwayTimeLeftMs = liveSnap.lastServerGoAwayTimeLeftMs ?: -1L,
+            contextWindowCompressionActive = liveSnap.contextWindowCompressionEnabled,
+            performanceSummary = ui.performanceSummary
+        )
+    }
+
+    /**
+     * Generates the formatted, redacted Phase 07A `COPY DIAG` text snapshot.
+     */
+    @Synchronized
+    fun generateRedactedDiagnosticSnapshot(): String =
+        buildRedactedDiagnosticSnapshot().toFormattedReport()
 }

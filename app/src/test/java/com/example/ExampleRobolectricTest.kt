@@ -38,7 +38,15 @@ class ExampleRobolectricTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         assertEquals("OmniVoice Rebuild", context.getString(R.string.app_name))
         assertEquals("com.kazim.omnivoice.rebuild", BuildConfig.APPLICATION_ID)
-        assertEquals("ov-rebuild-p03-20261111", BuildConfig.SOURCE_BUILD_ID)
+        assertTrue(
+            "Expected derived Phase 07 SOURCE_BUILD_ID, got ${BuildConfig.SOURCE_BUILD_ID}",
+            BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p07-0.7.0-phase07-sha256-") ||
+                BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p07-0.7.0-phase07-git-")
+        )
+        assertTrue(
+            "Expected reproducible SHA-256 SOURCE_FINGERPRINT, got ${BuildConfig.SOURCE_FINGERPRINT}",
+            BuildConfig.SOURCE_FINGERPRINT.matches(Regex("^sha256-[0-9a-f]{12}$"))
+        )
         assertEquals(LiveConfigConstants.SUPPORTED_LIVE_MODEL_ID, BuildConfig.LIVE_MODEL_ID)
     }
 

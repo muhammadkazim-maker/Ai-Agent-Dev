@@ -9,6 +9,7 @@ import com.example.contract.TurnId
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Hardware streaming output abstraction for [LiveAudioPlaybackAdapter].
@@ -78,6 +80,8 @@ class AndroidStreamingAudioTrackDriver : StreamingAudioTrackDriver {
     private var activeBufferSizeInFrames: Int = 0
     private var activeTrackInstanceId: Long = 0L
     private var writtenFramesInTrack: Long = 0L
+    private var paddingFramesInTrack: Long = 0L
+    private var paddingBytesInTrack: Long = 0L
 
     private val closedGenerations = LinkedHashSet<PlaybackGenerationId>()
     private val releasedTrackInstanceIds = LinkedHashSet<Long>()
@@ -230,6 +234,8 @@ class AndroidStreamingAudioTrackDriver : StreamingAudioTrackDriver {
                 activeBufferSizeInFrames = bufferSizeInBytes / bytesPerFrame
                 activeTrackInstanceId = newInstanceId
                 writtenFramesInTrack = 0L
+                paddingFramesInTrack = 0L
+                paddingBytesInTrack = 0L
                 lastRawHead32 = 0L
                 wraparoundOffset = 0L
                 lastMonotonicHead = 0L
@@ -304,29 +310,42 @@ class AndroidStreamingAudioTrackDriver : StreamingAudioTrackDriver {
     override fun finishStreamForDrain(generationId: PlaybackGenerationId) {
         val trackToPad: AudioTrack?
         val silenceBytesCount: Int
+        val channelCount: Int
         synchronized(lock) {
             if (activeGenerationId != generationId) return
             val track = activeTrack ?: return
-            if (track.state != AudioTrack.STATE_INITIALIZED) {
+            if (track.state != AudioTrack.STATE_INITIALIZED || writtenFramesInTrack <= 0L) {
                 return
             }
-            val bytesPerFrame = 2 * activeChannelCount.coerceAtLeast(1)
-            if (writtenFramesInTrack in 1L until activeBufferSizeInFrames.toLong()) {
-                val deficitFrames = (activeBufferSizeInFrames.toLong() - writtenFramesInTrack).toInt()
-                trackToPad = track
-                silenceBytesCount = deficitFrames * bytesPerFrame
+            channelCount = activeChannelCount.coerceAtLeast(1)
+            val bytesPerFrame = 2 * channelCount
+            val sampleRate = activeSampleRateHz.coerceAtLeast(16_000)
+            val tailCushionFrames = (sampleRate * 80) / 1000
+            val deficitFrames = if (writtenFramesInTrack < activeBufferSizeInFrames.toLong()) {
+                (activeBufferSizeInFrames.toLong() - writtenFramesInTrack).toInt()
             } else {
-                trackToPad = null
-                silenceBytesCount = 0
+                0
             }
+            val totalPadFrames = (deficitFrames + tailCushionFrames).coerceAtLeast(tailCushionFrames)
+            trackToPad = track
+            silenceBytesCount = totalPadFrames * bytesPerFrame
         }
         if (trackToPad != null && silenceBytesCount > 0) {
             try {
                 val silence = ByteArray(silenceBytesCount)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val writtenPad = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     trackToPad.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
                 } else {
                     trackToPad.write(silence, 0, silence.size)
+                }
+                if (writtenPad > 0) {
+                    synchronized(lock) {
+                        if (activeGenerationId == generationId) {
+                            val bytesPerFrame = 2 * channelCount
+                            paddingBytesInTrack += writtenPad.toLong()
+                            paddingFramesInTrack += (writtenPad / bytesPerFrame).toLong()
+                        }
+                    }
                 }
             } catch (_: Throwable) {
             }
@@ -394,6 +413,8 @@ class AndroidStreamingAudioTrackDriver : StreamingAudioTrackDriver {
                 trackInstanceId = activeTrackInstanceId,
                 lastWriteCode = lastWriteCode,
                 underrunCount = underruns,
+                paddingFramesWritten = paddingFramesInTrack,
+                paddingBytesWritten = paddingBytesInTrack,
                 diagnostic = lastDiagnostic
             )
         }
@@ -444,6 +465,8 @@ class AndroidStreamingAudioTrackDriver : StreamingAudioTrackDriver {
         activeBufferSizeInFrames = 0
         activeTrackInstanceId = 0L
         writtenFramesInTrack = 0L
+        paddingFramesInTrack = 0L
+        paddingBytesInTrack = 0L
 
         if (track != null) {
             try {
@@ -496,6 +519,12 @@ class DeterministicStreamingAudioTrackDriver(
     private var lastRawHead32: Long = 0L
     private var wraparoundOffset: Long = 0L
     private var lastMonotonicHead: Long = 0L
+    var paddingFramesWritten: Long = 0L
+        private set
+    var paddingBytesWritten: Long = 0L
+        private set
+
+    var onWriteHook: ((PlaybackGenerationId, Int) -> Unit)? = null
 
     var trackCreationCount: Int = 0
         private set
@@ -527,6 +556,8 @@ class DeterministicStreamingAudioTrackDriver(
         acceptedBytesStream.reset()
         totalBytesAccepted = 0L
         manualPlaybackHeadFrames = 0L
+        paddingFramesWritten = 0L
+        paddingBytesWritten = 0L
         writeInvocationCount = 0
         finishStreamForDrainCallCount = 0
     }
@@ -559,6 +590,8 @@ class DeterministicStreamingAudioTrackDriver(
         if (isNewGeneration) {
             currentGenerationBytesAccepted = 0L
             manualPlaybackHeadFrames = 0L
+            paddingFramesWritten = 0L
+            paddingBytesWritten = 0L
             lastRawHead32 = 0L
             wraparoundOffset = 0L
             lastMonotonicHead = 0L
@@ -605,6 +638,11 @@ class DeterministicStreamingAudioTrackDriver(
             return AudioTrack.ERROR_INVALID_OPERATION
         }
         writeInvocationCount += 1
+        onWriteHook?.invoke(generationId, length)
+        if (activeGenerationId != generationId || activeTrackInstanceId == 0L || activeTrackInstanceId in releasedTrackInstanceIds) {
+            lastWriteCode = AudioTrack.ERROR_INVALID_OPERATION
+            return AudioTrack.ERROR_INVALID_OPERATION
+        }
 
         val scripted = if (scriptedWriteSizes.isNotEmpty()) {
             scriptedWriteSizes.removeFirst()
@@ -630,6 +668,11 @@ class DeterministicStreamingAudioTrackDriver(
     override fun finishStreamForDrain(generationId: PlaybackGenerationId) {
         if (activeGenerationId == generationId) {
             finishStreamForDrainCallCount += 1
+            val sampleRate = openedSampleRateHz.coerceAtLeast(16_000)
+            val bytesPerFrame = (2 * openedChannelCount.coerceAtLeast(1)).toLong()
+            val tailCushionFrames = ((sampleRate * 80) / 1000).toLong()
+            paddingFramesWritten += tailCushionFrames
+            paddingBytesWritten += tailCushionFrames * bytesPerFrame
         }
     }
 
@@ -665,6 +708,8 @@ class DeterministicStreamingAudioTrackDriver(
             trackInstanceId = activeTrackInstanceId,
             lastWriteCode = lastWriteCode,
             underrunCount = 0,
+            paddingFramesWritten = paddingFramesWritten,
+            paddingBytesWritten = paddingBytesWritten,
             diagnostic = "Deterministic test driver track active"
         )
     }
@@ -705,7 +750,9 @@ class LiveAudioPlaybackAdapter(
     private val writeRetryDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) },
     private val drainPollDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) },
     private val audioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val clockMs: () -> Long = { System.currentTimeMillis() }
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+    @Volatile var hardwarePlaybackStallTimeoutMs: Long = 5_000L,
+    @Volatile var maxDrainHardBoundMs: Long = 60_000L
 ) {
     private val lock = Any()
     private val writeMutex = Mutex()
@@ -714,6 +761,7 @@ class LiveAudioPlaybackAdapter(
     private val pumpScope = CoroutineScope(SupervisorJob() + audioDispatcher)
     private val chunkQueues = mutableMapOf<PlaybackGenerationId, ArrayDeque<QueuedPcmChunk>>()
     private val pumpJobs = mutableMapOf<PlaybackGenerationId, Job>()
+    private val wakeSignals = mutableMapOf<PlaybackGenerationId, CompletableDeferred<Unit>>()
     private val inputClosedGenerations = mutableSetOf<PlaybackGenerationId>()
     private val chunkSequenceCounters = mutableMapOf<PlaybackGenerationId, AtomicLong>()
 
@@ -734,12 +782,15 @@ class LiveAudioPlaybackAdapter(
     fun startTurnPlayback(turnId: TurnId, sessionId: SessionId): PlaybackGenerationId {
         val newGen: PlaybackGenerationId
         val prevGen: PlaybackGenerationId?
+        val signalsToCancel: List<CompletableDeferred<Unit>>
         synchronized(lock) {
             prevGen = _state.value.activeGeneration
             recreatedGeneration = null
 
             pumpJobs.values.forEach { it.cancel() }
             pumpJobs.clear()
+            signalsToCancel = wakeSignals.values.toList()
+            wakeSignals.clear()
             chunkQueues.clear()
             inputClosedGenerations.clear()
             chunkSequenceCounters.clear()
@@ -767,6 +818,9 @@ class LiveAudioPlaybackAdapter(
                     bytesAcceptedByHardware = 0L,
                     totalFramesWrittenToHardware = 0L,
                     hardwarePlaybackHeadFrames = 0L,
+                    paddingFramesWrittenToHardware = 0L,
+                    paddingBytesWrittenToHardware = 0L,
+                    lastHardwareProgressAtMs = 0L,
                     partialWriteCount = 0,
                     zeroWriteRetryCount = 0,
                     lastWriteResultCode = 0,
@@ -785,18 +839,23 @@ class LiveAudioPlaybackAdapter(
                 )
             }
         }
+        signalsToCancel.forEach { it.cancel() }
         if (prevGen != null) {
             driver.stopAndFlushTrack(prevGen)
         }
         return newGen
     }
 
-    suspend fun verifyAndWritePcmChunk(
+    /**
+     * Synchronously verifies MIME/alignment and enqueues a PCM chunk into the generation's
+     * strict FIFO queue without blocking the caller on `AudioTrack.write` or coroutine chains.
+     */
+    fun enqueueVerifiedPcmChunk(
         generationId: PlaybackGenerationId,
         rawMimeType: String?,
         pcmBytes: ByteArray,
         onEvent: (PlaybackCallbackEvent) -> Unit = {}
-    ): PcmChunkWriteOutcome = withContext(audioDispatcher) {
+    ): PcmChunkWriteOutcome {
         synchronized(lock) {
             val currentGen = _state.value.activeGeneration
             if (currentGen == null || currentGen != generationId) {
@@ -806,7 +865,7 @@ class LiveAudioPlaybackAdapter(
                         statusDetail = "STALE_CALLBACK_DROPPED: Dropped chunk for ${generationId.wireId} (active=${currentGen?.wireId ?: "none"})."
                     )
                 }
-                return@withContext PcmChunkWriteOutcome.DroppedStaleGeneration(
+                return PcmChunkWriteOutcome.DroppedStaleGeneration(
                     generationId = generationId,
                     activeGenerationId = currentGen
                 )
@@ -815,19 +874,13 @@ class LiveAudioPlaybackAdapter(
 
         val mimeVerification = PcmMimeVerifier.verifyAndParseSampleRate(rawMimeType)
         if (mimeVerification is PcmMimeVerificationResult.Rejected) {
-            stopAndFlush(
+            emitFailureAndFlushIfStillActive(
+                generationId = generationId,
                 reason = "Rejected unverified/unsupported MIME (${mimeVerification.reason})",
-                error = mimeVerification.reason,
-                expectedGenerationId = generationId
+                errorCode = "UNSUPPORTED_AUDIO_MIME",
+                onEvent = onEvent
             )
-            onEvent(
-                PlaybackCallbackEvent.PlaybackFailed(
-                    generationId = generationId,
-                    reason = mimeVerification.reason,
-                    errorCode = "UNSUPPORTED_AUDIO_MIME"
-                )
-            )
-            return@withContext PcmChunkWriteOutcome.RejectedMime(
+            return PcmChunkWriteOutcome.RejectedMime(
                 generationId = generationId,
                 rawMimeType = rawMimeType,
                 reason = mimeVerification.reason
@@ -835,17 +888,12 @@ class LiveAudioPlaybackAdapter(
         }
         val verified = mimeVerification as PcmMimeVerificationResult.Verified
 
-        // Check track open readiness if driver supports pre-check (e.g. openTrackSucceeds = false)
-        // We can test opening the track or ensure pump is running
-        ensurePumpRunning(generationId, verified.sampleRateHz, verified.channelCount, onEvent)
-
         val bytesPerFrame = 2 * verified.channelCount.coerceAtLeast(1)
         val alignedByteCount = pcmBytes.size - (pcmBytes.size % bytesPerFrame)
         if (alignedByteCount <= 0) {
             val reason = "AUDIO_TRACK_WRITE_FAILED: Audio chunk has 0 aligned 16-bit PCM bytes (size=${pcmBytes.size})."
-            stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-            onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "AUDIO_TRACK_WRITE_FAILED"))
-            return@withContext PcmChunkWriteOutcome.FailedWrite(generationId, reason)
+            emitFailureAndFlushIfStillActive(generationId, reason, "AUDIO_TRACK_WRITE_FAILED", onEvent)
+            return PcmChunkWriteOutcome.FailedWrite(generationId, reason)
         }
         val chunkFrames = alignedByteCount.toLong() / bytesPerFrame.toLong()
 
@@ -857,13 +905,14 @@ class LiveAudioPlaybackAdapter(
         val totalReceivedAfterChunk: Long
         val newQueuedBytes: Long
         val newMaxQueuedBytes: Long
+        val wakeSignal: CompletableDeferred<Unit>?
         synchronized(lock) {
             val currentGen = _state.value.activeGeneration
             if (currentGen != generationId) {
                 updateStateAndNotify {
                     it.copy(stalePlaybackCallbacksDropped = it.stalePlaybackCallbacksDropped + 1)
                 }
-                return@withContext PcmChunkWriteOutcome.DroppedStaleGeneration(generationId, currentGen)
+                return PcmChunkWriteOutcome.DroppedStaleGeneration(generationId, currentGen)
             }
             totalReceivedAfterChunk = _state.value.audioBytesReceived + alignedByteCount
             newQueuedBytes = _state.value.queuedBytes + alignedByteCount
@@ -871,6 +920,7 @@ class LiveAudioPlaybackAdapter(
 
             val queue = chunkQueues.getOrPut(generationId) { ArrayDeque() }
             queue.addLast(QueuedPcmChunk(seq, rawMimeType, pcmBytes))
+            wakeSignal = wakeSignals.remove(generationId)
 
             updateStateAndNotify { current ->
                 current.copy(
@@ -899,13 +949,16 @@ class LiveAudioPlaybackAdapter(
             )
         )
 
+        ensurePumpRunning(generationId, verified.sampleRateHz, verified.channelCount, onEvent)
+        wakeSignal?.complete(Unit)
+
         // Check if track opening failed in pump
         val currentError = synchronized(lock) { _state.value.lastError }
         if (currentError != null && currentError.startsWith("AUDIO_TRACK_WRITE_FAILED")) {
-            return@withContext PcmChunkWriteOutcome.FailedWrite(generationId, currentError)
+            return PcmChunkWriteOutcome.FailedWrite(generationId, currentError)
         }
 
-        PcmChunkWriteOutcome.WrittenToHardware(
+        return PcmChunkWriteOutcome.WrittenToHardware(
             generationId = generationId,
             verifiedMimeType = verified.canonicalMimeType,
             sampleRateHz = verified.sampleRateHz,
@@ -914,6 +967,20 @@ class LiveAudioPlaybackAdapter(
             totalBytesAcceptedByHardware = alignedByteCount.toLong(),
             partialWritesInChunk = 0,
             zeroWritesInChunk = 0
+        )
+    }
+
+    suspend fun verifyAndWritePcmChunk(
+        generationId: PlaybackGenerationId,
+        rawMimeType: String?,
+        pcmBytes: ByteArray,
+        onEvent: (PlaybackCallbackEvent) -> Unit = {}
+    ): PcmChunkWriteOutcome = withContext(audioDispatcher) {
+        enqueueVerifiedPcmChunk(
+            generationId = generationId,
+            rawMimeType = rawMimeType,
+            pcmBytes = pcmBytes,
+            onEvent = onEvent
         )
     }
 
@@ -953,8 +1020,7 @@ class LiveAudioPlaybackAdapter(
         val openDiag = driver.getTrackDiagnostics(generationId)
         if (!trackOpened) {
             val reason = "AUDIO_TRACK_WRITE_FAILED: AudioTrack init failed for ${sampleRateHz}Hz (detail=${openDiag.diagnostic} / writeCode=${openDiag.lastWriteCode})."
-            stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-            onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "AUDIO_TRACK_WRITE_FAILED"))
+            emitFailureAndFlushIfStillActive(generationId, reason, "AUDIO_TRACK_WRITE_FAILED", onEvent)
             return
         }
 
@@ -974,6 +1040,45 @@ class LiveAudioPlaybackAdapter(
 
         var playbackStarted = false
         var accumulatedBufferedBytes = 0L
+        var lastObservedPumpHeadFrames = 0L
+        var lastPumpHeadProgressMs = clockMs()
+
+        fun checkPendingHardwareProgressOrStall(): Boolean {
+            if (!playbackStarted) return true
+            val currentHead = driver.getPlaybackHeadFrames(generationId)
+            val nowMs = clockMs()
+            val totalWrittenFrames = synchronized(lock) {
+                if (_state.value.activeGeneration == generationId) {
+                    val headAdvanced = currentHead > _state.value.hardwarePlaybackHeadFrames
+                    updateStateAndNotify {
+                        it.copy(
+                            hardwarePlaybackHeadFrames = currentHead,
+                            lastHardwareProgressAtMs = if (headAdvanced) nowMs else it.lastHardwareProgressAtMs
+                        )
+                    }
+                    _state.value.totalFramesWrittenToHardware
+                } else {
+                    0L
+                }
+            }
+            if (totalWrittenFrames <= currentHead) {
+                lastObservedPumpHeadFrames = currentHead
+                lastPumpHeadProgressMs = nowMs
+                return true
+            }
+            if (currentHead > lastObservedPumpHeadFrames) {
+                lastObservedPumpHeadFrames = currentHead
+                lastPumpHeadProgressMs = nowMs
+                return true
+            }
+            val stallLimitMs = hardwarePlaybackStallTimeoutMs.coerceAtLeast(100L)
+            if ((nowMs - lastPumpHeadProgressMs) >= stallLimitMs) {
+                val reason = "HARDWARE_PLAYBACK_STALL: Hardware playback head stalled at $currentHead / $totalWrittenFrames pending frames for >= $stallLimitMs ms on ${generationId.wireId}."
+                emitFailureAndFlushIfStillActive(generationId, reason, "HARDWARE_PLAYBACK_STALL", onEvent)
+                return false
+            }
+            return true
+        }
 
         while (true) {
             val activeGen = synchronized(lock) { _state.value.activeGeneration }
@@ -989,20 +1094,74 @@ class LiveAudioPlaybackAdapter(
             }
 
             if (chunk == null) {
-                val isClosedAndEmpty = synchronized(lock) {
-                    inputClosedGenerations.contains(generationId) && (chunkQueues[generationId]?.isEmpty() == true)
+                val nextAction = synchronized(lock) {
+                    val activeNow = _state.value.activeGeneration
+                    if (activeNow != generationId) {
+                        wakeSignals.remove(generationId)?.cancel()
+                        -1
+                    } else {
+                        val queueEmpty = chunkQueues[generationId]?.isEmpty() ?: true
+                        if (!queueEmpty) {
+                            1
+                        } else if (inputClosedGenerations.contains(generationId)) {
+                            wakeSignals.remove(generationId)?.cancel()
+                            2
+                        } else {
+                            0
+                        }
+                    }
                 }
-                if (isClosedAndEmpty) {
+                if (nextAction == -1) break
+                if (nextAction == 1) continue
+                if (nextAction == 2) {
                     if (!playbackStarted) {
                         playbackStarted = true
                         driver.startStreamingTrackPlayback(generationId)
+                        lastObservedPumpHeadFrames = driver.getPlaybackHeadFrames(generationId)
+                        lastPumpHeadProgressMs = clockMs()
                         synchronized(lock) {
-                            updateStateAndNotify { it.copy(isPlaying = true, playbackStartedAfterBufferedBytes = accumulatedBufferedBytes) }
+                            updateStateAndNotify {
+                                it.copy(
+                                    isPlaying = true,
+                                    playbackStartedAfterBufferedBytes = accumulatedBufferedBytes,
+                                    hardwarePlaybackHeadFrames = lastObservedPumpHeadFrames,
+                                    lastHardwareProgressAtMs = lastPumpHeadProgressMs
+                                )
+                            }
                         }
                     }
                     break
                 }
-                delay(10L)
+                if (!checkPendingHardwareProgressOrStall()) {
+                    return
+                }
+                val waitSignal = synchronized(lock) {
+                    val activeNow = _state.value.activeGeneration
+                    val queueStillEmpty = chunkQueues[generationId]?.isEmpty() ?: true
+                    val stillOpen = !inputClosedGenerations.contains(generationId)
+                    if (activeNow == generationId && queueStillEmpty && stillOpen) {
+                        CompletableDeferred<Unit>().also { wakeSignals[generationId] = it }
+                    } else {
+                        null
+                    }
+                }
+                if (waitSignal != null) {
+                    val hasPendingHardwareFrames = playbackStarted && synchronized(lock) {
+                        _state.value.totalFramesWrittenToHardware > _state.value.hardwarePlaybackHeadFrames
+                    }
+                    if (hasPendingHardwareFrames) {
+                        withTimeoutOrNull(10L) {
+                            waitSignal.await()
+                        }
+                    } else {
+                        waitSignal.await()
+                    }
+                    synchronized(lock) {
+                        if (wakeSignals[generationId] === waitSignal) {
+                            wakeSignals.remove(generationId)
+                        }
+                    }
+                }
                 continue
             }
 
@@ -1011,8 +1170,17 @@ class LiveAudioPlaybackAdapter(
             if (!playbackStarted && accumulatedBufferedBytes >= prebufferTargetBytes) {
                 playbackStarted = true
                 driver.startStreamingTrackPlayback(generationId)
+                lastObservedPumpHeadFrames = driver.getPlaybackHeadFrames(generationId)
+                lastPumpHeadProgressMs = clockMs()
                 synchronized(lock) {
-                    updateStateAndNotify { it.copy(isPlaying = true, playbackStartedAfterBufferedBytes = accumulatedBufferedBytes) }
+                    updateStateAndNotify {
+                        it.copy(
+                            isPlaying = true,
+                            playbackStartedAfterBufferedBytes = accumulatedBufferedBytes,
+                            hardwarePlaybackHeadFrames = lastObservedPumpHeadFrames,
+                            lastHardwareProgressAtMs = lastPumpHeadProgressMs
+                        )
+                    }
                 }
             }
 
@@ -1057,8 +1225,7 @@ class LiveAudioPlaybackAdapter(
                         }
                     }
                     val reason = "AUDIO_TRACK_WRITE_FAILED: AudioTrack.write returned $mappedErr on ${generationId.wireId}."
-                    stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-                    onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "AUDIO_TRACK_WRITE_FAILED"))
+                    emitFailureAndFlushIfStillActive(generationId, reason, "AUDIO_TRACK_WRITE_FAILED", onEvent)
                     return
                 }
 
@@ -1069,10 +1236,12 @@ class LiveAudioPlaybackAdapter(
                             cur.copy(zeroWriteRetryCount = cur.zeroWriteRetryCount + 1)
                         }
                     }
+                    if (!checkPendingHardwareProgressOrStall()) {
+                        return
+                    }
                     if (consecutiveZeros > maxZeroWriteRetriesPerChunk) {
                         val reason = "AUDIO_TRACK_WRITE_FAILED: AudioTrack.write stalled at 0 bytes."
-                        stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-                        onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "AUDIO_TRACK_WRITE_FAILED"))
+                        emitFailureAndFlushIfStillActive(generationId, reason, "AUDIO_TRACK_WRITE_FAILED", onEvent)
                         return
                     }
                     writeRetryDelayRunner(8L)
@@ -1083,6 +1252,8 @@ class LiveAudioPlaybackAdapter(
                 val isPartial = written < remaining
                 offset += written
                 remaining -= written
+                val writeNowMs = clockMs()
+                val currentHeadNow = driver.getPlaybackHeadFrames(generationId)
 
                 synchronized(lock) {
                     if (_state.value.activeGeneration == generationId) {
@@ -1095,6 +1266,8 @@ class LiveAudioPlaybackAdapter(
                             it.copy(
                                 bytesAcceptedByHardware = newAccepted,
                                 totalFramesWrittenToHardware = newFrames,
+                                hardwarePlaybackHeadFrames = max(it.hardwarePlaybackHeadFrames, currentHeadNow),
+                                lastHardwareProgressAtMs = writeNowMs,
                                 pendingQueuedBytes = newQueued,
                                 queuedBytes = newQueued,
                                 partialWriteCount = if (isPartial) cur.partialWriteCount + 1 else cur.partialWriteCount,
@@ -1106,6 +1279,10 @@ class LiveAudioPlaybackAdapter(
                         }
                     }
                 }
+            }
+
+            if (!checkPendingHardwareProgressOrStall()) {
+                return
             }
 
             val snapshot = _state.value
@@ -1126,6 +1303,7 @@ class LiveAudioPlaybackAdapter(
         generationId: PlaybackGenerationId,
         onEvent: (PlaybackCallbackEvent) -> Unit = {}
     ): Boolean = withContext(audioDispatcher) {
+        val wakeSignal: CompletableDeferred<Unit>?
         synchronized(lock) {
             val current = _state.value
             if (current.activeGeneration == null || current.activeGeneration != generationId) {
@@ -1138,6 +1316,7 @@ class LiveAudioPlaybackAdapter(
                 return@withContext false
             }
             inputClosedGenerations.add(generationId)
+            wakeSignal = wakeSignals.remove(generationId)
             updateStateAndNotify {
                 it.copy(
                     serverTurnComplete = true,
@@ -1145,6 +1324,7 @@ class LiveAudioPlaybackAdapter(
                 )
             }
         }
+        wakeSignal?.complete(Unit)
 
         val job = synchronized(lock) { pumpJobs[generationId] }
         job?.join()
@@ -1159,10 +1339,8 @@ class LiveAudioPlaybackAdapter(
                     return@withLock false
                 }
                 if (current.totalFramesWrittenToHardware <= 0L || current.bytesAcceptedByHardware <= 0L) {
-                    val diagnostic = driver.getTrackDiagnostics(generationId)
                     val reason = "AUDIO_TRACK_WRITE_FAILED: 0 frames accepted by AudioTrack."
-                    stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-                    onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "AUDIO_TRACK_WRITE_FAILED"))
+                    emitFailureAndFlushIfStillActive(generationId, reason, "AUDIO_TRACK_WRITE_FAILED", onEvent)
                     return@withLock false
                 }
                 totalFramesTarget = current.totalFramesWrittenToHardware
@@ -1170,9 +1348,12 @@ class LiveAudioPlaybackAdapter(
             }
 
             driver.finishStreamForDrain(generationId)
+            val postPadDiag = driver.getTrackDiagnostics(generationId)
 
+            val stallTimeoutMs = hardwarePlaybackStallTimeoutMs.coerceAtLeast(100L)
             val expectedPlaybackMs = (totalFramesTarget * 1000L) / sampleRateHz.toLong()
-            val boundedDeadlineMs = max(5_000L, expectedPlaybackMs + 5_000L)
+            val boundedDeadlineMs = max(stallTimeoutMs, expectedPlaybackMs + stallTimeoutMs)
+                .coerceAtMost(maxDrainHardBoundMs.coerceAtLeast(stallTimeoutMs))
             val drainStartMs = clockMs()
             var lastProgressMs = drainStartMs
 
@@ -1186,7 +1367,10 @@ class LiveAudioPlaybackAdapter(
                         isPlaybackDrained = false,
                         drainDeadlineMs = boundedDeadlineMs,
                         hardwarePlaybackHeadFrames = lastObservedHead,
-                        statusDetail = "Draining hardware playback buffer (${generationId.wireId}): head=$lastObservedHead / target=$totalFramesTarget."
+                        paddingFramesWrittenToHardware = postPadDiag.paddingFramesWritten,
+                        paddingBytesWrittenToHardware = postPadDiag.paddingBytesWritten,
+                        lastHardwareProgressAtMs = drainStartMs,
+                        statusDetail = "Draining hardware playback buffer (${generationId.wireId}): head=$lastObservedHead / target=$totalFramesTarget (padding=${postPadDiag.paddingFramesWritten} frames)."
                     )
                 }
             }
@@ -1213,6 +1397,9 @@ class LiveAudioPlaybackAdapter(
                         updateStateAndNotify {
                             it.copy(
                                 hardwarePlaybackHeadFrames = headFrames,
+                                paddingFramesWrittenToHardware = diagNow.paddingFramesWritten,
+                                paddingBytesWrittenToHardware = diagNow.paddingBytesWritten,
+                                lastHardwareProgressAtMs = lastProgressMs,
                                 underrunCount = diagNow.underrunCount,
                                 trackState = diagNow.trackState,
                                 playState = diagNow.playState
@@ -1235,10 +1422,9 @@ class LiveAudioPlaybackAdapter(
                     return@withLock accepted
                 }
 
-                if ((nowMs - drainStartMs) >= boundedDeadlineMs || (nowMs - lastProgressMs) >= 5_000L || stalledPolls >= maxDrainPollIterations) {
+                if ((nowMs - drainStartMs) >= boundedDeadlineMs || (nowMs - lastProgressMs) >= stallTimeoutMs || stalledPolls >= maxDrainPollIterations) {
                     val reason = "HARDWARE_DRAIN_INCOMPLETE: head=$headFrames / target=$totalFramesTarget."
-                    stopAndFlush(reason, error = reason, expectedGenerationId = generationId)
-                    onEvent(PlaybackCallbackEvent.PlaybackFailed(generationId, reason, "HARDWARE_DRAIN_INCOMPLETE"))
+                    emitFailureAndFlushIfStillActive(generationId, reason, "HARDWARE_DRAIN_INCOMPLETE", onEvent)
                     return@withLock false
                 }
 
@@ -1290,6 +1476,11 @@ class LiveAudioPlaybackAdapter(
                 }
                 is PlaybackCallbackEvent.PlaybackFailed -> {
                     shouldCloseDriverGen = activeGen
+                    pumpJobs.remove(activeGen)
+                    wakeSignals.remove(activeGen)?.cancel()
+                    chunkQueues.clear()
+                    inputClosedGenerations.clear()
+                    chunkSequenceCounters.clear()
                     updateStateAndNotify { current ->
                         current.copy(
                             activeGeneration = null,
@@ -1299,6 +1490,8 @@ class LiveAudioPlaybackAdapter(
                             isDrainingHardware = false,
                             isPlaybackDrained = false,
                             activeTrackInstanceId = 0L,
+                            pendingQueuedBytes = 0L,
+                            queuedBytes = 0L,
                             lastError = event.reason,
                             hardwareReleaseCount = current.hardwareReleaseCount + 1,
                             statusDetail = "PLAYBACK_FAILED (${activeGen.wireId}): ${event.reason}"
@@ -1313,12 +1506,36 @@ class LiveAudioPlaybackAdapter(
         return true
     }
 
+    private fun emitFailureAndFlushIfStillActive(
+        generationId: PlaybackGenerationId,
+        reason: String,
+        errorCode: String,
+        onEvent: (PlaybackCallbackEvent) -> Unit
+    ) {
+        onEvent(
+            PlaybackCallbackEvent.PlaybackFailed(
+                generationId = generationId,
+                reason = reason,
+                errorCode = errorCode
+            )
+        )
+        val stillActive = synchronized(lock) { _state.value.activeGeneration == generationId }
+        if (stillActive) {
+            stopAndFlush(
+                reason = reason,
+                error = reason,
+                expectedGenerationId = generationId
+            )
+        }
+    }
+
     fun stopAndFlush(
         reason: String,
         error: String? = null,
         expectedGenerationId: PlaybackGenerationId? = null
     ) {
         val prevGen: PlaybackGenerationId?
+        val signalsToCancel: List<CompletableDeferred<Unit>>
         synchronized(lock) {
             val activeGen = _state.value.activeGeneration
             if (expectedGenerationId != null && activeGen != expectedGenerationId) {
@@ -1330,6 +1547,8 @@ class LiveAudioPlaybackAdapter(
             prevGen = activeGen
             pumpJobs.values.forEach { it.cancel() }
             pumpJobs.clear()
+            signalsToCancel = wakeSignals.values.toList()
+            wakeSignals.clear()
             chunkQueues.clear()
             inputClosedGenerations.clear()
             chunkSequenceCounters.clear()
@@ -1352,6 +1571,8 @@ class LiveAudioPlaybackAdapter(
                 )
             }
         }
+        signalsToCancel.forEach { it.cancel() }
         driver.stopAndFlushTrack(prevGen ?: expectedGenerationId)
     }
 }
+
