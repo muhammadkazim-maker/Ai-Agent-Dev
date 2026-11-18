@@ -462,7 +462,7 @@ private fun RedactedDiagnosticsPane(
                     tag = "live_diag_vad_candidate_label"
                 )
                 DiagnosticChip(
-                    label = "RESUMPTION: ${liveState.sessionResumptionStatus.wireCode} • RESTORE: ${liveState.contextRestorationStatus.wireCode} • GOAWAY: ${liveState.serverGoAwayCount}",
+                    label = "RESUMPTION: ${liveState.sessionResumptionStatus.wireCode} • RESTORE: ${liveState.contextRestorationStatus.wireCode} • GOAWAY: ${liveState.serverGoAwayCount} • CLOSES: ${liveState.actualSocketCloseCount}",
                     tag = "live_diag_resumption_label"
                 )
                 DiagnosticChip(

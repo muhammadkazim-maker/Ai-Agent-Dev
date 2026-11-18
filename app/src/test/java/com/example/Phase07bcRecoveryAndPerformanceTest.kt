@@ -23,6 +23,9 @@ import com.example.live.ContextRestorationStatus
 import com.example.live.ControllableLiveNetworkMonitor
 import com.example.live.DeterministicTestLiveTransportDriver
 import com.example.live.GeminiLiveConnectionAdapter
+import com.example.live.LiveConnectionPhase
+import com.example.live.LiveFailureClassification
+import com.example.live.LiveHandshakeResult
 import com.example.live.LiveSocketCallbackEvent
 import com.example.live.SessionResumptionStatus
 import com.example.ui.shell.ConversationShellRoute
@@ -1105,5 +1108,261 @@ class Phase07bcRecoveryAndPerformanceTest {
         assertTrue(turn2AcceptedBytes.all { it == 0x22.toByte() })
         assertEquals(1, h.coordinator.uiState.value.completedTurnsInSession)
         h.coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun test15a_goAwayWhileListeningWithValidHandle_50000ms_performsOrderlyHandoverAndRestoresListening() = runBlocking<Unit> {
+        val h = Harness()
+        h.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h.coordinator.setActiveConversationEnabled(true)
+        h.fakeClockMs.set(90_000L)
+        h.coordinator.startVoiceTurn()
+        assertEquals(ConversationState.LISTENING, h.coordinator.uiState.value.state)
+
+        val liveGen1 = h.liveAdapter.state.value.activeGeneration!!
+        val captureGen1 = h.audioCapture.state.value.activeGeneration!!
+        repeat(52) { idx ->
+            h.liveDriver.simulateServerResumptionUpdateForTest(
+                generationId = liveGen1,
+                rawHandle = "resumption_handle_SECRET_50S_${idx + 1}",
+                resumable = true,
+                lastConsumedClientMessageIndex = idx
+            )
+        }
+        assertEquals(52, h.coordinator.uiState.value.liveConnectionState.sessionResumptionUpdatesReceived)
+        assertTrue(h.coordinator.uiState.value.liveConnectionState.hasScopedResumptionHandle)
+
+        // GoAway notice arrives while silently LISTENING with timeLeftMs=50000 (socket NOT closed)
+        h.liveDriver.simulateServerGoAwayForTest(liveGen1, timeLeftMs = 50_000L)
+
+        waitUntil {
+            val gen = h.liveAdapter.state.value.activeGeneration
+            gen != null && gen != liveGen1 && h.coordinator.uiState.value.state == ConversationState.LISTENING
+        }
+
+        val liveAfter = h.coordinator.uiState.value.liveConnectionState
+        val liveGen2 = liveAfter.activeGeneration!!
+        assertNotEquals(liveGen1, liveGen2)
+        assertEquals(1, liveAfter.serverGoAwayCount)
+        assertEquals(50_000L, liveAfter.lastServerGoAwayTimeLeftMs)
+        assertEquals(0, liveAfter.actualSocketCloseCount)
+        assertFalse(liveAfter.goAwayNoticePendingHandover)
+        assertEquals(SessionResumptionStatus.RESUMED_WITH_SERVER_HANDLE, liveAfter.sessionResumptionStatus)
+        assertEquals(1, liveAfter.sessionResumptionSuccessCount)
+        assertEquals(1, h.liveAdapter.getActiveGenerationCountForDiagnostics())
+        assertTrue(h.audioCapture.state.value.isCapturing)
+        assertNotEquals(captureGen1, h.audioCapture.state.value.activeGeneration)
+        assertEquals(0, h.liveDriver.sentAudioChunks.size)
+        assertEquals(0, h.liveDriver.endOfTurnSignalCount)
+
+        val diag = h.coordinator.generateRedactedDiagnosticSnapshot()
+        assertTrue(diag.contains("serverGoAwaySignals: count=1, pendingHandover=false, lastGen=${liveGen1.wireId}, lastTimeLeftMs=50000 ms"))
+        assertTrue(diag.contains("actualSocketClosures: count=0"))
+        assertTrue(diag.contains("resumedConnections=1"))
+        assertFalse(diag.contains("resumption_handle_SECRET_50S"))
+        h.coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun test15b_duplicateGoAwayAndActualSocketCloseRacingWithHandover_singleHandoverAndRepeatNoticeIfMidSpeech() = runBlocking<Unit> {
+        // Part 1: Duplicate GoAway + actual socket close racing during in-flight GoAway handover in LISTENING
+        val handoverGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val h1 = Harness()
+        h1.liveDriver.scriptedHandler = { genId, modelId, attempt, onSocketEvent ->
+            if (attempt == 2) {
+                handoverGate.await()
+            }
+            val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+            onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+            LiveHandshakeResult.Accepted(genId, note)
+        }
+        h1.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h1.coordinator.setActiveConversationEnabled(true)
+        h1.fakeClockMs.set(95_000L)
+        h1.coordinator.startVoiceTurn()
+        val liveGen1 = h1.liveAdapter.state.value.activeGeneration!!
+        h1.liveDriver.simulateServerResumptionUpdateForTest(
+            generationId = liveGen1,
+            rawHandle = "resumption_handle_RACE_SECRET_01",
+            resumable = true
+        )
+
+        h1.liveDriver.simulateServerGoAwayForTest(liveGen1, timeLeftMs = 50_000L)
+        waitUntil { h1.coordinator.uiState.value.state == ConversationState.PREPARING }
+
+        // Fire duplicate GoAway AND actual remote close while handover is in progress
+        h1.liveDriver.simulateServerGoAwayForTest(liveGen1, timeLeftMs = 45_000L)
+        h1.liveDriver.simulateActualSocketCloseForTest(liveGen1, "Remote WebSocket closed by server (1001 Going Away)")
+
+        handoverGate.complete(Unit)
+        waitUntil {
+            val gen = h1.liveAdapter.state.value.activeGeneration
+            gen != null && gen != liveGen1 && h1.coordinator.uiState.value.state == ConversationState.LISTENING
+        }
+
+        assertEquals(2, h1.liveDriver.collectorAttachedGenerations.size)
+        assertEquals(1, h1.coordinator.uiState.value.liveConnectionState.sessionResumptionSuccessCount)
+        assertTrue(h1.audioCapture.state.value.isCapturing)
+        assertEquals(0, h1.liveDriver.sentAudioChunks.size)
+        h1.coordinator.dispatch(CoordinatorCommand.STOP)
+
+        // Part 2: Mid-speech when GoAway arrives and socket closes before completion -> no replay, repeat notice, LISTENING restored
+        val h2 = Harness()
+        h2.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h2.coordinator.setActiveConversationEnabled(true)
+        h2.fakeClockMs.set(98_000L)
+        h2.coordinator.startVoiceTurn()
+        val genBeforeSpeech = h2.liveAdapter.state.value.activeGeneration!!
+        val capGenBeforeSpeech = h2.audioCapture.state.value.activeGeneration!!
+        h2.liveDriver.simulateServerResumptionUpdateForTest(
+            generationId = genBeforeSpeech,
+            rawHandle = "resumption_handle_MIDSPEECH_SECRET",
+            resumable = true
+        )
+
+        val speechFrame = ShortArray(320) { 9_000 }
+        var ts = 98_100L
+        repeat(10) {
+            h2.fakeClockMs.set(ts)
+            h2.coordinator.onAudioHardwareCallback(
+                CaptureCallbackEvent.FrameCaptured(capGenBeforeSpeech, speechFrame, 16_000)
+            )
+            ts += 20L
+        }
+        waitUntil { h2.liveDriver.sentAudioChunks.isNotEmpty() }
+        val sentChunksBeforeGoAway = h2.liveDriver.sentAudioChunks.size
+
+        h2.liveDriver.simulateServerGoAwayForTest(genBeforeSpeech, timeLeftMs = 50_000L)
+        // Actual close happens mid-speech after GoAway notice
+        h2.liveDriver.simulateActualSocketCloseForTest(genBeforeSpeech, "Remote WebSocket closed by server (1001 Going Away)")
+
+        waitUntil {
+            val gen = h2.liveAdapter.state.value.activeGeneration
+            gen != null && gen != genBeforeSpeech && h2.coordinator.uiState.value.state == ConversationState.LISTENING
+        }
+
+        // Old captured speech MUST NOT be replayed onto the new socket
+        assertEquals(sentChunksBeforeGoAway, h2.liveDriver.sentAudioChunks.size)
+        assertEquals(0, h2.liveDriver.endOfTurnSignalCount)
+        assertEquals(1, h2.coordinator.uiState.value.liveConnectionState.actualSocketCloseCount)
+        assertTrue(h2.coordinator.uiState.value.lastVoiceTurnSummary.contains("Please repeat your question"))
+        assertTrue(h2.audioCapture.state.value.isCapturing)
+        h2.coordinator.dispatch(CoordinatorCommand.STOP)
+    }
+
+    @Test
+    fun test15c_stopAndPauseDuringGoAwayRecovery_preemptHandoverAndPreventListeningRestore() = runBlocking<Unit> {
+        // Part 1: STOP during GoAway handover
+        val stopGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val h1 = Harness()
+        h1.liveDriver.scriptedHandler = { genId, modelId, attempt, onSocketEvent ->
+            if (attempt == 2) {
+                stopGate.await()
+            }
+            val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+            onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+            LiveHandshakeResult.Accepted(genId, note)
+        }
+        h1.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h1.coordinator.setActiveConversationEnabled(true)
+        h1.coordinator.startVoiceTurn()
+        val liveGen1 = h1.liveAdapter.state.value.activeGeneration!!
+        h1.liveDriver.simulateServerResumptionUpdateForTest(liveGen1, "resumption_handle_STOP_TEST", resumable = true)
+        h1.liveDriver.simulateServerGoAwayForTest(liveGen1, timeLeftMs = 50_000L)
+        waitUntil { h1.coordinator.uiState.value.state == ConversationState.PREPARING }
+
+        h1.coordinator.dispatch(CoordinatorCommand.STOP)
+        stopGate.complete(Unit)
+        delay(50L)
+        assertEquals(ConversationState.STOPPED, h1.coordinator.uiState.value.state)
+        assertEquals(LiveConnectionPhase.DISCONNECTED, h1.liveAdapter.state.value.phase)
+        assertEquals(SessionResumptionStatus.CLEARED_ON_STOP_OR_RESET, h1.liveAdapter.state.value.sessionResumptionStatus)
+        assertFalse(h1.audioCapture.state.value.isCapturing)
+        assertFalse(h1.playbackAdapter.state.value.isPlaying)
+        assertFalse(h1.coordinator.hasActiveTurnJobs())
+
+        // Part 2: PAUSE during GoAway handover
+        val pauseGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val h2 = Harness()
+        h2.liveDriver.scriptedHandler = { genId, modelId, attempt, onSocketEvent ->
+            if (attempt == 2) {
+                pauseGate.await()
+            }
+            val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+            onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+            LiveHandshakeResult.Accepted(genId, note)
+        }
+        h2.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h2.coordinator.setActiveConversationEnabled(true)
+        h2.coordinator.startVoiceTurn()
+        val liveGen2 = h2.liveAdapter.state.value.activeGeneration!!
+        h2.liveDriver.simulateServerResumptionUpdateForTest(liveGen2, "resumption_handle_PAUSE_TEST", resumable = true)
+        h2.liveDriver.simulateServerGoAwayForTest(liveGen2, timeLeftMs = 50_000L)
+        waitUntil { h2.coordinator.uiState.value.state == ConversationState.PREPARING }
+
+        h2.coordinator.dispatch(CoordinatorCommand.PAUSE)
+        pauseGate.complete(Unit)
+        delay(50L)
+        assertEquals(ConversationState.PAUSED, h2.coordinator.uiState.value.state)
+        assertEquals(LiveConnectionPhase.DISCONNECTED, h2.liveAdapter.state.value.phase)
+        assertFalse(h2.audioCapture.state.value.isCapturing)
+        assertFalse(h2.playbackAdapter.state.value.isPlaying)
+        assertFalse(h2.coordinator.hasActiveTurnJobs())
+    }
+
+    @Test
+    fun test15d_rejectedResumptionHandleDuringGoAway_fallbackFailureShowsSpecificReasonAndPreservesFailedTurn() = runBlocking<Unit> {
+        val h = Harness()
+        h.liveDriver.scriptedHandler = { genId, modelId, attempt, onSocketEvent ->
+            if (attempt == 1) {
+                val note = "SETUP_ACCEPTED ($modelId @ ${genId.wireId})"
+                onSocketEvent(LiveSocketCallbackEvent.SetupAccepted(genId, note))
+                LiveHandshakeResult.Accepted(genId, note)
+            } else {
+                LiveHandshakeResult.Failed(
+                    generationId = genId,
+                    classification = LiveFailureClassification.TRANSIENT_NETWORK_OR_SOCKET,
+                    rawDetail = "HTTP 503 resumption handle rejected and fresh fallback connect unavailable"
+                )
+            }
+        }
+        h.coordinator.onMicPermissionUpdated(MicPermissionState.GRANTED)
+        h.coordinator.setActiveConversationEnabled(true)
+        h.fakeClockMs.set(110_000L)
+        h.coordinator.startVoiceTurn()
+        assertEquals(ConversationState.LISTENING, h.coordinator.uiState.value.state)
+
+        val failedTurnId = h.coordinator.uiState.value.currentTurnId
+        val liveGen1 = h.liveAdapter.state.value.activeGeneration!!
+        h.liveDriver.simulateServerResumptionUpdateForTest(
+            generationId = liveGen1,
+            rawHandle = "resumption_handle_REJECTED_SECRET_777",
+            resumable = true
+        )
+        h.liveDriver.rejectResumptionHandleOnNextConnect = true
+
+        h.liveDriver.simulateServerGoAwayForTest(liveGen1, timeLeftMs = 50_000L)
+        waitUntil { h.coordinator.uiState.value.state == ConversationState.ERROR }
+
+        val ui = h.coordinator.uiState.value
+        assertEquals(failedTurnId, ui.currentTurnId)
+        assertEquals(LiveFailureClassification.TRANSIENT_NETWORK_OR_SOCKET.wireCode, ui.activeVoiceTurnErrorCode)
+        assertTrue(ui.lastVoiceTurnSummary.contains("resumption handle rejected and fallback reconnection also failed"))
+        assertEquals(1, h.liveDriver.rejectedHandleFallbackCount)
+        assertEquals(0, ui.liveConnectionState.sessionResumptionSuccessCount)
+        assertEquals(1, ui.liveConnectionState.serverGoAwayCount)
+        assertEquals(failedTurnId.value, ui.currentActiveDiagnosticError?.turnId)
+        assertEquals(failedTurnId.value, ui.lastCompletedTurnTimingSnapshot?.turnId)
+        assertEquals(1, ui.performanceSummary.totalAttemptedTurns)
+        assertEquals(1, ui.performanceSummary.failedTurns)
+        assertFalse(h.audioCapture.state.value.isCapturing)
+        assertFalse(h.playbackAdapter.state.value.isPlaying)
+
+        val diag = h.coordinator.generateRedactedDiagnosticSnapshot()
+        assertTrue(diag.contains("activeErrorTurnId: ${failedTurnId.value}"))
+        assertTrue(diag.contains("activeErrorCode: ${LiveFailureClassification.TRANSIENT_NETWORK_OR_SOCKET.wireCode}"))
+        assertTrue(diag.contains("serverGoAwaySignals: count=1"))
+        assertTrue(diag.contains("resumedConnections=0"))
+        assertFalse(diag.contains("resumption_handle_REJECTED_SECRET_777"))
     }
 }

@@ -76,7 +76,8 @@ sealed interface LiveHandshakeResult {
     data class Failed(
         val generationId: LiveSessionGenerationId,
         val classification: LiveFailureClassification,
-        val rawDetail: String
+        val rawDetail: String,
+        val handleRejectedFallbackUsed: Boolean = false
     ) : LiveHandshakeResult
 }
 
@@ -204,6 +205,8 @@ object LiveExceptionClassifier {
                 lower.contains("liveservergoaway") ||
                 lower.contains("go_away") ||
                 lower.contains("goaway") ||
+                lower.contains("going away") ||
+                hasWebSocketCloseCode(lower, 1001) ||
                 lower.contains("session expired") ||
                 lower.contains("session_expired") ||
                 lower.contains("timeleft=") ->
@@ -531,6 +534,7 @@ class FirebaseAiLiveTransportDriver(
                 )
             }
 
+            var handleRejectedFallbackUsed = false
             try {
                 val initializedApps = try {
                     com.google.firebase.FirebaseApp.getApps(
@@ -572,249 +576,278 @@ class FirebaseAiLiveTransportDriver(
                     systemInstruction = sysInstructionContent
                 )
 
-                val candidateHandle = synchronized(lock) {
+                var candidateHandle = synchronized(lock) {
                     val resumable = scopedResumableStatus[generationId.sessionId.value] ?: true
                     if (resumable) scopedResumptionHandles[generationId.sessionId.value] else null
                 }
 
                 var resumedWithHandle = false
-                var handleRejectedFallbackUsed = false
+                var finalEarlyError: Throwable? = null
 
-                val session = withContext(ioDispatcher) {
-                    if (!candidateHandle.isNullOrBlank()) {
-                        try {
-                            val connected = withTimeout(handshakeTimeoutMs) {
-                                liveModel.connect(SessionResumptionConfig(handle = candidateHandle))
+                for (connectPass in 0..1) {
+                    val tryingHandle = candidateHandle
+                    resumedWithHandle = false
+                    val session = withContext(ioDispatcher) {
+                        if (!tryingHandle.isNullOrBlank()) {
+                            try {
+                                val connected = withTimeout(handshakeTimeoutMs) {
+                                    liveModel.connect(SessionResumptionConfig(handle = tryingHandle))
+                                }
+                                resumedWithHandle = true
+                                connected
+                            } catch (handleErr: Throwable) {
+                                if (handleErr is CancellationException && handleErr !is TimeoutCancellationException) {
+                                    throw handleErr
+                                }
+                                val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                                if (!validatedNow) {
+                                    throw handleErr
+                                }
+                                synchronized(lock) {
+                                    scopedResumptionHandles.remove(generationId.sessionId.value)
+                                    scopedResumableStatus.remove(generationId.sessionId.value)
+                                }
+                                resumedWithHandle = false
+                                handleRejectedFallbackUsed = true
+                                logDriver("SESSION_RESUMPTION_HANDLE_REJECTED: Cleared rejected/expired handle for ${generationId.sessionId.value} and falling back to clean connection.")
+                                withTimeout(handshakeTimeoutMs) {
+                                    liveModel.connect(SessionResumptionConfig())
+                                }
                             }
-                            resumedWithHandle = true
-                            connected
-                        } catch (handleErr: Throwable) {
-                            if (handleErr is CancellationException && handleErr !is TimeoutCancellationException) {
-                                throw handleErr
-                            }
-                            val validatedNow = networkMonitor?.isInternetValidated() ?: true
-                            if (!validatedNow) {
-                                throw handleErr
-                            }
-                            // Clear rejected or expired handle and fall back to a clean connection without the handle
-                            synchronized(lock) {
-                                scopedResumptionHandles.remove(generationId.sessionId.value)
-                                scopedResumableStatus.remove(generationId.sessionId.value)
-                            }
-                            resumedWithHandle = false
-                            handleRejectedFallbackUsed = true
-                            logDriver("SESSION_RESUMPTION_HANDLE_REJECTED: Cleared rejected/expired handle for ${generationId.sessionId.value} and falling back to clean connection.")
+                        } else {
                             withTimeout(handshakeTimeoutMs) {
                                 liveModel.connect(SessionResumptionConfig())
                             }
                         }
-                    } else {
-                        withTimeout(handshakeTimeoutMs) {
-                            liveModel.connect(SessionResumptionConfig())
-                        }
                     }
-                }
 
-                val collectorAttach = CompletableDeferred<CollectorAttachOutcome>()
-                val immediateFailure = AtomicReference<Throwable?>(null)
-                var handshakeReturnedAccepted = false
+                    val collectorAttach = CompletableDeferred<CollectorAttachOutcome>()
+                    val immediateFailure = AtomicReference<Throwable?>(null)
+                    var handshakeReturnedAccepted = false
 
-                val receiveJob: Job
-                synchronized(lock) {
-                    activeGenerationId = generationId
-                    receiverCollectorAttachedGen = null
-                    activeLiveSession = session
-                    receiveJob = driverScope.launch {
-                        session.receive()
-                            .onStart {
-                                val attached = synchronized(lock) {
-                                    if (activeGenerationId == generationId && !closingGenerations.contains(generationId)) {
-                                        receiverCollectorAttachedGen = generationId
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                                if (attached) {
-                                    collectorAttach.complete(CollectorAttachOutcome.Attached)
-                                } else {
-                                    collectorAttach.complete(
-                                        CollectorAttachOutcome.Failed(CancellationException("STALE_CALLBACK_DROPPED: generation superseded before collector start"))
-                                    )
-                                }
-                            }
-                            .catch { err ->
-                                immediateFailure.compareAndSet(null, err)
-                                val isLocalOrStale = synchronized(lock) {
-                                    if (activeGenerationId == generationId) {
-                                        receiverCollectorAttachedGen = null
-                                    }
-                                    activeGenerationId != generationId || closingGenerations.contains(generationId)
-                                } || (err is CancellationException && err !is TimeoutCancellationException)
-                                collectorAttach.complete(CollectorAttachOutcome.Failed(err))
-                                if (isLocalOrStale) {
-                                    logDriver("STALE_CALLBACK_DROPPED: Ignored closed/cancelled receive channel for ${generationId.wireId}")
-                                    return@catch
-                                }
-                                if (handshakeReturnedAccepted) {
-                                    val validatedNow = networkMonitor?.isInternetValidated() ?: true
-                                    val classification = LiveExceptionClassifier.classify(
-                                        throwable = err,
-                                        isInternetValidated = validatedNow
-                                    )
-                                    onSocketEvent(
-                                        LiveSocketCallbackEvent.HandshakeFailed(
-                                            generationId = generationId,
-                                            classification = classification,
-                                            rawErrorMessage = LiveExceptionClassifier.formatRedactedChain(err)
-                                        )
-                                    )
-                                }
-                            }
-                            .onCompletion { cause ->
-                                val isLocalOrStale = synchronized(lock) {
-                                    if (activeGenerationId == generationId) {
-                                        receiverCollectorAttachedGen = null
-                                    }
-                                    activeGenerationId != generationId || closingGenerations.contains(generationId)
-                                }
-                                if (cause == null && immediateFailure.get() == null && !isLocalOrStale && handshakeReturnedAccepted) {
-                                    onSocketEvent(
-                                        LiveSocketCallbackEvent.SocketClosedRemotely(
-                                            generationId = generationId,
-                                            reason = "Gemini Live receive stream completed/closed by server"
-                                        )
-                                    )
-                                }
-                            }
-                            .collect { message ->
-                                val stillActive = synchronized(lock) {
-                                    activeGenerationId == generationId && !closingGenerations.contains(generationId)
-                                }
-                                if (!stillActive) {
-                                    logDriver("STALE_CALLBACK_DROPPED: Dropped server frame for superseded ${generationId.wireId}")
-                                    return@collect
-                                }
-                                when (message) {
-                                    is LiveServerSetupComplete -> {
-                                        onSocketEvent(
-                                            LiveSocketCallbackEvent.SetupAccepted(
-                                                generationId = generationId,
-                                                serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}",
-                                                resumedWithServerHandle = resumedWithHandle,
-                                                handleRejectedFallbackUsed = handleRejectedFallbackUsed
-                                            )
-                                        )
-                                    }
-                                    is LiveSessionResumptionUpdate -> {
-                                        val hasHandleNow = synchronized(lock) {
-                                            storeScopedResumptionUpdateLocked(
-                                                sessionId = generationId.sessionId,
-                                                newHandle = message.newHandle,
-                                                resumable = message.resumable
-                                            )
+                    val receiveJob: Job
+                    synchronized(lock) {
+                        closingGenerations.remove(generationId)
+                        activeGenerationId = generationId
+                        receiverCollectorAttachedGen = null
+                        activeLiveSession = session
+                        receiveJob = driverScope.launch {
+                            session.receive()
+                                .onStart {
+                                    val attached = synchronized(lock) {
+                                        if (activeGenerationId == generationId && !closingGenerations.contains(generationId)) {
+                                            receiverCollectorAttachedGen = generationId
+                                            true
+                                        } else {
+                                            false
                                         }
+                                    }
+                                    if (attached) {
+                                        collectorAttach.complete(CollectorAttachOutcome.Attached)
+                                    } else {
+                                        collectorAttach.complete(
+                                            CollectorAttachOutcome.Failed(CancellationException("STALE_CALLBACK_DROPPED: generation superseded before collector start"))
+                                        )
+                                    }
+                                }
+                                .catch { err ->
+                                    immediateFailure.compareAndSet(null, err)
+                                    val isLocalOrStale = synchronized(lock) {
+                                        if (activeGenerationId == generationId) {
+                                            receiverCollectorAttachedGen = null
+                                        }
+                                        activeGenerationId != generationId || closingGenerations.contains(generationId)
+                                    } || (err is CancellationException && err !is TimeoutCancellationException)
+                                    collectorAttach.complete(CollectorAttachOutcome.Failed(err))
+                                    if (isLocalOrStale) {
+                                        logDriver("STALE_CALLBACK_DROPPED: Ignored closed/cancelled receive channel for ${generationId.wireId}")
+                                        return@catch
+                                    }
+                                    if (handshakeReturnedAccepted) {
+                                        val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                                        val classification = LiveExceptionClassifier.classify(
+                                            throwable = err,
+                                            isInternetValidated = validatedNow
+                                        )
+                                        logDriver("ACTUAL_SOCKET_FAILED_REMOTELY: gen=${generationId.wireId} classification=${classification.wireCode}")
                                         onSocketEvent(
-                                            LiveSocketCallbackEvent.SessionResumptionUpdated(
+                                            LiveSocketCallbackEvent.HandshakeFailed(
                                                 generationId = generationId,
-                                                resumable = message.resumable ?: hasHandleNow,
-                                                hasScopedHandle = hasHandleNow,
-                                                lastConsumedClientMessageIndex = message.lastConsumedClientMessageIndex
+                                                classification = classification,
+                                                rawErrorMessage = LiveExceptionClassifier.formatRedactedChain(err)
                                             )
                                         )
                                     }
-                                    is LiveServerGoAway -> {
-                                        val goAwayMs = message.timeLeft?.inWholeMilliseconds
-                                        val goAwayReason =
-                                            "SESSION_EXPIRED_OR_GO_AWAY: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${goAwayMs ?: "UNSPECIFIED"})"
-                                        onSocketEvent(
-                                            LiveSocketCallbackEvent.ServerGoAwayReceived(
-                                                generationId = generationId,
-                                                timeLeftMs = goAwayMs,
-                                                reason = goAwayReason
-                                            )
-                                        )
+                                }
+                                .onCompletion { cause ->
+                                    val isLocalOrStale = synchronized(lock) {
+                                        if (activeGenerationId == generationId) {
+                                            receiverCollectorAttachedGen = null
+                                        }
+                                        activeGenerationId != generationId || closingGenerations.contains(generationId)
+                                    }
+                                    if (cause == null && immediateFailure.get() == null && !isLocalOrStale && handshakeReturnedAccepted) {
+                                        logDriver("ACTUAL_SOCKET_CLOSED_REMOTELY: gen=${generationId.wireId} stream completed by server")
                                         onSocketEvent(
                                             LiveSocketCallbackEvent.SocketClosedRemotely(
                                                 generationId = generationId,
-                                                reason = goAwayReason
+                                                reason = "Gemini Live receive stream completed/closed by server"
                                             )
                                         )
                                     }
-                                    is LiveServerContent -> {
-                                        val inTranscript = message.inputTranscription?.text?.takeIf { it.isNotBlank() }
-                                        val textParts = message.content?.parts
-                                            ?.filterIsInstance<TextPart>()
-                                            ?.mapNotNull { it.text.takeIf { t -> t.isNotBlank() } }
-                                            ?.joinToString(" ")
-                                            ?.takeIf { it.isNotBlank() }
-                                        val outTranscript = message.outputTranscription?.text?.takeIf { it.isNotBlank() } ?: textParts
-                                        if (inTranscript != null || outTranscript != null) {
+                                }
+                                .collect { message ->
+                                    val stillActive = synchronized(lock) {
+                                        activeGenerationId == generationId && !closingGenerations.contains(generationId)
+                                    }
+                                    if (!stillActive) {
+                                        logDriver("STALE_CALLBACK_DROPPED: Dropped server frame for superseded ${generationId.wireId}")
+                                        return@collect
+                                    }
+                                    when (message) {
+                                        is LiveServerSetupComplete -> {
                                             onSocketEvent(
-                                                LiveSocketCallbackEvent.ServerTranscriptionReceived(
+                                                LiveSocketCallbackEvent.SetupAccepted(
                                                     generationId = generationId,
-                                                    inputTranscript = inTranscript,
-                                                    outputTranscript = outTranscript
+                                                    serverNote = "LiveServerSetupComplete frame verified on ${generationId.wireId}",
+                                                    resumedWithServerHandle = resumedWithHandle,
+                                                    handleRejectedFallbackUsed = handleRejectedFallbackUsed
                                                 )
                                             )
                                         }
-
-                                        val parts = message.content?.parts.orEmpty()
-                                        for (part in parts) {
-                                            if (part is InlineDataPart && part.inlineData.isNotEmpty()) {
-                                                val lowerMime = part.mimeType.lowercase()
-                                                if (lowerMime.startsWith("audio/")) {
-                                                    onSocketEvent(
-                                                        LiveSocketCallbackEvent.ServerAudioChunkReceived(
-                                                            generationId = generationId,
-                                                            mimeType = part.mimeType,
-                                                            pcmBytes = part.inlineData
-                                                        )
+                                        is LiveSessionResumptionUpdate -> {
+                                            val hasHandleNow = synchronized(lock) {
+                                                storeScopedResumptionUpdateLocked(
+                                                    sessionId = generationId.sessionId,
+                                                    newHandle = message.newHandle,
+                                                    resumable = message.resumable
+                                                )
+                                            }
+                                            onSocketEvent(
+                                                LiveSocketCallbackEvent.SessionResumptionUpdated(
+                                                    generationId = generationId,
+                                                    resumable = message.resumable ?: hasHandleNow,
+                                                    hasScopedHandle = hasHandleNow,
+                                                    lastConsumedClientMessageIndex = message.lastConsumedClientMessageIndex
+                                                )
+                                            )
+                                        }
+                                        is LiveServerGoAway -> {
+                                            val goAwayMs = message.timeLeft?.inWholeMilliseconds
+                                            val goAwayReason =
+                                                "GO_AWAY_NOTICE: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${goAwayMs ?: "UNSPECIFIED"})"
+                                            logDriver("SERVER_GO_AWAY_NOTICE: gen=${generationId.wireId} timeLeftMs=${goAwayMs ?: -1L} (transport still open; scheduling orderly handover)")
+                                            onSocketEvent(
+                                                LiveSocketCallbackEvent.ServerGoAwayReceived(
+                                                    generationId = generationId,
+                                                    timeLeftMs = goAwayMs,
+                                                    reason = goAwayReason
+                                                )
+                                            )
+                                        }
+                                        is LiveServerContent -> {
+                                            val inTranscript = message.inputTranscription?.text?.takeIf { it.isNotBlank() }
+                                            val textParts = message.content?.parts
+                                                ?.filterIsInstance<TextPart>()
+                                                ?.mapNotNull { it.text.takeIf { t -> t.isNotBlank() } }
+                                                ?.joinToString(" ")
+                                                ?.takeIf { it.isNotBlank() }
+                                            val outTranscript = message.outputTranscription?.text?.takeIf { it.isNotBlank() } ?: textParts
+                                            if (inTranscript != null || outTranscript != null) {
+                                                onSocketEvent(
+                                                    LiveSocketCallbackEvent.ServerTranscriptionReceived(
+                                                        generationId = generationId,
+                                                        inputTranscript = inTranscript,
+                                                        outputTranscript = outTranscript
                                                     )
+                                                )
+                                            }
+
+                                            val parts = message.content?.parts.orEmpty()
+                                            for (part in parts) {
+                                                if (part is InlineDataPart && part.inlineData.isNotEmpty()) {
+                                                    val lowerMime = part.mimeType.lowercase()
+                                                    if (lowerMime.startsWith("audio/")) {
+                                                        onSocketEvent(
+                                                            LiveSocketCallbackEvent.ServerAudioChunkReceived(
+                                                                generationId = generationId,
+                                                                mimeType = part.mimeType,
+                                                                pcmBytes = part.inlineData
+                                                            )
+                                                        )
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        if (message.turnComplete || message.interrupted) {
-                                            onSocketEvent(
-                                                LiveSocketCallbackEvent.ServerTurnCompleted(
-                                                    generationId = generationId,
-                                                    interrupted = message.interrupted
+                                            if (message.turnComplete || message.interrupted) {
+                                                onSocketEvent(
+                                                    LiveSocketCallbackEvent.ServerTurnCompleted(
+                                                        generationId = generationId,
+                                                        interrupted = message.interrupted
+                                                    )
                                                 )
-                                            )
+                                            }
                                         }
+                                        else -> Unit
                                     }
-                                    else -> Unit
                                 }
-                            }
+                        }
+                        activeReceiveJob = receiveJob
                     }
-                    activeReceiveJob = receiveJob
-                }
 
-                val attachOutcome = withTimeout(handshakeTimeoutMs) {
-                    collectorAttach.await()
-                }
-                yield()
+                    val attachOutcome = withTimeout(handshakeTimeoutMs) {
+                        collectorAttach.await()
+                    }
+                    yield()
 
-                val earlyError = (attachOutcome as? CollectorAttachOutcome.Failed)?.throwable
-                    ?: immediateFailure.get()
-                if (earlyError != null) {
+                    val earlyError = (attachOutcome as? CollectorAttachOutcome.Failed)?.throwable
+                        ?: immediateFailure.get()
+                    if (earlyError == null) {
+                        finalEarlyError = null
+                        handshakeReturnedAccepted = true
+                        break
+                    }
+
                     closeAndAwaitSocket(generationId)
+                    val validatedNow = networkMonitor?.isInternetValidated() ?: true
+                    val earlyClassification = LiveExceptionClassifier.classify(
+                        throwable = earlyError,
+                        isInternetValidated = validatedNow
+                    )
+                    val canFallbackCleanConnect =
+                        connectPass == 0 &&
+                            resumedWithHandle &&
+                            validatedNow &&
+                            earlyClassification != LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE &&
+                            earlyClassification != LiveFailureClassification.BAD_CREDENTIALS_OR_APP_CHECK &&
+                            earlyClassification != LiveFailureClassification.QUOTA_EXHAUSTED
                     if (resumedWithHandle) {
                         synchronized(lock) {
                             scopedResumptionHandles.remove(generationId.sessionId.value)
                             scopedResumableStatus.remove(generationId.sessionId.value)
                         }
                     }
+                    if (canFallbackCleanConnect) {
+                        candidateHandle = null
+                        handleRejectedFallbackUsed = true
+                        logDriver("SESSION_RESUMPTION_HANDLE_REJECTED: Stream failed during setup with handle for ${generationId.sessionId.value}; falling back to clean connection.")
+                        continue
+                    }
+                    finalEarlyError = earlyError
+                    break
+                }
+
+                if (finalEarlyError != null) {
                     val validatedNow = networkMonitor?.isInternetValidated() ?: true
                     val classification = LiveExceptionClassifier.classify(
-                        throwable = earlyError,
+                        throwable = finalEarlyError,
                         isInternetValidated = validatedNow
                     )
                     return@withLock LiveHandshakeResult.Failed(
                         generationId = generationId,
                         classification = classification,
-                        rawDetail = LiveExceptionClassifier.formatRedactedChain(earlyError)
+                        rawDetail = LiveExceptionClassifier.formatRedactedChain(finalEarlyError),
+                        handleRejectedFallbackUsed = handleRejectedFallbackUsed
                     )
                 }
 
@@ -831,8 +864,6 @@ class FirebaseAiLiveTransportDriver(
                         rawDetail = "Superseded or cancelled before SETUP_ACCEPTED (${generationId.wireId})"
                     )
                 }
-
-                handshakeReturnedAccepted = true
                 val contextNote = when {
                     resumedWithHandle -> "context=RESUMED_WITH_SERVER_HANDLE"
                     handleRejectedFallbackUsed -> "context=NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT(handleRejectedFallback)"
@@ -865,7 +896,8 @@ class FirebaseAiLiveTransportDriver(
                 LiveHandshakeResult.Failed(
                     generationId = generationId,
                     classification = classification,
-                    rawDetail = detail
+                    rawDetail = detail,
+                    handleRejectedFallbackUsed = handleRejectedFallbackUsed
                 )
             }
         }
@@ -1097,13 +1129,14 @@ class DeterministicTestLiveTransportDriver(
     }
 
     /**
-     * Simulates the server sending a [LiveServerGoAway] notice on the active generation.
+     * Simulates the server sending a [LiveServerGoAway] notice on the active generation
+     * while the underlying transport may still remain open until actual closure.
      */
     fun simulateServerGoAwayForTest(
         generationId: LiveSessionGenerationId,
         timeLeftMs: Long? = 5_000L
     ) {
-        val reason = "SESSION_EXPIRED_OR_GO_AWAY: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${timeLeftMs ?: "UNSPECIFIED"})"
+        val reason = "GO_AWAY_NOTICE: LiveServerGoAway received from Gemini Live endpoint (timeLeftMs=${timeLeftMs ?: "UNSPECIFIED"})"
         activeCallback?.invoke(
             LiveSocketCallbackEvent.ServerGoAwayReceived(
                 generationId = generationId,
@@ -1111,6 +1144,19 @@ class DeterministicTestLiveTransportDriver(
                 reason = reason
             )
         )
+    }
+
+    /**
+     * Simulates an actual remote WebSocket close callback arriving from the transport layer.
+     */
+    fun simulateActualSocketCloseForTest(
+        generationId: LiveSessionGenerationId,
+        reason: String = "Remote WebSocket closed by server (1001 Going Away)"
+    ) {
+        if (lastConnectedGenId == generationId) {
+            isCollectorAttachedForCurrentGen = false
+            isSetupAcceptedForCurrentGen = false
+        }
         activeCallback?.invoke(
             LiveSocketCallbackEvent.SocketClosedRemotely(
                 generationId = generationId,
@@ -1171,14 +1217,20 @@ class DeterministicTestLiveTransportDriver(
         }
         activeCallback = wrappedCallback
         val result = scriptedHandler(generationId, modelId, attempt, wrappedCallback)
-        if (result is LiveHandshakeResult.Accepted) {
-            isSetupAcceptedForCurrentGen = true
-            return result.copy(
-                resumedWithServerHandle = result.resumedWithServerHandle || resumedWithHandle,
-                handleRejectedFallbackUsed = result.handleRejectedFallbackUsed || handleRejectedFallback
-            )
+        return when (result) {
+            is LiveHandshakeResult.Accepted -> {
+                isSetupAcceptedForCurrentGen = true
+                result.copy(
+                    resumedWithServerHandle = result.resumedWithServerHandle || resumedWithHandle,
+                    handleRejectedFallbackUsed = result.handleRejectedFallbackUsed || handleRejectedFallback
+                )
+            }
+            is LiveHandshakeResult.Failed -> {
+                result.copy(
+                    handleRejectedFallbackUsed = result.handleRejectedFallbackUsed || handleRejectedFallback
+                )
+            }
         }
-        return result
     }
 
     override suspend fun sendStartOfSpokenTurn(
@@ -1266,6 +1318,7 @@ class GeminiLiveConnectionAdapter(
     private var eligibleForSingleAutoReconnect: Boolean = false
     private var autoReconnectPerformedForOutage: Boolean = false
     private var operatorHalted: Boolean = false
+    private var haltEpoch: Long = 0L
     private val establishedSessionIds = LinkedHashSet<String>()
 
     /**
@@ -1385,6 +1438,7 @@ class GeminiLiveConnectionAdapter(
                         isInternetValidated = false,
                         handshakeVerified = false,
                         audioPlaybackClaimed = false,
+                        goAwayNoticePendingHandover = false,
                         autoRetryStoppedReason = "RETRY_CANCELLED_OFFLINE (NETWORK_UNAVAILABLE)",
                         statusHeadline = "NETWORK_UNAVAILABLE — CONNECTION INVALIDATED",
                         statusDetail = offlineSummary,
@@ -1395,6 +1449,7 @@ class GeminiLiveConnectionAdapter(
                             isInternetValidated = false,
                             handshakeVerified = false,
                             audioPlaybackClaimed = false,
+                            goAwayNoticePendingHandover = false,
                             redactedSummary = offlineSummary
                         )
                     )
@@ -1654,6 +1709,7 @@ class GeminiLiveConnectionAdapter(
                                 hasScopedResumptionHandle = hasScopedHandleNow,
                                 sessionResumptionSuccessCount = newResumedCount,
                                 sessionResumptionFallbackCount = newFallbackCount,
+                                goAwayNoticePendingHandover = false,
                                 statusHeadline = "LIVE HANDSHAKE VERIFIED (SETUP_ACCEPTED)",
                                 statusDetail = safeNote,
                                 diagnostics = prev.diagnostics.copy(
@@ -1673,6 +1729,7 @@ class GeminiLiveConnectionAdapter(
                                     hasScopedResumptionHandle = hasScopedHandleNow,
                                     sessionResumptionSuccessCount = newResumedCount,
                                     sessionResumptionFallbackCount = newFallbackCount,
+                                    goAwayNoticePendingHandover = false,
                                     redactedSummary = safeNote
                                 )
                             )
@@ -1705,14 +1762,21 @@ class GeminiLiveConnectionAdapter(
 
                     is LiveSocketCallbackEvent.ServerGoAwayReceived -> {
                         closeGenAfterCallback = null
+                        val safeNoticeReason = DiagnosticRedactor.redact(event.reason)
                         updateStateAndNotify { prev ->
                             val newGoAwayCount = prev.serverGoAwayCount + 1
                             prev.copy(
                                 serverGoAwayCount = newGoAwayCount,
                                 lastServerGoAwayTimeLeftMs = event.timeLeftMs,
+                                goAwayNoticePendingHandover = true,
+                                lastGoAwayGenerationWireId = currentActive.wireId,
+                                statusDetail = "GoAway notice on ${currentActive.wireId} (timeLeftMs=${event.timeLeftMs ?: "UNSPECIFIED"}); scheduling orderly handover.",
                                 diagnostics = prev.diagnostics.copy(
                                     serverGoAwayCount = newGoAwayCount,
-                                    lastServerGoAwayTimeLeftMs = event.timeLeftMs
+                                    lastServerGoAwayTimeLeftMs = event.timeLeftMs,
+                                    goAwayNoticePendingHandover = true,
+                                    lastGoAwayGenerationWireId = currentActive.wireId,
+                                    redactedSummary = safeNoticeReason
                                 )
                             )
                         }
@@ -1740,6 +1804,14 @@ class GeminiLiveConnectionAdapter(
                             null
                         }
                         updateStateAndNotify { prev ->
+                            val newActualCloseCount = if (wasEstablished) {
+                                prev.actualSocketCloseCount + 1
+                            } else {
+                                prev.actualSocketCloseCount
+                            }
+                            val closeGenLabel = if (wasEstablished) currentActive.wireId else prev.lastActualSocketCloseGenerationWireId
+                            val closeClassLabel = if (wasEstablished) event.classification.wireCode else prev.lastActualSocketCloseClassification
+                            val closeReasonLabel = if (wasEstablished) safeMsg else prev.lastActualSocketCloseReason
                             prev.copy(
                                 phase = LiveConnectionPhase.FAILED,
                                 activeGeneration = if (wasEstablished) null else prev.activeGeneration,
@@ -1747,6 +1819,11 @@ class GeminiLiveConnectionAdapter(
                                 failureClassification = event.classification,
                                 handshakeVerified = false,
                                 isReceiverCollectorAttached = false,
+                                goAwayNoticePendingHandover = false,
+                                actualSocketCloseCount = newActualCloseCount,
+                                lastActualSocketCloseGenerationWireId = closeGenLabel,
+                                lastActualSocketCloseClassification = closeClassLabel,
+                                lastActualSocketCloseReason = closeReasonLabel,
                                 autoRetryStoppedReason = stopReason ?: prev.autoRetryStoppedReason,
                                 statusHeadline = "LIVE SESSION FAILED: ${event.classification.wireCode}",
                                 statusDetail = safeMsg,
@@ -1757,6 +1834,11 @@ class GeminiLiveConnectionAdapter(
                                     failureCode = event.classification.wireCode,
                                     handshakeVerified = false,
                                     isReceiverCollectorAttached = false,
+                                    goAwayNoticePendingHandover = false,
+                                    actualSocketCloseCount = newActualCloseCount,
+                                    lastActualSocketCloseGenerationWireId = closeGenLabel,
+                                    lastActualSocketCloseClassification = closeClassLabel,
+                                    lastActualSocketCloseReason = closeReasonLabel,
                                     redactedSummary = "Failure [${event.classification.wireCode}]: $safeMsg"
                                 )
                             )
@@ -1774,6 +1856,7 @@ class GeminiLiveConnectionAdapter(
                         if (closeClassification == LiveFailureClassification.CANCELLED_BY_STOP_OR_PAUSE) {
                             logAdapter("STALE_CALLBACK_DROPPED: Ignored local close/cancel callback for ${currentActive.wireId}")
                             updateStateAndNotify { prev ->
+                                val newActualCloseCount = prev.actualSocketCloseCount + 1
                                 prev.copy(
                                     phase = LiveConnectionPhase.DISCONNECTED,
                                     activeGeneration = null,
@@ -1781,6 +1864,11 @@ class GeminiLiveConnectionAdapter(
                                     failureClassification = LiveFailureClassification.NONE,
                                     handshakeVerified = false,
                                     isReceiverCollectorAttached = false,
+                                    goAwayNoticePendingHandover = false,
+                                    actualSocketCloseCount = newActualCloseCount,
+                                    lastActualSocketCloseGenerationWireId = currentActive.wireId,
+                                    lastActualSocketCloseClassification = closeClassification.wireCode,
+                                    lastActualSocketCloseReason = safeReason,
                                     statusHeadline = "LIVE SOCKET DISCONNECTED",
                                     statusDetail = safeReason,
                                     diagnostics = prev.diagnostics.copy(
@@ -1789,6 +1877,11 @@ class GeminiLiveConnectionAdapter(
                                         failureCode = LiveFailureClassification.NONE.wireCode,
                                         handshakeVerified = false,
                                         isReceiverCollectorAttached = false,
+                                        goAwayNoticePendingHandover = false,
+                                        actualSocketCloseCount = newActualCloseCount,
+                                        lastActualSocketCloseGenerationWireId = currentActive.wireId,
+                                        lastActualSocketCloseClassification = closeClassification.wireCode,
+                                        lastActualSocketCloseReason = safeReason,
                                         redactedSummary = "Socket closed (${currentActive.wireId}): $safeReason"
                                     )
                                 )
@@ -1806,6 +1899,7 @@ class GeminiLiveConnectionAdapter(
                                 null
                             }
                             updateStateAndNotify { prev ->
+                                val newActualCloseCount = prev.actualSocketCloseCount + 1
                                 prev.copy(
                                     phase = LiveConnectionPhase.FAILED,
                                     activeGeneration = null,
@@ -1813,6 +1907,11 @@ class GeminiLiveConnectionAdapter(
                                     failureClassification = closeClassification,
                                     handshakeVerified = false,
                                     isReceiverCollectorAttached = false,
+                                    goAwayNoticePendingHandover = false,
+                                    actualSocketCloseCount = newActualCloseCount,
+                                    lastActualSocketCloseGenerationWireId = currentActive.wireId,
+                                    lastActualSocketCloseClassification = closeClassification.wireCode,
+                                    lastActualSocketCloseReason = safeReason,
                                     autoRetryStoppedReason = stopReason ?: prev.autoRetryStoppedReason,
                                     statusHeadline = "LIVE SOCKET CLOSED [${closeClassification.wireCode}]",
                                     statusDetail = safeReason,
@@ -1822,6 +1921,11 @@ class GeminiLiveConnectionAdapter(
                                         failureCode = closeClassification.wireCode,
                                         handshakeVerified = false,
                                         isReceiverCollectorAttached = false,
+                                        goAwayNoticePendingHandover = false,
+                                        actualSocketCloseCount = newActualCloseCount,
+                                        lastActualSocketCloseGenerationWireId = currentActive.wireId,
+                                        lastActualSocketCloseClassification = closeClassification.wireCode,
+                                        lastActualSocketCloseReason = safeReason,
                                         redactedSummary = "Remote socket closed (${currentActive.wireId}) [${closeClassification.wireCode}]: $safeReason"
                                     )
                                 )
@@ -2021,12 +2125,13 @@ class GeminiLiveConnectionAdapter(
         var existingToAwait: CompletableDeferred<LiveConnectionState>? = null
         var joinedWasAutoOnly = false
 
-        synchronized(lock) {
+        val startHaltEpoch = synchronized(lock) {
             if (lastSessionId != sessionId) {
                 effectiveDriver.clearScopedResumptionState(lastSessionId)
             }
             lastSessionId = sessionId
             operatorHalted = false
+            val epochNow = haltEpoch
 
             if (reuseIfHealthy && isHealthyEstablishedSessionLocked()) {
                 return _state.value
@@ -2043,6 +2148,7 @@ class GeminiLiveConnectionAdapter(
                 inFlightConnectIsAutoReconnectOnly = isControlledAutoReconnect
                 myDeferred = created
             }
+            epochNow
         }
 
         if (existingToAwait != null) {
@@ -2066,6 +2172,12 @@ class GeminiLiveConnectionAdapter(
 
         try {
             return connectMutex.withLock {
+                val haltedBeforeLock = synchronized(lock) {
+                    operatorHalted || haltEpoch != startHaltEpoch
+                }
+                if (haltedBeforeLock) {
+                    return@withLock _state.value
+                }
                 if (reuseIfHealthy && synchronized(lock) { isHealthyEstablishedSessionLocked() }) {
                     return@withLock _state.value
                 }
@@ -2143,6 +2255,7 @@ class GeminiLiveConnectionAdapter(
 
                 var attempt = 1
                 var retryCount = 0
+                var countedRejectedHandleFallback = false
                 val effectiveMaxAttempts = maxAttemptsLimit.coerceAtLeast(1)
 
                 while (attempt <= effectiveMaxAttempts) {
@@ -2266,6 +2379,12 @@ class GeminiLiveConnectionAdapter(
                             }
                             val classification = result.classification
                             val redactedError = DiagnosticRedactor.redact(result.rawDetail)
+                            val fallbackTriggeredNow =
+                                result.handleRejectedFallbackUsed && !countedRejectedHandleFallback
+                            if (fallbackTriggeredNow) {
+                                countedRejectedHandleFallback = true
+                            }
+                            val hasScopedHandleNow = effectiveDriver.hasScopedResumptionHandle(sessionId)
 
                             if (classification == LiveFailureClassification.NETWORK_UNAVAILABLE ||
                                 !networkMonitor.isInternetValidated()
@@ -2281,6 +2400,21 @@ class GeminiLiveConnectionAdapter(
                                     if (activeConnectRequestId == requestId) {
                                         activeGenerationId = null
                                         updateStateAndNotify { prev ->
+                                            val newFallbackCount = if (fallbackTriggeredNow) {
+                                                prev.sessionResumptionFallbackCount + 1
+                                            } else {
+                                                prev.sessionResumptionFallbackCount
+                                            }
+                                            val nextResumptionStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                                SessionResumptionStatus.HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION
+                                            } else {
+                                                prev.sessionResumptionStatus
+                                            }
+                                            val nextContextStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                                ContextRestorationStatus.NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT
+                                            } else {
+                                                prev.contextRestorationStatus
+                                            }
                                             prev.copy(
                                                 phase = LiveConnectionPhase.FAILED,
                                                 activeGeneration = null,
@@ -2289,6 +2423,11 @@ class GeminiLiveConnectionAdapter(
                                                 attemptCount = attempt,
                                                 retryCount = retryCount,
                                                 handshakeVerified = false,
+                                                goAwayNoticePendingHandover = false,
+                                                sessionResumptionStatus = nextResumptionStatus,
+                                                contextRestorationStatus = nextContextStatus,
+                                                hasScopedResumptionHandle = hasScopedHandleNow,
+                                                sessionResumptionFallbackCount = newFallbackCount,
                                                 autoRetryStoppedReason = stopReason,
                                                 statusHeadline = "FAILED (${classification.wireCode}) — AUTO-RETRY STOPPED",
                                                 statusDetail = "${classification.guidance} | Detail: $redactedError",
@@ -2300,6 +2439,11 @@ class GeminiLiveConnectionAdapter(
                                                     attemptCount = attempt,
                                                     retryCount = retryCount,
                                                     handshakeVerified = false,
+                                                    goAwayNoticePendingHandover = false,
+                                                    sessionResumptionStatus = nextResumptionStatus.wireCode,
+                                                    contextRestorationStatus = nextContextStatus.wireCode,
+                                                    hasScopedResumptionHandle = hasScopedHandleNow,
+                                                    sessionResumptionFallbackCount = newFallbackCount,
                                                     redactedSummary = "$stopReason | $redactedError"
                                                 )
                                             )
@@ -2325,6 +2469,21 @@ class GeminiLiveConnectionAdapter(
                                     if (activeConnectRequestId == requestId) {
                                         activeGenerationId = null
                                         updateStateAndNotify { prev ->
+                                            val newFallbackCount = if (fallbackTriggeredNow) {
+                                                prev.sessionResumptionFallbackCount + 1
+                                            } else {
+                                                prev.sessionResumptionFallbackCount
+                                            }
+                                            val nextResumptionStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                                SessionResumptionStatus.HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION
+                                            } else {
+                                                prev.sessionResumptionStatus
+                                            }
+                                            val nextContextStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                                ContextRestorationStatus.NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT
+                                            } else {
+                                                prev.contextRestorationStatus
+                                            }
                                             prev.copy(
                                                 phase = LiveConnectionPhase.FAILED,
                                                 activeGeneration = null,
@@ -2333,6 +2492,11 @@ class GeminiLiveConnectionAdapter(
                                                 attemptCount = attempt,
                                                 retryCount = retryCount,
                                                 handshakeVerified = false,
+                                                goAwayNoticePendingHandover = false,
+                                                sessionResumptionStatus = nextResumptionStatus,
+                                                contextRestorationStatus = nextContextStatus,
+                                                hasScopedResumptionHandle = hasScopedHandleNow,
+                                                sessionResumptionFallbackCount = newFallbackCount,
                                                 autoRetryStoppedReason = exhaustedReason,
                                                 statusHeadline = "FAILED AFTER $attempt BOUNDED ATTEMPTS (${classification.wireCode})",
                                                 statusDetail = "$exhaustedReason | Last error: $redactedError",
@@ -2344,6 +2508,11 @@ class GeminiLiveConnectionAdapter(
                                                     attemptCount = attempt,
                                                     retryCount = retryCount,
                                                     handshakeVerified = false,
+                                                    goAwayNoticePendingHandover = false,
+                                                    sessionResumptionStatus = nextResumptionStatus.wireCode,
+                                                    contextRestorationStatus = nextContextStatus.wireCode,
+                                                    hasScopedResumptionHandle = hasScopedHandleNow,
+                                                    sessionResumptionFallbackCount = newFallbackCount,
                                                     redactedSummary = "$exhaustedReason | $redactedError"
                                                 )
                                             )
@@ -2361,6 +2530,21 @@ class GeminiLiveConnectionAdapter(
                                 val backoffMsg =
                                     "Transient failure (${classification.wireCode}) on ${genId.wireId}. Waiting ${nextDelayMs}ms before retry ${attempt + 1}/$effectiveMaxAttempts. Detail: $redactedError"
                                 updateStateAndNotify { prev ->
+                                    val newFallbackCount = if (fallbackTriggeredNow) {
+                                        prev.sessionResumptionFallbackCount + 1
+                                    } else {
+                                        prev.sessionResumptionFallbackCount
+                                    }
+                                    val nextResumptionStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                        SessionResumptionStatus.HANDLE_REJECTED_FELL_BACK_NEW_CONNECTION
+                                    } else {
+                                        prev.sessionResumptionStatus
+                                    }
+                                    val nextContextStatus = if (fallbackTriggeredNow || countedRejectedHandleFallback) {
+                                        ContextRestorationStatus.NEW_CONNECTION_WITHOUT_RESUMED_CONTEXT
+                                    } else {
+                                        prev.contextRestorationStatus
+                                    }
                                     prev.copy(
                                         phase = LiveConnectionPhase.RETRY_BACKOFF_WAITING,
                                         failureClassification = classification,
@@ -2368,6 +2552,10 @@ class GeminiLiveConnectionAdapter(
                                         retryCount = retryCount,
                                         lastBackoffDelayMs = nextDelayMs,
                                         handshakeVerified = false,
+                                        sessionResumptionStatus = nextResumptionStatus,
+                                        contextRestorationStatus = nextContextStatus,
+                                        hasScopedResumptionHandle = hasScopedHandleNow,
+                                        sessionResumptionFallbackCount = newFallbackCount,
                                         statusHeadline = "TRANSIENT FAILURE — BACKOFF ${nextDelayMs}ms (RETRY $retryCount)",
                                         statusDetail = backoffMsg,
                                         diagnostics = prev.diagnostics.copy(
@@ -2379,6 +2567,10 @@ class GeminiLiveConnectionAdapter(
                                             retryCount = retryCount,
                                             lastBackoffDelayMs = nextDelayMs,
                                             handshakeVerified = false,
+                                            sessionResumptionStatus = nextResumptionStatus.wireCode,
+                                            contextRestorationStatus = nextContextStatus.wireCode,
+                                            hasScopedResumptionHandle = hasScopedHandleNow,
+                                            sessionResumptionFallbackCount = newFallbackCount,
                                             redactedSummary = backoffMsg
                                         )
                                     )
@@ -2438,6 +2630,7 @@ class GeminiLiveConnectionAdapter(
                         activeGeneration = null,
                         lastCompletedGeneration = genToClose ?: prev.lastCompletedGeneration,
                         handshakeVerified = false,
+                        goAwayNoticePendingHandover = false,
                         autoRetryStoppedReason = "RETRY_CANCELLED ($safeReason)",
                         statusHeadline = "SCHEDULED RETRY CANCELLED",
                         statusDetail = "Cancelled ($genLabel): $safeReason",
@@ -2445,6 +2638,7 @@ class GeminiLiveConnectionAdapter(
                             sessionGenerationWireId = genLabel,
                             phaseWireCode = LiveConnectionPhase.DISCONNECTED.wireCode,
                             handshakeVerified = false,
+                            goAwayNoticePendingHandover = false,
                             redactedSummary = "Cancelled ($genLabel): $safeReason"
                         )
                     )
@@ -2466,6 +2660,7 @@ class GeminiLiveConnectionAdapter(
         val safeReason = DiagnosticRedactor.redact(reason)
         synchronized(lock) {
             operatorHalted = true
+            haltEpoch += 1L
             eligibleForSingleAutoReconnect = false
             autoReconnectPerformedForOutage = false
             activeConnectRequestId = connectRequestSeq.incrementAndGet()
@@ -2481,6 +2676,7 @@ class GeminiLiveConnectionAdapter(
                     lastCompletedGeneration = prevGen ?: prev.lastCompletedGeneration,
                     handshakeVerified = false,
                     audioPlaybackClaimed = false,
+                    goAwayNoticePendingHandover = false,
                     autoRetryStoppedReason = "DISCONNECTED ($safeReason)",
                     statusHeadline = "LIVE ADAPTER DISCONNECTED",
                     statusDetail = "Disconnected ($genLabel): $safeReason",
@@ -2489,6 +2685,7 @@ class GeminiLiveConnectionAdapter(
                         phaseWireCode = LiveConnectionPhase.DISCONNECTED.wireCode,
                         handshakeVerified = false,
                         audioPlaybackClaimed = false,
+                        goAwayNoticePendingHandover = false,
                         redactedSummary = "Disconnected ($genLabel): $safeReason"
                     )
                 )
@@ -2503,6 +2700,19 @@ class GeminiLiveConnectionAdapter(
         withContext(backgroundDispatcher + NonCancellable) {
             effectiveDriver.closeAndAwaitSocket(null)
         }
+    }
+
+    suspend fun rotateSessionForGoAway(
+        sessionId: SessionId,
+        reason: String
+    ): LiveConnectionState {
+        logAdapter("GO_AWAY_HANDOVER_START: Rotating session ${sessionId.value} cleanly ($reason)")
+        return executeHandshakeWithPolicy(
+            sessionId = sessionId,
+            maxAttemptsLimit = backoffPolicy.maxAttempts,
+            isControlledAutoReconnect = false,
+            reuseIfHealthy = false
+        )
     }
 
     suspend fun recreateSessionAfterInterruption(

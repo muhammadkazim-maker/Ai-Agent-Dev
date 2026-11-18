@@ -228,7 +228,8 @@ class ConversationCoordinator(
     val wakeWordDetector: WakeWordDetector = FakeWakeWordDetector(),
     val isRealDeviceMeasurementMode: Boolean =
         speechDetector.requiresLoadedModel &&
-            playbackAdapter.driver is com.example.audio.AndroidStreamingAudioTrackDriver
+            playbackAdapter.driver is com.example.audio.AndroidStreamingAudioTrackDriver,
+    private val goAwayDeadlineDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) }
 ) {
     private sealed interface PrerequisiteCheck {
         data object Passed : PrerequisiteCheck
@@ -273,6 +274,18 @@ class ConversationCoordinator(
     @Volatile
     private var activeNextTurnRecoveryJob: Job? = null
     @Volatile
+    private var activeGoAwayHandoverJob: Job? = null
+    @Volatile
+    private var activeGoAwayHandoverDeferred: CompletableDeferred<VerifiedOutcome>? = null
+    @Volatile
+    private var activeGoAwayHandoverTurnDeferred: CompletableDeferred<VerifiedOutcome>? = null
+    @Volatile
+    private var pendingGoAwayDeadlineJob: Job? = null
+    @Volatile
+    private var scheduledGoAwayForLiveGenWireId: String? = null
+    @Volatile
+    private var goAwayHandoverAttemptedForCurrentGenOrTurn: Boolean = false
+    @Volatile
     private var postPlaybackGuardJob: Job? = null
     private val micSendMutex = Mutex()
     @Volatile
@@ -284,6 +297,11 @@ class ConversationCoordinator(
     @Volatile
     private var previousTurnEarliestMissingStep: String? = null
     private var consecutiveFirstResponseTimeouts: Int = 0
+
+    private fun cancelPendingGoAwayDeadlineLocked() {
+        pendingGoAwayDeadlineJob?.cancel()
+        pendingGoAwayDeadlineJob = null
+    }
 
     @Volatile
     private var wakeWordState: WakeWordState = WakeWordState.COMMAND_LISTENING
@@ -550,7 +568,8 @@ class ConversationCoordinator(
             !isDeliberatelyPaused &&
                 !isDeliberatelyStopped &&
                 activeTimeoutRecoveryJob?.isActive != true &&
-                activeNextTurnRecoveryJob?.isActive != true
+                activeNextTurnRecoveryJob?.isActive != true &&
+                activeGoAwayHandoverJob?.isActive != true
         }
         liveAdapter.onStateChanged = { onLiveAdapterStateUpdated() }
         liveAdapter.onServerEventListener = { event -> onServerSocketEvent(event) }
@@ -567,6 +586,8 @@ class ConversationCoordinator(
         val recoveryActive =
             activeTimeoutRecoveryJob?.isActive == true ||
                 activeNextTurnRecoveryJob?.isActive == true ||
+                activeGoAwayHandoverJob?.isActive == true ||
+                pendingGoAwayDeadlineJob?.isActive == true ||
                 postPlaybackGuardJob?.isActive == true
         if (turn == null) return recoveryActive
         return recoveryActive || turn.activeJobCount() > 0 || turn.parentJob.isActive
@@ -582,6 +603,8 @@ class ConversationCoordinator(
         val recoveryJobsCount =
             (if (activeTimeoutRecoveryJob?.isActive == true) 1 else 0) +
                 (if (activeNextTurnRecoveryJob?.isActive == true) 1 else 0) +
+                (if (activeGoAwayHandoverJob?.isActive == true) 1 else 0) +
+                (if (pendingGoAwayDeadlineJob?.isActive == true) 1 else 0) +
                 (if (postPlaybackGuardJob?.isActive == true) 1 else 0)
         return CoordinatorResourceSnapshot(
             activeTurnJobs = (turn?.activeJobCount() ?: 0) + recoveryJobsCount,
@@ -676,6 +699,22 @@ class ConversationCoordinator(
                     authoritativeSystemInstruction = liveSnap.systemInstruction
                 )
             }
+            if (liveSnap.handshakeVerified &&
+                liveSnap.activeGeneration != null &&
+                scheduledGoAwayForLiveGenWireId != null &&
+                liveSnap.activeGeneration.wireId != scheduledGoAwayForLiveGenWireId
+            ) {
+                cancelPendingGoAwayDeadlineLocked()
+                scheduledGoAwayForLiveGenWireId = null
+                needsSessionRecreationBeforeNextTurn = false
+                goAwayHandoverAttemptedForCurrentGenOrTurn = false
+            }
+            if (activeGoAwayHandoverJob?.isActive == true ||
+                activeTimeoutRecoveryJob?.isActive == true ||
+                activeNextTurnRecoveryJob?.isActive == true
+            ) {
+                return
+            }
             val turn = activeTurn ?: return
             if (turn.closed) return
             val currentState = _uiState.value.state
@@ -707,38 +746,39 @@ class ConversationCoordinator(
                     !isCompletingInterruptionRecovery &&
                     (liveSnap.phase == LiveConnectionPhase.FAILED || liveSnap.phase == LiveConnectionPhase.DISCONNECTED)
                 ) {
-                    val isSilentWaitingInListening =
-                        currentState == ConversationState.LISTENING &&
-                            !turn.activityStartSent &&
-                            !turn.endOfTurnSubmitted
                     val isGoAwayOrProactiveExpiry =
                         liveSnap.failureClassification == LiveFailureClassification.SESSION_EXPIRED_OR_GO_AWAY ||
+                            scheduledGoAwayForLiveGenWireId != null ||
                             needsSessionRecreationBeforeNextTurn
-                    if (isSilentWaitingInListening &&
+                    val canAttemptGoAwayHandover =
                         isGoAwayOrProactiveExpiry &&
-                        _uiState.value.isActiveConversationEnabled &&
-                        !isDeliberatelyPaused &&
-                        !isDeliberatelyStopped
-                    ) {
-                        cancelInactivityTimerLocked()
-                        cancelPostPlaybackGuardJobLocked()
-                        speechGate.cancelAndResetToIdle(resetSessionCounters = false)
-                        syncSpeechGateTelemetryLocked()
-                        activeTurn = null
-                        turn.dispose(cancelAllJobs = true)
-                        audioCapture.stopAndRelease(
-                            reason = "Session rotating after ServerGoAway / session expiry while waiting silently",
-                            wipeEphemeral = true
-                        )
-                        playbackAdapter.stopAndFlush(reason = "Session rotating after ServerGoAway")
-                        liveAdapter.setAudioPlaybackClaimed(false)
-                        needsSessionRecreationBeforeNextTurn = false
-                        val job = prepareNextTurnSessionRecoveryLocked(
+                            liveAdapter.networkMonitor.isInternetValidated() &&
+                            _uiState.value.isActiveConversationEnabled &&
+                            !isDeliberatelyPaused &&
+                            !isDeliberatelyStopped &&
+                            !goAwayHandoverAttemptedForCurrentGenOrTurn &&
+                            (liveSnap.failureClassification == LiveFailureClassification.NONE ||
+                                liveSnap.failureClassification.retryable)
+                    if (canAttemptGoAwayHandover) {
+                        val spokenQuestionLost =
+                            currentState != ConversationState.LISTENING ||
+                                turn.activityStartSent ||
+                                turn.endOfTurnRequested ||
+                                turn.endOfTurnSubmitted ||
+                                turn.confirmedSentFramesCount > 0L ||
+                                speechGate.hasObservedWaitingSpeechCandidate()
+                        val handoverJob = scheduleOrderlyGoAwayHandoverLocked(
                             sessionId = turn.sessionId,
-                            previousTurnId = turn.turnId,
-                            completedTurn = turn
+                            goAwayGenWireId = scheduledGoAwayForLiveGenWireId
+                                ?: liveSnap.lastCompletedGeneration?.wireId
+                                ?: liveSnap.activeGeneration?.wireId
+                                ?: "NONE",
+                            timeLeftMs = liveSnap.lastServerGoAwayTimeLeftMs,
+                            spokenQuestionLost = spokenQuestionLost,
+                            failedTurnForDiagnostics = turn,
+                            triggerDetail = "Actual socket close (${liveSnap.failureClassification.wireCode}) during ${currentState.wireLabel} racing with or following ServerGoAway"
                         )
-                        job?.start()
+                        handoverJob?.start()
                         return
                     }
                     val failCode = liveSnap.failureClassification
@@ -776,6 +816,12 @@ class ConversationCoordinator(
             synchronized(this) {
                 val setupAtMs = monotonicClockMs()
                 val liveGenWire = event.generationId.wireId
+                if (scheduledGoAwayForLiveGenWireId != null && scheduledGoAwayForLiveGenWireId != liveGenWire) {
+                    cancelPendingGoAwayDeadlineLocked()
+                    scheduledGoAwayForLiveGenWireId = null
+                    needsSessionRecreationBeforeNextTurn = false
+                    goAwayHandoverAttemptedForCurrentGenOrTurn = false
+                }
                 activeTurn?.let { turn ->
                     if (!turn.closed) {
                         if (turn.tSetupAcceptedMs == null) {
@@ -1000,6 +1046,8 @@ class ConversationCoordinator(
         activeTurn?.collectAllJobs()?.let { jobs.addAll(it) }
         activeTimeoutRecoveryJob?.let { jobs.add(it) }
         activeNextTurnRecoveryJob?.let { jobs.add(it) }
+        activeGoAwayHandoverJob?.let { jobs.add(it) }
+        pendingGoAwayDeadlineJob?.let { jobs.add(it) }
         postPlaybackGuardJob?.let { jobs.add(it) }
         return jobs
     }
@@ -1123,6 +1171,7 @@ class ConversationCoordinator(
                 (activeTurn?.let { !it.closed } == true) ||
                     (activeTimeoutRecoveryJob?.isActive == true) ||
                     (activeNextTurnRecoveryJob?.isActive == true) ||
+                    (activeGoAwayHandoverJob?.isActive == true) ||
                     current.state == ConversationState.PREPARING ||
                     current.state == ConversationState.CONNECTING ||
                     current.state == ConversationState.LISTENING ||
@@ -1181,6 +1230,7 @@ class ConversationCoordinator(
                 (activeTurn?.let { !it.closed } == true) ||
                     (activeTimeoutRecoveryJob?.isActive == true) ||
                     (activeNextTurnRecoveryJob?.isActive == true) ||
+                    (activeGoAwayHandoverJob?.isActive == true) ||
                     current.state == ConversationState.PREPARING ||
                     current.state == ConversationState.CONNECTING ||
                     current.state == ConversationState.LISTENING ||
@@ -1329,6 +1379,9 @@ class ConversationCoordinator(
                         isSyntheticOrTestMeasurement = isSyntheticOrTestMeasurementMode
                     )
                     syncTimingSnapshotsLocked()
+                    cancelPendingGoAwayDeadlineLocked()
+                    scheduledGoAwayForLiveGenWireId = null
+                    goAwayHandoverAttemptedForCurrentGenOrTurn = false
                     liveAdapter.startNetworkMonitoring()
 
                     alreadySetupAccepted =
@@ -1848,11 +1901,17 @@ class ConversationCoordinator(
 
         val detail = if (allowRestoreAfterTimeoutRecovery) {
             val codeLabel = recoveryReasonCode ?: completedTurn?.watchdogFailureCode ?: "TURN_RECOVERY"
-            if (codeLabel == "MISSING_SERVER_TURN_COMPLETE") {
-                val playedFrames = completedTurn?.latchedPlaybackFramesPlayed ?: 0L
-                "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Previous reply finished playing ($playedFrames frames) without server turnComplete ($codeLabel); recovered session cleanly and resumed listening."
-            } else {
-                "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation automatically restored after clean recovery from $codeLabel."
+            when (codeLabel) {
+                "MISSING_SERVER_TURN_COMPLETE" -> {
+                    val playedFrames = completedTurn?.latchedPlaybackFramesPlayed ?: 0L
+                    "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Previous reply finished playing ($playedFrames frames) without server turnComplete ($codeLabel); recovered session cleanly and resumed listening."
+                }
+                "GO_AWAY_SPOKEN_TURN_UNPRESERVED" ->
+                    "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Connection rotated after ServerGoAway interruption; spoken question/reply could not be preserved or replayed. Please repeat your question."
+                "GO_AWAY_ORDERLY_HANDOVER" ->
+                    "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Orderly ServerGoAway handover verified; listening resumed automatically."
+                else ->
+                    "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation automatically restored after clean recovery from $codeLabel."
             }
         } else {
             "LISTENING (${captureGen.wireId} • Turn #${_uiState.value.completedTurnsInSession + 1}): Active conversation restored (post-playback echo guard -> silent waiting)."
@@ -4124,12 +4183,112 @@ class ConversationCoordinator(
 
             is LiveSocketCallbackEvent.ServerGoAwayReceived -> {
                 synchronized(this) {
-                    needsSessionRecreationBeforeNextTurn = true
-                    logTurnLifecycleEventLocked(
-                        "SERVER_GO_AWAY_RECEIVED: timeLeftMs=${event.timeLeftMs} gen=${event.generationId.wireId}"
-                    )
                     syncLiveState()
                     syncTimingSnapshotsLocked()
+                    val current = _uiState.value
+                    if (isDeliberatelyStopped ||
+                        isDeliberatelyPaused ||
+                        current.state == ConversationState.STOPPED ||
+                        current.state == ConversationState.PAUSED
+                    ) {
+                        return
+                    }
+                    val genWireId = event.generationId.wireId
+                    val alreadyScheduledForThisGen = scheduledGoAwayForLiveGenWireId == genWireId
+                    val handoverOrRecoveryActive =
+                        activeGoAwayHandoverJob?.isActive == true ||
+                            activeNextTurnRecoveryJob?.isActive == true ||
+                            activeTimeoutRecoveryJob?.isActive == true
+                    if (alreadyScheduledForThisGen || handoverOrRecoveryActive) {
+                        logTurnLifecycleEventLocked(
+                            "DUPLICATE_GO_AWAY_IGNORED: timeLeftMs=${event.timeLeftMs} gen=$genWireId " +
+                                "(scheduledGen=$scheduledGoAwayForLiveGenWireId, handoverActive=$handoverOrRecoveryActive)"
+                        )
+                        return
+                    }
+
+                    scheduledGoAwayForLiveGenWireId = genWireId
+                    needsSessionRecreationBeforeNextTurn = true
+                    logTurnLifecycleEventLocked(
+                        "SERVER_GO_AWAY_RECEIVED: timeLeftMs=${event.timeLeftMs} gen=$genWireId"
+                    )
+
+                    val turn = activeTurn
+                    val isSilentWaitingInListening =
+                        current.state == ConversationState.LISTENING &&
+                            turn != null &&
+                            !turn.closed &&
+                            !turn.activityStartSent &&
+                            !turn.endOfTurnRequested &&
+                            !turn.endOfTurnSubmitted &&
+                            turn.confirmedSentFramesCount <= 0L &&
+                            !speechGate.hasObservedWaitingSpeechCandidate()
+
+                    if (isSilentWaitingInListening &&
+                        current.isActiveConversationEnabled &&
+                        !goAwayHandoverAttemptedForCurrentGenOrTurn
+                    ) {
+                        val handoverJob = scheduleOrderlyGoAwayHandoverLocked(
+                            sessionId = turn!!.sessionId,
+                            goAwayGenWireId = genWireId,
+                            timeLeftMs = event.timeLeftMs,
+                            spokenQuestionLost = false,
+                            failedTurnForDiagnostics = turn,
+                            triggerDetail = "Orderly ServerGoAway handover while waiting silently in LISTENING (timeLeftMs=${event.timeLeftMs ?: "UNSPECIFIED"})"
+                        )
+                        handoverJob?.start()
+                        return
+                    }
+
+                    val timeLeftMs = event.timeLeftMs
+                    if (current.isActiveConversationEnabled && timeLeftMs != null && timeLeftMs > 0L) {
+                        val expectedSessionId = current.sessionId
+                        val leadMarginMs = kotlin.math.min(1_500L, kotlin.math.max(100L, timeLeftMs / 4L))
+                        val waitMs = kotlin.math.max(0L, timeLeftMs - leadMarginMs)
+                        cancelPendingGoAwayDeadlineLocked()
+                        pendingGoAwayDeadlineJob = turnScope.launch {
+                            goAwayDeadlineDelayRunner(waitMs)
+                            var jobToStart: Job? = null
+                            synchronized(this@ConversationCoordinator) {
+                                val nowUi = _uiState.value
+                                val nowTurn = activeTurn
+                                val currentLiveGen = liveAdapter.state.value.activeGeneration?.wireId
+                                val stillSameGoAway =
+                                    scheduledGoAwayForLiveGenWireId == genWireId &&
+                                        currentLiveGen == genWireId &&
+                                        nowUi.sessionId == expectedSessionId &&
+                                        nowUi.isActiveConversationEnabled &&
+                                        !isDeliberatelyPaused &&
+                                        !isDeliberatelyStopped &&
+                                        nowUi.state != ConversationState.PAUSED &&
+                                        nowUi.state != ConversationState.STOPPED &&
+                                        activeGoAwayHandoverJob?.isActive != true &&
+                                        activeNextTurnRecoveryJob?.isActive != true &&
+                                        activeTimeoutRecoveryJob?.isActive != true &&
+                                        !goAwayHandoverAttemptedForCurrentGenOrTurn &&
+                                        nowTurn != null &&
+                                        !nowTurn.closed
+                                if (stillSameGoAway) {
+                                    val spokenQuestionLost =
+                                        nowUi.state != ConversationState.LISTENING ||
+                                            nowTurn!!.activityStartSent ||
+                                            nowTurn.endOfTurnRequested ||
+                                            nowTurn.endOfTurnSubmitted ||
+                                            nowTurn.confirmedSentFramesCount > 0L ||
+                                            speechGate.hasObservedWaitingSpeechCandidate()
+                                    jobToStart = scheduleOrderlyGoAwayHandoverLocked(
+                                        sessionId = expectedSessionId,
+                                        goAwayGenWireId = genWireId,
+                                        timeLeftMs = timeLeftMs,
+                                        spokenQuestionLost = spokenQuestionLost,
+                                        failedTurnForDiagnostics = nowTurn,
+                                        triggerDetail = "ServerGoAway handover deadline reached (${waitMs}ms into ${timeLeftMs}ms window)"
+                                    )
+                                }
+                            }
+                            jobToStart?.start()
+                        }
+                    }
                 }
             }
 
@@ -4240,6 +4399,287 @@ class ConversationCoordinator(
         }
     }
 
+    private fun scheduleOrderlyGoAwayHandoverLocked(
+        sessionId: SessionId,
+        goAwayGenWireId: String,
+        timeLeftMs: Long?,
+        spokenQuestionLost: Boolean,
+        failedTurnForDiagnostics: TurnRuntimeState?,
+        triggerDetail: String
+    ): Job? {
+        if (activeGoAwayHandoverJob?.isActive == true ||
+            activeNextTurnRecoveryJob?.isActive == true ||
+            activeTimeoutRecoveryJob?.isActive == true
+        ) {
+            logTurnLifecycleEventLocked("GO_AWAY_HANDOVER_DEDUPLICATED: Recovery already active; ignoring.")
+            return null
+        }
+        val currentBefore = _uiState.value
+        if (isDeliberatelyPaused ||
+            isDeliberatelyStopped ||
+            !currentBefore.isActiveConversationEnabled ||
+            currentBefore.state == ConversationState.PAUSED ||
+            currentBefore.state == ConversationState.STOPPED
+        ) {
+            return null
+        }
+
+        goAwayHandoverAttemptedForCurrentGenOrTurn = true
+        needsSessionRecreationBeforeNextTurn = false
+
+        val turnBeingReplaced = activeTurn ?: failedTurnForDiagnostics
+        val turnDeferredToResolve = turnBeingReplaced?.completionDeferred
+        val handoverDeferred = CompletableDeferred<VerifiedOutcome>()
+        activeGoAwayHandoverDeferred = handoverDeferred
+        activeGoAwayHandoverTurnDeferred = turnDeferredToResolve
+
+        if (turnBeingReplaced != null && !turnBeingReplaced.closed) {
+            latchPlaybackSnapshotIntoTurnLocked(turnBeingReplaced, playbackAdapter.state.value)
+        }
+        val failedTurnId = turnBeingReplaced?.turnId ?: currentBefore.currentTurnId
+        val failedTurnGenWire = turnBeingReplaced?.turnGen?.wireId ?: "NONE"
+        val savedTrace = turnBeingReplaced?.structuredTraceEntries?.toList()
+            ?: currentBefore.structuredTurnTrace
+
+        cancelActiveTurnStreamsLocked("Orderly GoAway handover ($goAwayGenWireId)")
+
+        val preparingSeq = appendTurnStateLocked(ConversationState.PREPARING)
+        val preparingReadiness = appendReadinessOrderLocked("PREPARING")
+        val preparingPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.PREPARING)
+        val timeLeftLabel = timeLeftMs?.let { "${it}ms" } ?: "UNSPECIFIED"
+        val preparingDetail = if (spokenQuestionLost) {
+            "PREPARING: Rotating Gemini Live session for ServerGoAway ($goAwayGenWireId, timeLeft=$timeLeftLabel). Previous speech/reply could not be preserved and will not be replayed."
+        } else {
+            "PREPARING: Orderly Gemini Live handover for ServerGoAway ($goAwayGenWireId, timeLeft=$timeLeftLabel)..."
+        }
+        val preparingOutcome = VerifiedOutcome.StateTransitionVerified(
+            actionId = idGenerator.nextActionId("goaway_handover_preparing"),
+            sessionId = sessionId,
+            turnId = failedTurnId,
+            previousState = currentBefore.state,
+            resultingState = ConversationState.PREPARING,
+            detail = preparingDetail
+        )
+        _uiState.update { state ->
+            state.copy(
+                currentTurnId = failedTurnId,
+                activeConversationPhase = ActiveConversationPhase.PREPARING,
+                activeConversationPhaseSequence = preparingPhaseSeq,
+                activeTurnGenerationId = null,
+                voiceTurnStateSequence = preparingSeq,
+                voiceTurnReadinessOrder = preparingReadiness,
+                structuredTurnTrace = savedTrace,
+                lastCompletedTurnTrace = if (savedTrace.isNotEmpty()) savedTrace else state.lastCompletedTurnTrace,
+                lastVoiceTurnSummary = preparingDetail
+            )
+        }
+        applyVerifiedOutcome(
+            sessionId = sessionId,
+            turnId = failedTurnId,
+            actionId = preparingOutcome.actionId,
+            newState = ConversationState.PREPARING,
+            roleLabel = "ACTIVE_CONVERSATION",
+            outcome = preparingOutcome
+        )
+
+        var createdJob: Job? = null
+        val job = turnScope.launch(start = CoroutineStart.LAZY) {
+            val rotatedState = try {
+                withContext(backgroundDispatcher) {
+                    withTimeoutOrNull(connectionTimeoutMs) {
+                        liveAdapter.rotateSessionForGoAway(
+                            sessionId = sessionId,
+                            reason = triggerDetail
+                        )
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                liveAdapter.state.value
+            }
+
+            synchronized(this@ConversationCoordinator) {
+                if (activeGoAwayHandoverJob === createdJob) {
+                    activeGoAwayHandoverJob = null
+                }
+                if (activeGoAwayHandoverDeferred === handoverDeferred) {
+                    activeGoAwayHandoverDeferred = null
+                }
+                if (activeGoAwayHandoverTurnDeferred === turnDeferredToResolve) {
+                    activeGoAwayHandoverTurnDeferred = null
+                }
+
+                val currentAfter = _uiState.value
+                val preemptedByOperator =
+                    isDeliberatelyStopped ||
+                        isDeliberatelyPaused ||
+                        currentAfter.state == ConversationState.STOPPED ||
+                        currentAfter.state == ConversationState.PAUSED ||
+                        currentAfter.sessionId != sessionId
+
+                if (preemptedByOperator || !currentAfter.isActiveConversationEnabled) {
+                    val preemptOutcome = currentAfter.lastOutcome ?: VerifiedOutcome.StateTransitionVerified(
+                        actionId = idGenerator.nextActionId("goaway_preempted"),
+                        sessionId = sessionId,
+                        turnId = failedTurnId,
+                        previousState = ConversationState.PREPARING,
+                        resultingState = currentAfter.state,
+                        detail = "ServerGoAway handover superseded by Stop/Pause or inactive conversation."
+                    )
+                    handoverDeferred.complete(preemptOutcome)
+                    turnDeferredToResolve?.complete(preemptOutcome)
+                    return@launch
+                }
+
+                val isReadyNow = rotatedState != null &&
+                    liveAdapter.isSessionReadyForAudio() &&
+                    (rotatedState.phase == LiveConnectionPhase.SETUP_ACCEPTED ||
+                        rotatedState.phase == LiveConnectionPhase.ACTIVE)
+
+                if (isReadyNow) {
+                    scheduledGoAwayForLiveGenWireId = null
+                    needsSessionRecreationBeforeNextTurn = false
+                    goAwayHandoverAttemptedForCurrentGenOrTurn = false
+
+                    val recoveryReasonCode = if (spokenQuestionLost) {
+                        if (turnBeingReplaced != null) {
+                            lastCompletedTurnRuntime = turnBeingReplaced
+                            recordTurnOutcomeLocked(
+                                turn = turnBeingReplaced,
+                                category = Phase07TurnOutcomeCategory.INTERRUPTED,
+                                outcomeCode = "GO_AWAY_SPOKEN_TURN_UNPRESERVED"
+                            )
+                        }
+                        val noticeMsg =
+                            "ServerGoAway handover completed ($goAwayGenWireId -> ${rotatedState!!.activeGeneration?.wireId ?: "live"}), but spoken question/reply on ${failedTurnId.value} could not be preserved or replayed. Please repeat your question."
+                        recordDiagnosticErrorLocked(
+                            stage = "GO_AWAY_HANDOVER_INTERRUPTED",
+                            errorCode = "GO_AWAY_SPOKEN_TURN_UNPRESERVED",
+                            rawSummary = noticeMsg,
+                            sessionId = sessionId,
+                            turnId = failedTurnId,
+                            generationWireId = failedTurnGenWire
+                        )
+                        archiveActiveDiagnosticErrorLocked()
+                        syncTimingSnapshotsLocked()
+                        "GO_AWAY_SPOKEN_TURN_UNPRESERVED"
+                    } else {
+                        "GO_AWAY_ORDERLY_HANDOVER"
+                    }
+
+                    val restoreOutcome = autoRestoreCaptureForNextTurnLocked(
+                        previousTurnId = failedTurnId,
+                        completedTurn = turnBeingReplaced,
+                        allowRestoreAfterTimeoutRecovery = true,
+                        recoveryReasonCode = recoveryReasonCode
+                    )
+                    handoverDeferred.complete(restoreOutcome)
+                    turnDeferredToResolve?.complete(restoreOutcome)
+                    return@launch
+                }
+
+                val finalLive = rotatedState ?: liveAdapter.state.value
+                val failCode = when {
+                    !liveAdapter.networkMonitor.isInternetValidated() ||
+                        finalLive.phase == LiveConnectionPhase.NETWORK_UNAVAILABLE ->
+                        "NETWORK_UNAVAILABLE"
+                    finalLive.failureClassification != LiveFailureClassification.NONE ->
+                        finalLive.failureClassification.wireCode
+                    else ->
+                        "GO_AWAY_HANDOVER_FAILED"
+                }
+                val livePhaseNow = liveAdapter.state.value.phase
+                if (livePhaseNow == LiveConnectionPhase.ACTIVE ||
+                    livePhaseNow == LiveConnectionPhase.SETUP_ACCEPTED ||
+                    livePhaseNow == LiveConnectionPhase.CONNECTING ||
+                    livePhaseNow == LiveConnectionPhase.RECONNECTING
+                ) {
+                    liveAdapter.disconnectAndRelease(
+                        reason = "ServerGoAway handover failed ($failCode) for ${failedTurnId.value}"
+                    )
+                }
+
+                val liveDetailRedacted = DiagnosticRedactor.redact(finalLive.statusDetail)
+                val detailMsg = buildString {
+                    append("$failCode: ServerGoAway handover failed after $goAwayGenWireId")
+                    if (finalLive.sessionResumptionFallbackCount > 0) {
+                        append(" (resumption handle rejected and fallback reconnection also failed)")
+                    }
+                    append(": $liveDetailRedacted")
+                    if (spokenQuestionLost) {
+                        append(". Previous spoken question was not preserved or replayed.")
+                    }
+                    append(" Press Start to try again.")
+                }
+
+                if (turnBeingReplaced != null) {
+                    lastCompletedTurnRuntime = turnBeingReplaced
+                    recordTurnOutcomeLocked(
+                        turn = turnBeingReplaced,
+                        category = Phase07TurnOutcomeCategory.FAILED,
+                        outcomeCode = failCode
+                    )
+                }
+                recordDiagnosticErrorLocked(
+                    stage = "GO_AWAY_HANDOVER",
+                    errorCode = failCode,
+                    rawSummary = detailMsg,
+                    sessionId = sessionId,
+                    turnId = failedTurnId,
+                    generationWireId = failedTurnGenWire
+                )
+                syncTimingSnapshotsLocked()
+
+                val actId = idGenerator.nextActionId(actionVerbForFailureCode(failCode))
+                val errorSeq = appendTurnStateLocked(ConversationState.ERROR)
+                val errorReadiness = appendReadinessOrderLocked("ERROR")
+                val errorPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.ERROR)
+                val errorOutcome = VerifiedOutcome.PrerequisiteFailureOutcome(
+                    actionId = actId,
+                    sessionId = sessionId,
+                    turnId = failedTurnId,
+                    resultingState = ConversationState.ERROR,
+                    failureCode = failCode,
+                    detail = detailMsg
+                )
+                val missingStep = turnBeingReplaced?.earliestMissingStep()
+                    ?: _uiState.value.lastCompletedTurnEarliestMissingStep
+                previousTurnEarliestMissingStep = missingStep
+                _uiState.update { state ->
+                    state.copy(
+                        currentTurnId = failedTurnId,
+                        activeConversationPhase = ActiveConversationPhase.ERROR,
+                        activeConversationPhaseSequence = errorPhaseSeq,
+                        activeTurnGenerationId = null,
+                        voiceTurnStateSequence = errorSeq,
+                        voiceTurnReadinessOrder = errorReadiness,
+                        structuredTurnTrace = savedTrace,
+                        lastCompletedTurnTrace = if (savedTrace.isNotEmpty()) savedTrace else state.lastCompletedTurnTrace,
+                        lastCompletedTurnEarliestMissingStep = missingStep,
+                        activeTurnEarliestMissingStep = missingStep,
+                        activeVoiceTurnErrorCode = failCode,
+                        activeVoiceTurnErrorDetail = detailMsg,
+                        lastVoiceTurnSummary = "ERROR [$failCode]: $detailMsg"
+                    )
+                }
+                applyVerifiedOutcome(
+                    sessionId = sessionId,
+                    turnId = failedTurnId,
+                    actionId = actId,
+                    newState = ConversationState.ERROR,
+                    roleLabel = "GO_AWAY_HANDOVER",
+                    outcome = errorOutcome
+                )
+                handoverDeferred.complete(errorOutcome)
+                turnDeferredToResolve?.complete(errorOutcome)
+            }
+        }
+        createdJob = job
+        activeGoAwayHandoverJob = job
+        return job
+    }
+
     private fun prepareNextTurnSessionRecoveryLocked(
         sessionId: SessionId,
         previousTurnId: TurnId,
@@ -4287,18 +4727,25 @@ class ConversationCoordinator(
 
         var createdJob: Job? = null
         val job = turnScope.launch(start = CoroutineStart.LAZY) {
-            val needsExplicitRecreate = synchronized(this@ConversationCoordinator) {
+            val (needsExplicitRecreate, isGoAwayRotation) = synchronized(this@ConversationCoordinator) {
+                cancelPendingGoAwayDeadlineLocked()
                 val flag = needsSessionRecreationBeforeNextTurn
+                val goAwayPending = scheduledGoAwayForLiveGenWireId != null
                 needsSessionRecreationBeforeNextTurn = false
-                flag
+                flag to goAwayPending
             }
             val recoveredState = try {
                 withContext(backgroundDispatcher) {
                     withTimeoutOrNull(connectionTimeoutMs) {
-                        if (needsExplicitRecreate) {
+                        if (isGoAwayRotation) {
+                            liveAdapter.rotateSessionForGoAway(
+                                sessionId = sessionId,
+                                reason = "Proactive session rotation after completed turn (ServerGoAway)"
+                            )
+                        } else if (needsExplicitRecreate) {
                             liveAdapter.recreateSessionAfterInterruption(
                                 sessionId = sessionId,
-                                reason = "Proactive session rotation before next turn (ServerGoAway or interruption)"
+                                reason = "Proactive session rotation before next turn (interruption)"
                             )
                         } else {
                             liveAdapter.ensureConnectedSession(sessionId)
@@ -4336,10 +4783,13 @@ class ConversationCoordinator(
                 }
 
                 if (recoveredState != null && liveAdapter.isSessionReadyForAudio()) {
+                    scheduledGoAwayForLiveGenWireId = null
+                    goAwayHandoverAttemptedForCurrentGenOrTurn = false
                     autoRestoreCaptureForNextTurnLocked(
                         previousTurnId = previousTurnId,
                         completedTurn = completedTurn,
-                        allowRestoreAfterTimeoutRecovery = completedTurn.tPlaybackDrainedMs == null
+                        allowRestoreAfterTimeoutRecovery = completedTurn.tPlaybackDrainedMs == null,
+                        recoveryReasonCode = if (isGoAwayRotation) "GO_AWAY_ORDERLY_HANDOVER" else null
                     )
                 } else {
                     val rawDiagnostic =
@@ -4362,6 +4812,7 @@ class ConversationCoordinator(
                         failureCode = failureCode,
                         detail = failureDetail
                     )
+                    lastCompletedTurnRuntime = completedTurn
                     recordDiagnosticErrorLocked(
                         stage = "NEXT_TURN_RECOVERY",
                         errorCode = failureCode,
@@ -4370,6 +4821,7 @@ class ConversationCoordinator(
                         turnId = previousTurnId,
                         generationWireId = completedTurn.turnGen.wireId
                     )
+                    syncTimingSnapshotsLocked()
                     _uiState.update { state ->
                         state.copy(
                             state = ConversationState.ERROR,
@@ -4402,12 +4854,15 @@ class ConversationCoordinator(
     private fun cancelActiveTurnStreamsLocked(reason: String) {
         cancelInactivityTimerLocked()
         cancelPostPlaybackGuardJobLocked()
+        cancelPendingGoAwayDeadlineLocked()
         speechGate.cancelAndResetToIdle(resetSessionCounters = false)
         syncSpeechGateTelemetryLocked()
         activeTimeoutRecoveryJob?.cancel()
         activeTimeoutRecoveryJob = null
         activeNextTurnRecoveryJob?.cancel()
         activeNextTurnRecoveryJob = null
+        activeGoAwayHandoverJob?.cancel()
+        activeGoAwayHandoverJob = null
         val prevTurn = activeTurn
         activeTurn = null
         prevTurn?.dispose(cancelAllJobs = true)
@@ -4602,7 +5057,11 @@ class ConversationCoordinator(
             consecutiveFirstResponseTimeouts = 0
             val deferredToCancel = activeTurn?.completionDeferred
             val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
+            val goAwayDeferredToCancel = activeGoAwayHandoverDeferred
+            val goAwayTurnDeferredToCancel = activeGoAwayHandoverTurnDeferred
             activeTimeoutRecoveryDeferred = null
+            activeGoAwayHandoverDeferred = null
+            activeGoAwayHandoverTurnDeferred = null
             cancelActiveTurnStreamsLocked(reason = reason)
             liveAdapter.disconnectAndRelease(reason = reason)
             liveAdapter.stopNetworkMonitoring()
@@ -4629,12 +5088,17 @@ class ConversationCoordinator(
             )
             deferredToCancel?.complete(releaseOutcome)
             recoveryDeferredToCancel?.complete(releaseOutcome)
+            goAwayDeferredToCancel?.complete(releaseOutcome)
+            goAwayTurnDeferredToCancel?.complete(releaseOutcome)
         } else {
             cancelPostPlaybackGuardJobLocked()
+            cancelPendingGoAwayDeadlineLocked()
             speechGate.cancelAndResetToIdle(resetSessionCounters = false)
             syncSpeechGateTelemetryLocked()
             activeNextTurnRecoveryJob?.cancel()
             activeNextTurnRecoveryJob = null
+            activeGoAwayHandoverJob?.cancel()
+            activeGoAwayHandoverJob = null
             audioCapture.stopAndRelease(reason = reason, wipeEphemeral = true)
         }
         syncAudioState()
@@ -4710,9 +5174,16 @@ class ConversationCoordinator(
                 isDeliberatelyStopped = true
                 isDeliberatelyPaused = false
                 consecutiveFirstResponseTimeouts = 0
+                scheduledGoAwayForLiveGenWireId = null
+                needsSessionRecreationBeforeNextTurn = false
+                goAwayHandoverAttemptedForCurrentGenOrTurn = false
                 val deferredToCancel = activeTurn?.completionDeferred
                 val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
+                val goAwayDeferredToCancel = activeGoAwayHandoverDeferred
+                val goAwayTurnDeferredToCancel = activeGoAwayHandoverTurnDeferred
                 activeTimeoutRecoveryDeferred = null
+                activeGoAwayHandoverDeferred = null
+                activeGoAwayHandoverTurnDeferred = null
                 cancelActiveTurnStreamsLocked("Immediate operator STOP command")
                 liveAdapter.clearSessionResumptionState(current.sessionId)
                 liveAdapter.disconnectAndRelease(reason = "Immediate operator STOP command")
@@ -4753,6 +5224,8 @@ class ConversationCoordinator(
                 )
                 deferredToCancel?.complete(outcome)
                 recoveryDeferredToCancel?.complete(outcome)
+                goAwayDeferredToCancel?.complete(outcome)
+                goAwayTurnDeferredToCancel?.complete(outcome)
                 outcome
             }
 
@@ -4778,9 +5251,16 @@ class ConversationCoordinator(
                     preempted
                 } else {
                     isDeliberatelyPaused = true
+                    scheduledGoAwayForLiveGenWireId = null
+                    needsSessionRecreationBeforeNextTurn = false
+                    goAwayHandoverAttemptedForCurrentGenOrTurn = false
                     val deferredToCancel = activeTurn?.completionDeferred
                     val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
+                    val goAwayDeferredToCancel = activeGoAwayHandoverDeferred
+                    val goAwayTurnDeferredToCancel = activeGoAwayHandoverTurnDeferred
                     activeTimeoutRecoveryDeferred = null
+                    activeGoAwayHandoverDeferred = null
+                    activeGoAwayHandoverTurnDeferred = null
                     cancelActiveTurnStreamsLocked("Operator PAUSE command")
                     liveAdapter.disconnectAndRelease(reason = "Operator PAUSE command")
                     val updatedPhaseSeq = appendActiveConversationPhaseLocked(ActiveConversationPhase.PAUSED)
@@ -4818,6 +5298,8 @@ class ConversationCoordinator(
                     )
                     deferredToCancel?.complete(outcome)
                     recoveryDeferredToCancel?.complete(outcome)
+                    goAwayDeferredToCancel?.complete(outcome)
+                    goAwayTurnDeferredToCancel?.complete(outcome)
                     outcome
                 }
             }
@@ -5210,9 +5692,15 @@ class ConversationCoordinator(
                 isDeliberatelyStopped = false
                 consecutiveFirstResponseTimeouts = 0
                 previousTurnEarliestMissingStep = null
+                scheduledGoAwayForLiveGenWireId = null
+                goAwayHandoverAttemptedForCurrentGenOrTurn = false
                 val deferredToCancel = activeTurn?.completionDeferred
                 val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
+                val goAwayDeferredToCancel = activeGoAwayHandoverDeferred
+                val goAwayTurnDeferredToCancel = activeGoAwayHandoverTurnDeferred
                 activeTimeoutRecoveryDeferred = null
+                activeGoAwayHandoverDeferred = null
+                activeGoAwayHandoverTurnDeferred = null
                 cancelActiveTurnStreamsLocked("Session reset to IDLE")
                 speechGate.cancelAndResetToIdle(resetSessionCounters = true)
                 syncSpeechGateTelemetryLocked()
@@ -5286,6 +5774,8 @@ class ConversationCoordinator(
                 )
                 deferredToCancel?.complete(outcome)
                 recoveryDeferredToCancel?.complete(outcome)
+                goAwayDeferredToCancel?.complete(outcome)
+                goAwayTurnDeferredToCancel?.complete(outcome)
                 outcome
             }
         }
@@ -5312,6 +5802,9 @@ class ConversationCoordinator(
         val nextTurn = idGenerator.nextTurnId()
 
         if (winningCommand == CoordinatorCommand.STOP || winningCommand == CoordinatorCommand.PAUSE) {
+            scheduledGoAwayForLiveGenWireId = null
+            needsSessionRecreationBeforeNextTurn = false
+            goAwayHandoverAttemptedForCurrentGenOrTurn = false
             if (winningCommand == CoordinatorCommand.STOP) {
                 isDeliberatelyStopped = true
                 isDeliberatelyPaused = false
@@ -5322,7 +5815,11 @@ class ConversationCoordinator(
             }
             val deferredToCancel = activeTurn?.completionDeferred
             val recoveryDeferredToCancel = activeTimeoutRecoveryDeferred
+            val goAwayDeferredToCancel = activeGoAwayHandoverDeferred
+            val goAwayTurnDeferredToCancel = activeGoAwayHandoverTurnDeferred
             activeTimeoutRecoveryDeferred = null
+            activeGoAwayHandoverDeferred = null
+            activeGoAwayHandoverTurnDeferred = null
             cancelActiveTurnStreamsLocked("Preempted by ${winningCommand.name} precedence")
             liveAdapter.disconnectAndRelease(
                 reason = "Preempted by ${winningCommand.name} precedence"
@@ -5337,6 +5834,8 @@ class ConversationCoordinator(
             )
             deferredToCancel?.complete(preemptOutcome)
             recoveryDeferredToCancel?.complete(preemptOutcome)
+            goAwayDeferredToCancel?.complete(preemptOutcome)
+            goAwayTurnDeferredToCancel?.complete(preemptOutcome)
         }
 
         val targetState = when (winningCommand) {
@@ -5472,6 +5971,7 @@ class ConversationCoordinator(
         return (turn != null && !turn.closed) ||
             activeTimeoutRecoveryJob?.isActive == true ||
             activeNextTurnRecoveryJob?.isActive == true ||
+            activeGoAwayHandoverJob?.isActive == true ||
             currentState == ConversationState.PREPARING ||
             currentState == ConversationState.CONNECTING ||
             currentState == ConversationState.LISTENING ||
@@ -5615,6 +6115,12 @@ class ConversationCoordinator(
             rejectedResumptionHandleCount = liveSnap.sessionResumptionFallbackCount,
             serverGoAwayCount = liveSnap.serverGoAwayCount,
             lastServerGoAwayTimeLeftMs = liveSnap.lastServerGoAwayTimeLeftMs ?: -1L,
+            goAwayPendingHandover = liveSnap.goAwayNoticePendingHandover,
+            lastGoAwayGenerationId = liveSnap.lastGoAwayGenerationWireId,
+            actualSocketCloseCount = liveSnap.actualSocketCloseCount,
+            lastActualSocketCloseGenerationId = liveSnap.lastActualSocketCloseGenerationWireId,
+            lastActualSocketCloseClassification = liveSnap.lastActualSocketCloseClassification,
+            lastActualSocketCloseReason = liveSnap.lastActualSocketCloseReason,
             contextWindowCompressionActive = liveSnap.contextWindowCompressionEnabled,
             performanceSummary = ui.performanceSummary
         )

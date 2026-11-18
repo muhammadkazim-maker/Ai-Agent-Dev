@@ -622,6 +622,12 @@ data class RedactedDiagnosticSnapshot(
     val rejectedResumptionHandleCount: Int = 0,
     val serverGoAwayCount: Int = 0,
     val lastServerGoAwayTimeLeftMs: Long = -1L,
+    val goAwayPendingHandover: Boolean = false,
+    val lastGoAwayGenerationId: String = "NONE",
+    val actualSocketCloseCount: Int = 0,
+    val lastActualSocketCloseGenerationId: String = "NONE",
+    val lastActualSocketCloseClassification: String = "NONE",
+    val lastActualSocketCloseReason: String = "NONE",
     val contextWindowCompressionActive: Boolean = true,
     val performanceSummary: Phase07PerformanceSummary = Phase07PerformanceSummary(
         startupDurationDistribution = Phase07MetricDistribution.fromSamples(
@@ -765,7 +771,8 @@ data class RedactedDiagnosticSnapshot(
         appendLine("contextRestorationStatus: $contextRestorationStatus")
         appendLine("hasValidSessionResumptionHandle: $hasValidResumptionHandle (raw handle value private & never exported)")
         appendLine("sessionResumptionCounters: updatesReceived=$resumptionUpdateCount, resumedConnections=$resumedConnectionCount, rejectedHandleFallbacks=$rejectedResumptionHandleCount")
-        appendLine("serverGoAwaySignals: count=$serverGoAwayCount, lastTimeLeftMs=${if (lastServerGoAwayTimeLeftMs >= 0L) "$lastServerGoAwayTimeLeftMs ms" else "NONE"}")
+        appendLine("serverGoAwaySignals: count=$serverGoAwayCount, pendingHandover=$goAwayPendingHandover, lastGen=$lastGoAwayGenerationId, lastTimeLeftMs=${if (lastServerGoAwayTimeLeftMs >= 0L) "$lastServerGoAwayTimeLeftMs ms" else "NONE"}")
+        appendLine("actualSocketClosures: count=$actualSocketCloseCount, lastGen=$lastActualSocketCloseGenerationId, lastClassification=$lastActualSocketCloseClassification, lastReason=${DiagnosticRedactor.redactForDiagnostics(lastActualSocketCloseReason)}")
         appendLine()
         appendLine("[11. PHASE 07C HONEST PERFORMANCE SUMMARY (BOUNDED max=${performanceSummary.maxBoundedTurnWindow} TURNS)]")
         appendLine("turnOutcomes: attempted=${performanceSummary.totalAttemptedTurns}, completed=${performanceSummary.completedTurns}, failed=${performanceSummary.failedTurns}, interrupted=${performanceSummary.interruptedTurns}, timedOut=${performanceSummary.timedOutTurns}, noSpeechRejected=${performanceSummary.noSpeechRejectedTurns}, windowRetained=${performanceSummary.recordedWindowTurnCount}")
