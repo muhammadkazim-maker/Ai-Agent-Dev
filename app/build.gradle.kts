@@ -63,8 +63,8 @@ android {
     applicationId = "com.kazim.omnivoice.rebuild"
     minSdk = 24
     targetSdk = 36
-    versionCode = 7
-    versionName = "0.7.0-phase07"
+    versionCode = 8
+    versionName = "0.8.0-phase08"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -73,15 +73,15 @@ android {
     val gitRev = resolveGitRevisionOrNull(rootDir)
     val sourceRevision = gitRev ?: "SOURCE_REVISION_UNAVAILABLE"
     val derivedBuildId = if (gitRev != null) {
-      "ov-rebuild-p07-$versionName-git-$gitRev-$sourceFingerprint"
+      "ov-rebuild-p08-$versionName-git-$gitRev-$sourceFingerprint"
     } else {
-      "ov-rebuild-p07-$versionName-$sourceFingerprint"
+      "ov-rebuild-p08-$versionName-$sourceFingerprint"
     }
 
     buildConfigField("String", "SOURCE_BUILD_ID", "\"$derivedBuildId\"")
     buildConfigField("String", "SOURCE_REVISION", "\"$sourceRevision\"")
     buildConfigField("String", "SOURCE_FINGERPRINT", "\"$sourceFingerprint\"")
-    buildConfigField("String", "PHASE_NAME", "\"Phase 07 - Stabilization, Timing & Bounded Recovery\"")
+    buildConfigField("String", "PHASE_NAME", "\"Phase 08 - Bounded Public Information Retrieval\"")
     buildConfigField("String", "MODEL_CONFIG_STATUS", "\"LIVE_ADAPTER_CONFIGURED (gemini-3.1-flash-live-preview via Firebase AI Logic v1beta)\"")
     buildConfigField("String", "LIVE_MODEL_ID", "\"gemini-3.1-flash-live-preview\"")
     buildConfigField("String", "LIVE_API_VERSION", "\"v1beta (Firebase AI Logic Managed WebSocket)\"")
@@ -209,6 +209,7 @@ dependencies {
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+  implementation(libs.kotlinx.serialization.json)
   implementation(libs.onnxruntime.android)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)

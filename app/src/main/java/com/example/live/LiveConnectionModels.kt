@@ -2,6 +2,7 @@ package com.example.live
 
 import com.example.BuildConfig
 import com.example.contract.SessionId
+import com.example.retrieval.PublicRetrievalConstants
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -26,6 +27,9 @@ object LiveConfigConstants {
     val ENDPOINT_FAMILY: LiveEndpointFamily = LiveEndpointFamily.FIREBASE_AI_LOGIC_GOOGLE_AI_V1BETA_BIDI
     val AUTH_ROUTE: LiveAuthRoute = LiveAuthRoute.FIREBASE_AI_LOGIC_MANAGED_APP_CHECK
     const val REGISTERED_ACTION_TOOLS_COUNT: Int = 0
+    const val REGISTERED_RETRIEVAL_TOOLS_COUNT: Int = PublicRetrievalConstants.REGISTERED_RETRIEVAL_TOOLS_COUNT
+    const val PUBLIC_RETRIEVAL_TOOL_NAME: String = PublicRetrievalConstants.TOOL_NAME_SEARCH_PUBLIC_INFO
+    const val RETRIEVAL_MODEL_ID: String = PublicRetrievalConstants.RETRIEVAL_MODEL_ID
 
     /**
      * Single authoritative non-leaking baseline Gemini Live session instruction (Phase 06A + 06B safety rule).
@@ -335,6 +339,22 @@ sealed interface LiveSocketCallbackEvent {
         val inputTranscript: String?,
         val outputTranscript: String?
     ) : LiveSocketCallbackEvent
+
+    data class LiveToolCallRequest(
+        val id: String?,
+        val name: String,
+        val queryArg: String
+    )
+
+    data class ServerToolCallReceived(
+        override val generationId: LiveSessionGenerationId,
+        val calls: List<LiveToolCallRequest>
+    ) : LiveSocketCallbackEvent
+
+    data class ServerToolCallCancelled(
+        override val generationId: LiveSessionGenerationId,
+        val functionIds: List<String>
+    ) : LiveSocketCallbackEvent
 }
 
 /**
@@ -358,6 +378,8 @@ data class RedactedLiveDiagnostics(
     val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: Int = LiveConfigConstants.REGISTERED_ACTION_TOOLS_COUNT,
+    val registeredRetrievalToolsCount: Int = LiveConfigConstants.REGISTERED_RETRIEVAL_TOOLS_COUNT,
+    val retrievalModelId: String = LiveConfigConstants.RETRIEVAL_MODEL_ID,
     val contextWindowCompressionEnabled: Boolean = true,
     val sessionResumptionEnabled: Boolean = true,
     val sessionResumptionStatus: String = SessionResumptionStatus.ENABLED_AWAITING_HANDLE.wireCode,
@@ -398,6 +420,8 @@ data class LiveConnectionState(
     val isReceiverCollectorAttached: Boolean = false,
     val audioPlaybackClaimed: Boolean = false,
     val registeredActionToolsCount: BooleanOrIntCount = 0,
+    val registeredRetrievalToolsCount: BooleanOrIntCount = LiveConfigConstants.REGISTERED_RETRIEVAL_TOOLS_COUNT,
+    val retrievalModelId: String = LiveConfigConstants.RETRIEVAL_MODEL_ID,
     val contextWindowCompressionEnabled: Boolean = true,
     val sessionResumptionEnabled: Boolean = true,
     val sessionResumptionStatus: SessionResumptionStatus = SessionResumptionStatus.ENABLED_AWAITING_HANDLE,

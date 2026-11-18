@@ -5,6 +5,7 @@ import com.example.contract.SessionId
 import com.example.contract.TurnId
 import com.example.contract.VerifiedOutcome
 import com.example.live.TurnGenerationId
+import com.example.retrieval.PublicRetrievalAttachment
 import java.util.EnumSet
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
@@ -100,6 +101,12 @@ class TurnRuntimeState(
 
     var firstResponseWatchdogJob: Job? = null
     var drainJob: Job? = null
+    var retrievalJob: Job? = null
+    val activeRetrievalCallIds: MutableSet<String> = mutableSetOf()
+    var retrievalRequestCountInTurn: Int = 0
+    var isRetrievalInFlight: Boolean = false
+    var retrievalAttempted: Boolean = false
+    var retrievalAttachment: PublicRetrievalAttachment? = null
     val micSendJobs: MutableList<Job> = mutableListOf()
     val writeJobs: MutableList<Job> = mutableListOf()
 
@@ -253,6 +260,7 @@ class TurnRuntimeState(
         all.addAll(writeJobs)
         firstResponseWatchdogJob?.let { all.add(it) }
         drainJob?.let { all.add(it) }
+        retrievalJob?.let { all.add(it) }
         return all
     }
 
@@ -263,6 +271,7 @@ class TurnRuntimeState(
         count += writeJobs.count { it.isActive }
         if (firstResponseWatchdogJob?.isActive == true) count += 1
         if (drainJob?.isActive == true) count += 1
+        if (retrievalJob?.isActive == true) count += 1
         return count
     }
 
@@ -278,6 +287,9 @@ class TurnRuntimeState(
             for (job in writeJobs) {
                 job.cancel()
             }
+            retrievalJob?.cancel()
+            retrievalJob = null
+            isRetrievalInFlight = false
             drainJob?.cancel()
             drainJob = null
             parentJob.cancel()

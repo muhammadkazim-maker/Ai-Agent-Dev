@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">OmniVoice Rebuild</string>
-    <string name="shell_subtitle">PHASE 07 // STABILIZATION, RECOVERY &amp; NATIVE VOICE</string>
+    <string name="shell_subtitle">PHASE 08 // BOUNDED PUBLIC SEARCH &amp; NATIVE VOICE</string>
     <string name="state_idle">IDLE</string>
     <string name="state_not_configured">NOT_CONFIGURED</string>
     <string name="state_paused">PAUSED</string>
@@ -15,8 +15,8 @@
     <string name="action_verify_precedence">Test Stop/Pause Precedence</string>
     <string name="action_open_mic_setup">Microphone Setup &amp; Self-Test</string>
     <string name="action_open_live_diagnostics">Gemini Live Handshake &amp; Diagnostics</string>
-    <string name="settings_placeholder_title">Settings (Phase 07 Stabilization, Language &amp; Active Session)</string>
-    <string name="settings_placeholder_desc">Phase 07 enforces one shared calm, friendly, direct policy across all turns with user-selected native-audio voice, explicit language priority (requested &gt; spoken &gt; stored across English, Urdu, Roman Urdu, and mixed speech), bounded progress-aware recovery, and clean session rebuilds without old-session interference.</string>
+    <string name="settings_placeholder_title">Settings (Phase 08 Retrieval, Language &amp; Active Session)</string>
+    <string name="settings_placeholder_desc">Phase 08 adds bounded, secured public web retrieval (gemini-3.8-flash + Google Search grounding) for current news and changing facts, clickable source citations, untrusted-data isolation, and honest unverified fallback while preserving one voice owner and zero unauthorized device actions.</string>
     <string name="transcript_header">CONVERSATION TRANSCRIPT &amp; VERIFIED OUTCOMES</string>
     <string name="transcript_empty_hint">Press Start to verify microphone &amp; internet, connect Gemini Live, and hold an active multi-turn voice conversation.</string>
     <string name="controls_header">COMMAND DECK (ACTIVE CONVERSATION COORDINATOR)</string>

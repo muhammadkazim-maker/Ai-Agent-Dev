@@ -379,15 +379,15 @@ private fun RedactedDiagnosticsPane(
                     )
                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            text = "PHASE 03 HONESTY BOUNDARY",
+                            text = "PHASE 08 HONESTY BOUNDARY",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                         Text(
-                            text = "• Audio Playback Claimed: ${if (diag.audioPlaybackClaimed) "YES" else "NO (Handshake Verification Only)"}\n" +
-                                "• Action Tools Registered: ${diag.registeredActionToolsCount} (Zero tools in Phase 03)\n" +
-                                "• Coding-Model Picker Separation: Runtime model ID is explicitly pinned to ${diag.modelId} (never inferred from IDE model picker).",
+                            text = "• Action Tools Registered: ${diag.registeredActionToolsCount} (Zero device/action tools)\n" +
+                                "• Read-Only Retrieval Tool: ${liveState.registeredRetrievalToolsCount} (${liveState.retrievalModelId} + Tool.googleSearch())\n" +
+                                "• Coding-Model Picker Separation: Runtime Live model ID is explicitly pinned to ${diag.modelId} (never inferred from IDE model picker).",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -474,6 +474,10 @@ private fun RedactedDiagnosticsPane(
                 DiagnosticChip(
                     label = "PERF (n=${perf.recordedWindowTurnCount}/${perf.maxBoundedTurnWindow}): ${perf.roadmapTargetStatus} • estMedian=$estMedianText",
                     tag = "live_diag_perf_summary_label"
+                )
+                DiagnosticChip(
+                    label = "SEARCH: req=${uiState.retrievalRequestsInSession}, ok=${uiState.retrievalGroundedSuccessCount}, cache=${uiState.retrievalCacheHitCount}, fail=${uiState.retrievalFailureCount}, blocked=${uiState.retrievalHostileBlockedCount}",
+                    tag = "live_diag_retrieval_label"
                 )
             }
 

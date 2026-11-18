@@ -44,7 +44,17 @@ import com.example.live.LiveConnectionState
 import com.example.live.LiveFailureClassification
 import com.example.live.LiveSocketCallbackEvent
 import com.example.live.TurnGenerationId
+import com.example.retrieval.PublicInformationRetrievalAdapter
+import com.example.retrieval.PublicRetrievalAttachment
+import com.example.retrieval.PublicRetrievalConstants
+import com.example.retrieval.RetrievalDecisionCategory
+import com.example.retrieval.RetrievalTriggerClassifier
+import com.example.retrieval.RetrievalVerificationStatus
+import com.google.firebase.ai.type.FunctionResponsePart
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlin.math.max
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -188,7 +198,17 @@ data class ConversationUiState(
     val serverOutputStallCount: Int = 0,
     val missingTurnCompleteCount: Int = 0,
     val hardwarePlaybackStallCount: Int = 0,
-    val performanceSummary: Phase07PerformanceSummary = Phase07PerformanceSummary()
+    val performanceSummary: Phase07PerformanceSummary = Phase07PerformanceSummary(),
+    val currentTurnRetrievalAttachment: PublicRetrievalAttachment? = null,
+    val isPublicRetrievalInFlight: Boolean = false,
+    val publicRetrievalModelId: String = PublicRetrievalConstants.RETRIEVAL_MODEL_ID,
+    val retrievalRequestsInSession: Int = 0,
+    val retrievalGroundedSuccessCount: Int = 0,
+    val retrievalCacheHitCount: Int = 0,
+    val retrievalExpiredCacheRejectedCount: Int = 0,
+    val retrievalFailureCount: Int = 0,
+    val retrievalHostileBlockedCount: Int = 0,
+    val retrievalSkippedNonCurrentCount: Int = 0
 )
 
 /**
@@ -229,8 +249,14 @@ class ConversationCoordinator(
     val isRealDeviceMeasurementMode: Boolean =
         speechDetector.requiresLoadedModel &&
             playbackAdapter.driver is com.example.audio.AndroidStreamingAudioTrackDriver,
-    private val goAwayDeadlineDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) }
+    private val goAwayDeadlineDelayRunner: suspend (Long) -> Unit = { ms -> delay(ms) },
+    publicRetrievalAdapter: PublicInformationRetrievalAdapter? = null
 ) {
+    val retrievalAdapter: PublicInformationRetrievalAdapter =
+        publicRetrievalAdapter ?: PublicInformationRetrievalAdapter(
+            isInternetValidated = { liveAdapter.networkMonitor.isInternetValidated() },
+            monotonicClockMs = monotonicClockMs
+        )
     private sealed interface PrerequisiteCheck {
         data object Passed : PrerequisiteCheck
         data class NotConfigured(val detail: String) : PrerequisiteCheck
@@ -1448,6 +1474,8 @@ class ConversationCoordinator(
                             voiceTurnPeakRmsLinear = 0f,
                             currentTurnUserTranscript = "",
                             currentTurnModelTranscript = "",
+                            currentTurnRetrievalAttachment = null,
+                            isPublicRetrievalInFlight = false,
                             authoritativeSystemInstruction = liveAdapter.systemInstruction,
                             lastVoiceTurnSummary = connectingOutcome.detail
                         )
@@ -1824,7 +1852,9 @@ class ConversationCoordinator(
                 voiceTurnBytesSent = 0L,
                 voiceTurnPeakRmsLinear = 0f,
                 currentTurnUserTranscript = "",
-                currentTurnModelTranscript = ""
+                currentTurnModelTranscript = "",
+                currentTurnRetrievalAttachment = null,
+                isPublicRetrievalInFlight = false
             )
         }
 
@@ -2712,6 +2742,7 @@ class ConversationCoordinator(
             var lastSeenResponseStarted = false
             var lastSeenBytesAccepted = 0L
             var lastSeenPlaybackHeadFrames = 0L
+            var wasRetrievalInFlight = false
 
             while (true) {
                 var waitStepMs = 10L
@@ -2771,9 +2802,28 @@ class ConversationCoordinator(
                         accumulatedWaitSinceLocalPlaybackIdleMs = 0L
                     }
 
+                    val retrievalInFlightNow =
+                        turn.isRetrievalInFlight && turn.retrievalJob?.isActive == true
+                    if (wasRetrievalInFlight && !retrievalInFlightNow) {
+                        wasRetrievalInFlight = false
+                        accumulatedWaitSinceResponseMs = 0L
+                    }
+
                     val totalElapsedMs = max((nowMs - submittedAtMs).coerceAtLeast(0L), accumulatedWaitMs)
 
-                    if (firstRespMs == null && firstAudioMs == null) {
+                    if (retrievalInFlightNow && firstAudioMs == null) {
+                        wasRetrievalInFlight = true
+                        val hardBoundMs = maxTurnResponseHardBoundMs.coerceAtLeast(timeoutMs)
+                        if (totalElapsedMs >= hardBoundMs) {
+                            triggerTimeout = true
+                            triggerTimeoutMs = hardBoundMs
+                            triggerFailureCode = "FIRST_RESPONSE_TIMEOUT"
+                            triggerFailureReason =
+                                "Turn exceeded hard upper bound of ${hardBoundMs}ms while awaiting public retrieval completion"
+                        } else {
+                            waitStepMs = minOf(100L, (hardBoundMs - totalElapsedMs).coerceAtLeast(10L))
+                        }
+                    } else if (firstRespMs == null && firstAudioMs == null) {
                         if (totalElapsedMs >= timeoutMs) {
                             triggerTimeout = true
                             triggerTimeoutMs = timeoutMs
@@ -4059,6 +4109,27 @@ class ConversationCoordinator(
                             val updatedSeq = appendTurnStateLocked(ConversationState.READY)
                             val updatedReadiness = appendReadinessOrderLocked("READY")
                             val newCompletedCount = current.completedTurnsInSession + 1
+                            var finalRetrievalAttachment = turn.retrievalAttachment
+                            if (finalRetrievalAttachment == null &&
+                                !turn.retrievalAttempted &&
+                                current.currentTurnUserTranscript.isNotBlank()
+                            ) {
+                                val postClassification = RetrievalTriggerClassifier.classify(current.currentTurnUserTranscript)
+                                if (postClassification.decision == RetrievalDecisionCategory.REQUIRES_CURRENT_PUBLIC_INFO) {
+                                    finalRetrievalAttachment = PublicRetrievalAttachment(
+                                        status = RetrievalVerificationStatus.UNVERIFIED_BACKGROUND_ONLY,
+                                        queryUsed = postClassification.normalizedQuery,
+                                        findingsSummary = "Live voice model responded using background knowledge without calling live public search.",
+                                        publicationOrEventTimeNote = "Unverified (no live web source consulted).",
+                                        uncertaintyNote = "Not verified against current web sources; current facts may have changed.",
+                                        fetchedAtEpochMs = null,
+                                        fetchedAtLabel = "NOT_SEARCHED",
+                                        freshnessPolicyLabel = postClassification.freshnessPolicy.label,
+                                        sources = emptyList(),
+                                        isNonPrivatePublicResult = false
+                                    )
+                                }
+                            }
                             val dialogueTurn = SessionDialogueTurn(
                                 sessionId = current.sessionId,
                                 turnId = current.currentTurnId,
@@ -4120,6 +4191,8 @@ class ConversationCoordinator(
                                     lastCompletedTurnEarliestMissingStep = turn.earliestMissingStep(),
                                     structuredTurnTrace = turn.structuredTraceEntries.toList(),
                                     activeTurnEarliestMissingStep = turn.earliestMissingStep(),
+                                    currentTurnRetrievalAttachment = finalRetrievalAttachment,
+                                    isPublicRetrievalInFlight = false,
                                     lastVoiceTurnSummary = readySummary
                                 )
                             }
@@ -4129,7 +4202,8 @@ class ConversationCoordinator(
                                 actionId = readyOutcome!!.actionId,
                                 newState = ConversationState.READY,
                                 roleLabel = "VOICE_TURN_COORDINATOR",
-                                outcome = readyOutcome!!
+                                outcome = readyOutcome!!,
+                                publicRetrievalAttachment = finalRetrievalAttachment
                             )
 
                             if (wantsAutoRestore && sessionReadyNow) {
@@ -4292,7 +4366,282 @@ class ConversationCoordinator(
                 }
             }
 
+            is LiveSocketCallbackEvent.ServerToolCallReceived -> {
+                handleServerToolCallEvent(event)
+            }
+
+            is LiveSocketCallbackEvent.ServerToolCallCancelled -> {
+                handleServerToolCallCancelledEvent(event)
+            }
+
             else -> Unit
+        }
+    }
+
+    private fun handleServerToolCallEvent(event: LiveSocketCallbackEvent.ServerToolCallReceived) {
+        val turn: TurnRuntimeState
+        val turnSeq: Long
+        val turnGen: TurnGenerationId
+        val callsToProcess: List<LiveSocketCallbackEvent.LiveToolCallRequest>
+        val jobToStart: Job
+        synchronized(this) {
+            val currentTurn = activeTurn
+            val activeLiveGen = liveAdapter.state.value.activeGeneration
+            if (currentTurn == null ||
+                currentTurn.closed ||
+                _uiState.value.sessionId != currentTurn.turnGen.sessionId ||
+                (activeLiveGen != null && activeLiveGen != event.generationId) ||
+                isDeliberatelyPaused ||
+                isDeliberatelyStopped ||
+                _uiState.value.state == ConversationState.PAUSED ||
+                _uiState.value.state == ConversationState.STOPPED
+            ) {
+                logTurnLifecycleEventLocked(
+                    "STALE_CALLBACK_DROPPED: Dropped ServerToolCallReceived for ${event.generationId.wireId} (activeTurn=${currentTurn?.turnGen?.wireId ?: "none"})."
+                )
+                _uiState.update { state ->
+                    state.copy(staleTurnCallbacksDropped = state.staleTurnCallbacksDropped + 1)
+                }
+                return
+            }
+
+            callsToProcess = event.calls.filter { req ->
+                val callId = req.id
+                callId == null || !currentTurn.activeRetrievalCallIds.contains(callId)
+            }
+            if (callsToProcess.isEmpty()) {
+                return
+            }
+
+            turn = currentTurn
+            turnSeq = turn.turnSeq
+            turnGen = turn.turnGen
+            val nowMs = monotonicClockMs()
+            if (turn.tFirstResponseMs == null) {
+                turn.tFirstResponseMs = nowMs
+            }
+            turn.tLastServerProgressMs = nowMs
+            turn.serverResponseStarted = true
+            if (_uiState.value.state == ConversationState.LISTENING) {
+                cancelInactivityTimerLocked()
+                if (turn.endOfTurnSubmissionInFlight) {
+                    turn.endOfTurnSubmitted = true
+                } else {
+                    stopTurnMicrophoneLocked(
+                        reason = "Server invoked bounded public retrieval tool",
+                        cancelQueuedMicSends = true,
+                        turnForTrace = turn
+                    )
+                }
+                promoteToProcessingLocked(
+                    turn = turn,
+                    sessionId = turn.sessionId,
+                    turnId = turn.turnId,
+                    turnGen = turn.turnGen
+                )
+            }
+
+            callsToProcess.forEach { req -> req.id?.let { turn.activeRetrievalCallIds.add(it) } }
+            turn.retrievalJob?.cancel()
+            turn.isRetrievalInFlight = true
+            turn.retrievalAttempted = true
+
+            _uiState.update { state ->
+                state.copy(
+                    isPublicRetrievalInFlight = true,
+                    lastVoiceTurnSummary = "THINKING: Verifying public web sources via ${PublicRetrievalConstants.RETRIEVAL_MODEL_ID}..."
+                )
+            }
+
+            jobToStart = turnScope.launch(turn.parentJob, start = CoroutineStart.LAZY) {
+                val thisJob = kotlin.coroutines.coroutineContext[Job]
+                try {
+                    val responses = mutableListOf<FunctionResponsePart>()
+                    for (call in callsToProcess) {
+                        kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                            if (!ctx[Job]!!.isActive) throw CancellationException("Retrieval cancelled")
+                        }
+                        val isStillActiveBeforeCall = synchronized(this@ConversationCoordinator) {
+                            activeTurn === turn &&
+                                !turn.closed &&
+                                turn.turnSeq == turnSeq &&
+                                turn.turnGen == turnGen &&
+                                !isDeliberatelyPaused &&
+                                !isDeliberatelyStopped
+                        }
+                        if (!isStillActiveBeforeCall) {
+                            return@launch
+                        }
+
+                        if (call.name != PublicRetrievalConstants.TOOL_NAME_SEARCH_PUBLIC_INFO) {
+                            val blockedAttachment = PublicRetrievalAttachment(
+                                status = RetrievalVerificationStatus.RETRIEVAL_HOSTILE_BLOCKED,
+                                queryUsed = "",
+                                findingsSummary = "Blocked unauthorized or unknown tool call '${call.name}'.",
+                                publicationOrEventTimeNote = "Not executed.",
+                                uncertaintyNote = "Only read-only public information search is permitted.",
+                                fetchedAtEpochMs = null,
+                                fetchedAtLabel = "BLOCKED",
+                                freshnessPolicyLabel = "POLICY_BLOCKED",
+                                failureCode = "UNSUPPORTED_OR_BLOCKED_TOOL",
+                                isNonPrivatePublicResult = false
+                            )
+                            val blockedJson = buildJsonObject {
+                                put("verified", false)
+                                put("status", RetrievalVerificationStatus.RETRIEVAL_HOSTILE_BLOCKED.wireCode)
+                                put("errorCode", "UNSUPPORTED_OR_BLOCKED_TOOL")
+                                put("sources", buildJsonArray { })
+                                put("mustSay", "Inform the user that that action is not available.")
+                            }
+                            synchronized(this@ConversationCoordinator) {
+                                if (activeTurn === turn && !turn.closed) {
+                                    turn.retrievalAttachment = blockedAttachment
+                                    _uiState.update { state ->
+                                        state.copy(
+                                            currentTurnRetrievalAttachment = blockedAttachment,
+                                            retrievalHostileBlockedCount = state.retrievalHostileBlockedCount + 1,
+                                            retrievalFailureCount = state.retrievalFailureCount + 1
+                                        )
+                                    }
+                                }
+                            }
+                            responses.add(FunctionResponsePart(name = call.name, response = blockedJson, id = call.id))
+                            continue
+                        }
+
+                        val turnRequestsSoFar = synchronized(this@ConversationCoordinator) {
+                            turn.retrievalRequestCountInTurn
+                        }
+                        val outcome = retrievalAdapter.retrieveForQuery(
+                            rawQuery = call.queryArg,
+                            turnRequestsSoFar = turnRequestsSoFar
+                        )
+
+                        val shouldContinueAfterLookup = synchronized(this@ConversationCoordinator) {
+                            if (activeTurn !== turn ||
+                                turn.closed ||
+                                turn.turnSeq != turnSeq ||
+                                turn.turnGen != turnGen ||
+                                _uiState.value.sessionId != turnGen.sessionId ||
+                                isDeliberatelyPaused ||
+                                isDeliberatelyStopped
+                            ) {
+                                false
+                            } else {
+                                if (outcome.attachment.status != RetrievalVerificationStatus.SKIPPED_NON_CURRENT_QUERY) {
+                                    turn.retrievalRequestCountInTurn += 1
+                                }
+                                turn.retrievalAttachment = outcome.attachment
+                                _uiState.update { state ->
+                                    val isGrounded = outcome.attachment.status == RetrievalVerificationStatus.GROUNDED_CURRENT_WEB ||
+                                        outcome.attachment.status == RetrievalVerificationStatus.GROUNDED_FRESH_CACHE
+                                    val isCacheHit = outcome.attachment.status == RetrievalVerificationStatus.GROUNDED_FRESH_CACHE
+                                    val isHostile = outcome.attachment.status == RetrievalVerificationStatus.RETRIEVAL_HOSTILE_BLOCKED
+                                    val isSkipped = outcome.attachment.status == RetrievalVerificationStatus.SKIPPED_NON_CURRENT_QUERY
+                                    val isFailure = !isGrounded && !isSkipped
+                                    state.copy(
+                                        currentTurnRetrievalAttachment = outcome.attachment,
+                                        retrievalRequestsInSession = retrievalAdapter.currentSessionRequestCount(),
+                                        retrievalExpiredCacheRejectedCount = retrievalAdapter.expiredCacheRejectedCount(),
+                                        retrievalGroundedSuccessCount = state.retrievalGroundedSuccessCount + if (isGrounded) 1 else 0,
+                                        retrievalCacheHitCount = state.retrievalCacheHitCount + if (isCacheHit) 1 else 0,
+                                        retrievalHostileBlockedCount = state.retrievalHostileBlockedCount + if (isHostile) 1 else 0,
+                                        retrievalFailureCount = state.retrievalFailureCount + if (isFailure) 1 else 0,
+                                        retrievalSkippedNonCurrentCount = state.retrievalSkippedNonCurrentCount + if (isSkipped) 1 else 0
+                                    )
+                                }
+                                true
+                            }
+                        }
+                        if (!shouldContinueAfterLookup) {
+                            return@launch
+                        }
+                        responses.add(
+                            FunctionResponsePart(
+                                name = call.name,
+                                response = outcome.toolResponsePayload,
+                                id = call.id
+                            )
+                        )
+                    }
+
+                    val canSendResponses = synchronized(this@ConversationCoordinator) {
+                        activeTurn === turn &&
+                            !turn.closed &&
+                            turn.turnSeq == turnSeq &&
+                            turn.turnGen == turnGen &&
+                            !isDeliberatelyPaused &&
+                            !isDeliberatelyStopped &&
+                            liveAdapter.state.value.activeGeneration == event.generationId
+                    }
+                    if (canSendResponses && responses.isNotEmpty()) {
+                        liveAdapter.sendToolResponsesToActiveSession(responses)
+                        synchronized(this@ConversationCoordinator) {
+                            if (activeTurn === turn && !turn.closed) {
+                                turn.tLastServerProgressMs = monotonicClockMs()
+                            }
+                        }
+                    }
+                } finally {
+                    synchronized(this@ConversationCoordinator) {
+                        for (call in callsToProcess) {
+                            call.id?.let { turn.activeRetrievalCallIds.remove(it) }
+                        }
+                        if (turn.retrievalJob === thisJob) {
+                            turn.retrievalJob = null
+                        }
+                        turn.isRetrievalInFlight = turn.retrievalJob?.isActive == true
+                        if (activeTurn === turn && !turn.closed) {
+                            _uiState.update { state ->
+                                state.copy(isPublicRetrievalInFlight = turn.isRetrievalInFlight)
+                            }
+                        }
+                    }
+                }
+            }
+            turn.retrievalJob = jobToStart
+        }
+        jobToStart.start()
+    }
+
+    private fun handleServerToolCallCancelledEvent(event: LiveSocketCallbackEvent.ServerToolCallCancelled) {
+        synchronized(this) {
+            val turn = activeTurn ?: return
+            if (turn.closed || liveAdapter.state.value.activeGeneration != event.generationId) {
+                return
+            }
+            val matchesInFlight =
+                event.functionIds.isEmpty() || event.functionIds.any { turn.activeRetrievalCallIds.contains(it) }
+            if (!matchesInFlight && !turn.isRetrievalInFlight) {
+                return
+            }
+            turn.retrievalJob?.cancel()
+            turn.retrievalJob = null
+            turn.isRetrievalInFlight = false
+            if (event.functionIds.isEmpty()) {
+                turn.activeRetrievalCallIds.clear()
+            } else {
+                turn.activeRetrievalCallIds.removeAll(event.functionIds.toSet())
+            }
+            val cancelledAttachment = turn.retrievalAttachment ?: PublicRetrievalAttachment(
+                status = RetrievalVerificationStatus.RETRIEVAL_CANCELLED,
+                queryUsed = "",
+                findingsSummary = "Public web retrieval was cancelled before completion.",
+                publicationOrEventTimeNote = "Cancelled.",
+                uncertaintyNote = "Current information could not be verified because the request was cancelled.",
+                fetchedAtEpochMs = null,
+                fetchedAtLabel = "CANCELLED",
+                freshnessPolicyLabel = "CANCELLED",
+                failureCode = "TOOL_CALL_CANCELLED",
+                isNonPrivatePublicResult = false
+            )
+            turn.retrievalAttachment = cancelledAttachment
+            _uiState.update { state ->
+                state.copy(
+                    isPublicRetrievalInFlight = false,
+                    currentTurnRetrievalAttachment = cancelledAttachment
+                )
+            }
         }
     }
 
@@ -4951,6 +5300,8 @@ class ConversationCoordinator(
                 lastCompletedTurnEarliestMissingStep = missingStep,
                 activeTurnEarliestMissingStep = missingStep,
                 hardwarePlaybackStallCount = if (isHardwareStall) state.hardwarePlaybackStallCount + 1 else state.hardwarePlaybackStallCount,
+                isPublicRetrievalInFlight = false,
+                currentTurnRetrievalAttachment = turn?.retrievalAttachment ?: state.currentTurnRetrievalAttachment,
                 activeVoiceTurnErrorCode = failureCode,
                 activeVoiceTurnErrorDetail = detail,
                 lastVoiceTurnSummary = "ERROR [$failureCode]: $detail"
@@ -4962,7 +5313,8 @@ class ConversationCoordinator(
             actionId = actId,
             newState = ConversationState.ERROR,
             roleLabel = "VOICE_TURN_ERROR",
-            outcome = outcome
+            outcome = outcome,
+            publicRetrievalAttachment = turn?.retrievalAttachment
         )
         deferredToComplete?.complete(outcome)
         return outcome
@@ -5211,6 +5563,7 @@ class ConversationCoordinator(
                         wakeWordStatusLabel = "STANDBY — SAY “JARVIS”",
                         wakeAuthorizationActive = false,
                         lastWakeKeyword = null,
+                        isPublicRetrievalInFlight = false,
                         lastVoiceTurnSummary = "STOPPED: Microphone capture, model turn, and queued audio playback cancelled."
                     )
                 }
@@ -5285,6 +5638,7 @@ class ConversationCoordinator(
                             wakeWordStatusLabel = "STANDBY — SAY “JARVIS”",
                             wakeAuthorizationActive = false,
                             lastWakeKeyword = null,
+                            isPublicRetrievalInFlight = false,
                             lastVoiceTurnSummary = "PAUSED: Session paused; active capture and playback released."
                         )
                     }
@@ -5704,6 +6058,7 @@ class ConversationCoordinator(
                 cancelActiveTurnStreamsLocked("Session reset to IDLE")
                 speechGate.cancelAndResetToIdle(resetSessionCounters = true)
                 syncSpeechGateTelemetryLocked()
+                retrievalAdapter.resetSession()
                 liveAdapter.clearSessionResumptionState()
                 liveAdapter.disconnectAndRelease(reason = "Session reset to IDLE")
                 needsSessionRecreationBeforeNextTurn = false
@@ -5761,6 +6116,15 @@ class ConversationCoordinator(
                         activeTurnTimingSnapshot = null,
                         lastCompletedTurnTimingSnapshot = null,
                         performanceSummary = Phase07PerformanceSummary(),
+                        currentTurnRetrievalAttachment = null,
+                        isPublicRetrievalInFlight = false,
+                        retrievalRequestsInSession = 0,
+                        retrievalGroundedSuccessCount = 0,
+                        retrievalCacheHitCount = 0,
+                        retrievalExpiredCacheRejectedCount = 0,
+                        retrievalFailureCount = 0,
+                        retrievalHostileBlockedCount = 0,
+                        retrievalSkippedNonCurrentCount = 0,
                         lastVoiceTurnSummary = "Ready. Press Start to begin a verified Gemini Live voice conversation."
                     )
                 }
@@ -5859,7 +6223,12 @@ class ConversationCoordinator(
                 activeConversationPhase = targetState.toActiveConversationPhase(),
                 activeConversationPhaseSequence = updatedPhaseSeq,
                 isDeliberatelyPaused = isDeliberatelyPaused,
-                isDeliberatelyStopped = isDeliberatelyStopped
+                isDeliberatelyStopped = isDeliberatelyStopped,
+                isPublicRetrievalInFlight = if (winningCommand == CoordinatorCommand.STOP || winningCommand == CoordinatorCommand.PAUSE) {
+                    false
+                } else {
+                    state.isPublicRetrievalInFlight
+                }
             )
         }
 
@@ -5919,7 +6288,8 @@ class ConversationCoordinator(
         actionId: ActionId,
         newState: ConversationState,
         roleLabel: String,
-        outcome: VerifiedOutcome
+        outcome: VerifiedOutcome,
+        publicRetrievalAttachment: PublicRetrievalAttachment? = null
     ) {
         val snap = audioCapture.state.value
         val liveSnap = liveAdapter.state.value
@@ -5935,7 +6305,8 @@ class ConversationCoordinator(
             stateSnapshot = newState,
             outcomeCode = outcome.code,
             message = outcome.detail,
-            timestampLabel = clockProvider()
+            timestampLabel = clockProvider(),
+            publicRetrievalAttachment = publicRetrievalAttachment
         )
         _uiState.update { state ->
             state.copy(
@@ -6122,7 +6493,16 @@ class ConversationCoordinator(
             lastActualSocketCloseClassification = liveSnap.lastActualSocketCloseClassification,
             lastActualSocketCloseReason = liveSnap.lastActualSocketCloseReason,
             contextWindowCompressionActive = liveSnap.contextWindowCompressionEnabled,
-            performanceSummary = ui.performanceSummary
+            performanceSummary = ui.performanceSummary,
+            registeredRetrievalToolsCount = liveSnap.registeredRetrievalToolsCount,
+            retrievalModelId = ui.publicRetrievalModelId,
+            retrievalRequestsInSession = ui.retrievalRequestsInSession,
+            retrievalGroundedSuccessCount = ui.retrievalGroundedSuccessCount,
+            retrievalCacheHitCount = ui.retrievalCacheHitCount,
+            retrievalExpiredCacheRejectedCount = ui.retrievalExpiredCacheRejectedCount,
+            retrievalFailureCount = ui.retrievalFailureCount,
+            retrievalHostileBlockedCount = ui.retrievalHostileBlockedCount,
+            retrievalSkippedNonCurrentCount = ui.retrievalSkippedNonCurrentCount
         )
     }
 

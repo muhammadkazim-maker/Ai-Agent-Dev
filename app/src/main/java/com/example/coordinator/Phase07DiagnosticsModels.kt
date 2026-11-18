@@ -3,6 +3,7 @@ package com.example.coordinator
 import com.example.BuildConfig
 import com.example.live.DiagnosticRedactor
 import com.example.live.LiveConfigConstants
+import com.example.retrieval.PublicRetrievalConstants
 import kotlin.math.ceil
 
 /**
@@ -638,7 +639,16 @@ data class RedactedDiagnosticSnapshot(
                 emptyList()
             }
         )
-    )
+    ),
+    val registeredRetrievalToolsCount: Int = LiveConfigConstants.REGISTERED_RETRIEVAL_TOOLS_COUNT,
+    val retrievalModelId: String = PublicRetrievalConstants.RETRIEVAL_MODEL_ID,
+    val retrievalRequestsInSession: Int = 0,
+    val retrievalGroundedSuccessCount: Int = 0,
+    val retrievalCacheHitCount: Int = 0,
+    val retrievalExpiredCacheRejectedCount: Int = 0,
+    val retrievalFailureCount: Int = 0,
+    val retrievalHostileBlockedCount: Int = 0,
+    val retrievalSkippedNonCurrentCount: Int = 0
 ) {
     fun toFormattedReport(): String = buildString {
         appendLine("=== OMNIVOICE REBUILD — PHASE 07A REDACTED DIAGNOSTIC SNAPSHOT ===")
@@ -792,6 +802,12 @@ data class RedactedDiagnosticSnapshot(
         appendLine("redactionPolicy: EXCLUDES transcript, raw audio, credentials, App Check tokens, resumption handles, contact info, and unfiltered exception messages")
         appendLine("outputStartLatencyNote: speechEnd-to-firstHardwareWrite is an ESTIMATE of output-start latency based on first positive AudioTrack.write; NOT physically measured speaker audibility")
         appendLine("transportSubmissionNote: tEndSubmittedMs marks client transport submission (sendStopActivityRealtime), distinct from server acknowledgment (tServerInputAckMs)")
+        appendLine()
+        appendLine("[13. PHASE 08 BOUNDED PUBLIC RETRIEVAL TELEMETRY]")
+        appendLine("registeredActionToolsCount: ${LiveConfigConstants.REGISTERED_ACTION_TOOLS_COUNT}")
+        appendLine("registeredRetrievalToolsCount: $registeredRetrievalToolsCount (${PublicRetrievalConstants.TOOL_NAME_SEARCH_PUBLIC_INFO} -> $retrievalModelId + ${PublicRetrievalConstants.RETRIEVAL_TOOL_DISPLAY})")
+        appendLine("sessionRetrievalCounts: requests=$retrievalRequestsInSession, groundedSuccess=$retrievalGroundedSuccessCount, freshCacheHits=$retrievalCacheHitCount, expiredCacheRejected=$retrievalExpiredCacheRejectedCount, skippedNonCurrent=$retrievalSkippedNonCurrentCount, failures=$retrievalFailureCount, hostileBlocked=$retrievalHostileBlockedCount")
+        appendLine("retrievalBoundaryPolicy: RETRIEVED_WEB_DATA_UNTRUSTED; NON_PRIVATE_PUBLIC_RESULTS_ONLY_FOR_LOCKSCREEN")
     }.trimEnd()
 
     private fun StringBuilder.appendTurnTimingSection(

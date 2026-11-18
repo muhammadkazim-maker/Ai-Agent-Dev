@@ -1,17 +1,21 @@
 package com.example.live
 
 import com.example.contract.SessionId
+import com.example.retrieval.PublicRetrievalToolSpec
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.ActivityDetectionConfig
 import com.google.firebase.ai.type.AudioTranscriptionConfig
 import com.google.firebase.ai.type.ContextWindowCompressionConfig
+import com.google.firebase.ai.type.FunctionResponsePart
 import com.google.firebase.ai.type.GenerativeBackend
 import com.google.firebase.ai.type.InlineData
 import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.LiveServerContent
 import com.google.firebase.ai.type.LiveServerGoAway
 import com.google.firebase.ai.type.LiveServerSetupComplete
+import com.google.firebase.ai.type.LiveServerToolCall
+import com.google.firebase.ai.type.LiveServerToolCallCancellation
 import com.google.firebase.ai.type.LiveSessionResumptionUpdate
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.RealtimeInputConfig
@@ -20,9 +24,12 @@ import com.google.firebase.ai.type.SessionResumptionConfig
 import com.google.firebase.ai.type.SlidingWindow
 import com.google.firebase.ai.type.SpeechConfig
 import com.google.firebase.ai.type.TextPart
+import com.google.firebase.ai.type.Tool
 import com.google.firebase.ai.type.Voice
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.liveGenerationConfig
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.EOFException
 import java.io.IOException
 import java.io.InterruptedIOException
@@ -108,6 +115,11 @@ interface LiveTransportDriver {
 
     suspend fun sendEndOfSpokenTurn(
         generationId: LiveSessionGenerationId
+    ): Boolean = true
+
+    suspend fun sendToolResponses(
+        generationId: LiveSessionGenerationId,
+        responses: List<FunctionResponsePart>
     ): Boolean = true
 
     fun isReceiverCollectorAttached(
@@ -572,7 +584,7 @@ class FirebaseAiLiveTransportDriver(
                 val liveModel = Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
                     modelName = modelId,
                     generationConfig = liveConfig,
-                    tools = emptyList(),
+                    tools = listOf(Tool.functionDeclarations(listOf(PublicRetrievalToolSpec.DECLARATION))),
                     systemInstruction = sysInstructionContent
                 )
 
@@ -788,6 +800,34 @@ class FirebaseAiLiveTransportDriver(
                                                 )
                                             }
                                         }
+                                        is LiveServerToolCall -> {
+                                            val calls = message.functionCalls.map { call ->
+                                                val queryValue = call.args["query"]?.let { elem ->
+                                                    runCatching { elem.jsonPrimitive.contentOrNull }.getOrNull()
+                                                }.orEmpty()
+                                                LiveSocketCallbackEvent.LiveToolCallRequest(
+                                                    id = call.id,
+                                                    name = call.name,
+                                                    queryArg = queryValue
+                                                )
+                                            }
+                                            if (calls.isNotEmpty()) {
+                                                onSocketEvent(
+                                                    LiveSocketCallbackEvent.ServerToolCallReceived(
+                                                        generationId = generationId,
+                                                        calls = calls
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        is LiveServerToolCallCancellation -> {
+                                            onSocketEvent(
+                                                LiveSocketCallbackEvent.ServerToolCallCancelled(
+                                                    generationId = generationId,
+                                                    functionIds = message.functionIds
+                                                )
+                                            )
+                                        }
                                         else -> Unit
                                     }
                                 }
@@ -870,7 +910,7 @@ class FirebaseAiLiveTransportDriver(
                     else -> "context=SESSION_RESUMPTION_ENABLED_COMPRESSION_SLIDING_WINDOW"
                 }
                 val acceptedNote =
-                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent ($modelId, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, tools=0, collector=ATTACHED, $contextNote)"
+                    "SETUP_ACCEPTED via Firebase AI Logic v1beta BidiGenerateContent ($modelId, voice=${LiveConfigConstants.DEFAULT_NATIVE_AUDIO_VOICE}, actionTools=0, retrievalTools=${LiveConfigConstants.REGISTERED_RETRIEVAL_TOOLS_COUNT}, collector=ATTACHED, $contextNote)"
                 onSocketEvent(
                     LiveSocketCallbackEvent.SetupAccepted(
                         generationId = generationId,
@@ -971,6 +1011,30 @@ class FirebaseAiLiveTransportDriver(
         }
     }
 
+    override suspend fun sendToolResponses(
+        generationId: LiveSessionGenerationId,
+        responses: List<FunctionResponsePart>
+    ): Boolean {
+        if (responses.isEmpty()) return true
+        if (networkMonitor != null && !networkMonitor.isInternetValidated()) return false
+        val session = synchronized(lock) {
+            if (activeGenerationId == generationId && receiverCollectorAttachedGen == generationId) {
+                activeLiveSession
+            } else {
+                null
+            }
+        } ?: return false
+        return try {
+            withContext(ioDispatcher) {
+                session.sendFunctionResponse(responses)
+            }
+            logDriver("FUNCTION_RESPONSE sent (${responses.size} part(s)) on ${generationId.wireId}")
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     override fun closeSocket(generationId: LiveSessionGenerationId?) {
         val sessionToClose: com.google.firebase.ai.type.LiveSession?
         val jobToCancel: Job?
@@ -1052,6 +1116,7 @@ class DeterministicTestLiveTransportDriver(
         private set
 
     val sentAudioChunks = mutableListOf<ByteArray>()
+    val sentToolResponses = mutableListOf<FunctionResponsePart>()
     val receivedSystemInstructions = mutableListOf<String>()
     var lastReceivedSystemInstruction: String = LiveConfigConstants.AUTHORITATIVE_SYSTEM_INSTRUCTION
         private set
@@ -1270,6 +1335,15 @@ class DeterministicTestLiveTransportDriver(
         if (cb != null && handler != null) {
             handler.invoke(generationId, cb)
         }
+        return true
+    }
+
+    override suspend fun sendToolResponses(
+        generationId: LiveSessionGenerationId,
+        responses: List<FunctionResponsePart>
+    ): Boolean {
+        if (lastConnectedGenId != generationId || !isCollectorAttachedForCurrentGen) return false
+        sentToolResponses.addAll(responses)
         return true
     }
 
@@ -1935,7 +2009,9 @@ class GeminiLiveConnectionAdapter(
 
                     is LiveSocketCallbackEvent.ServerAudioChunkReceived,
                     is LiveSocketCallbackEvent.ServerTurnCompleted,
-                    is LiveSocketCallbackEvent.ServerTranscriptionReceived -> {
+                    is LiveSocketCallbackEvent.ServerTranscriptionReceived,
+                    is LiveSocketCallbackEvent.ServerToolCallReceived,
+                    is LiveSocketCallbackEvent.ServerToolCallCancelled -> {
                         closeGenAfterCallback = null
                     }
                 }
@@ -1950,6 +2026,8 @@ class GeminiLiveConnectionAdapter(
         if (event is LiveSocketCallbackEvent.ServerAudioChunkReceived ||
             event is LiveSocketCallbackEvent.ServerTurnCompleted ||
             event is LiveSocketCallbackEvent.ServerTranscriptionReceived ||
+            event is LiveSocketCallbackEvent.ServerToolCallReceived ||
+            event is LiveSocketCallbackEvent.ServerToolCallCancelled ||
             event is LiveSocketCallbackEvent.ServerGoAwayReceived ||
             event is LiveSocketCallbackEvent.SessionResumptionUpdated
         ) {
@@ -2045,6 +2123,33 @@ class GeminiLiveConnectionAdapter(
             generationId = activeGen,
             pcm16kHzBytes = pcm16kHzBytes,
             mimeType = mimeType
+        )
+    }
+
+    suspend fun sendToolResponsesToActiveSession(
+        responses: List<FunctionResponsePart>
+    ): Boolean {
+        if (responses.isEmpty()) return true
+        if (!networkMonitor.isInternetValidated()) {
+            onNetworkValidatedChanged(false)
+            return false
+        }
+        val activeGen = synchronized(lock) {
+            val gen = activeGenerationId
+            val snap = _state.value
+            if (gen != null &&
+                (snap.phase == LiveConnectionPhase.SETUP_ACCEPTED || snap.phase == LiveConnectionPhase.ACTIVE) &&
+                snap.handshakeVerified &&
+                effectiveDriver.isReceiverCollectorAttached(gen)
+            ) {
+                gen
+            } else {
+                null
+            }
+        } ?: return false
+        return effectiveDriver.sendToolResponses(
+            generationId = activeGen,
+            responses = responses
         )
     }
 

@@ -680,9 +680,9 @@ class DeterministicStreamingAudioTrackDriver(
         if (activeGenerationId != generationId) return 0L
         val raw32 = simulatedRawHead32 ?: if (autoAdvancePlaybackHead) {
             val bytesPerFrame = (2 * openedChannelCount.coerceAtLeast(1)).toLong()
-            currentGenerationBytesAccepted / bytesPerFrame
+            (currentGenerationBytesAccepted / bytesPerFrame) + paddingFramesWritten
         } else {
-            manualPlaybackHeadFrames
+            manualPlaybackHeadFrames + paddingFramesWritten
         }
         if (raw32 < lastRawHead32 && (lastRawHead32 - raw32) > 0x8000_0000L) {
             wraparoundOffset += 0x1_0000_0000L

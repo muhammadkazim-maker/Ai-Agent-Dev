@@ -5,6 +5,7 @@ import com.example.audio.CaptureGenerationId
 import com.example.live.LiveConnectionPhase
 import com.example.live.LiveFailureClassification
 import com.example.live.LiveSessionGenerationId
+import com.example.retrieval.PublicRetrievalAttachment
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -388,6 +389,7 @@ data class TranscriptEntry(
     val stateSnapshot: ConversationState,
     val outcomeCode: String,
     val message: String,
-    val timestampLabel: String
+    val timestampLabel: String,
+    val publicRetrievalAttachment: PublicRetrievalAttachment? = null
 )
 

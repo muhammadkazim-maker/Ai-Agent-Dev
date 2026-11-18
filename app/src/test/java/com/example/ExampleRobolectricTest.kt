@@ -39,9 +39,9 @@ class ExampleRobolectricTest {
         assertEquals("OmniVoice Rebuild", context.getString(R.string.app_name))
         assertEquals("com.kazim.omnivoice.rebuild", BuildConfig.APPLICATION_ID)
         assertTrue(
-            "Expected derived Phase 07 SOURCE_BUILD_ID, got ${BuildConfig.SOURCE_BUILD_ID}",
-            BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p07-0.7.0-phase07-sha256-") ||
-                BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p07-0.7.0-phase07-git-")
+            "Expected derived Phase 08 SOURCE_BUILD_ID, got ${BuildConfig.SOURCE_BUILD_ID}",
+            BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p08-0.8.0-phase08-sha256-") ||
+                BuildConfig.SOURCE_BUILD_ID.startsWith("ov-rebuild-p08-0.8.0-phase08-git-")
         )
         assertTrue(
             "Expected reproducible SHA-256 SOURCE_FINGERPRINT, got ${BuildConfig.SOURCE_FINGERPRINT}",

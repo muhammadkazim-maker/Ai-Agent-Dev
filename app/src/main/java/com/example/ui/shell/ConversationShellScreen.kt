@@ -11,6 +11,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.webkit.WebView
+import android.widget.TextView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,13 +51,16 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.MicNone
 import androidx.compose.material.icons.outlined.MicOff
+import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -84,6 +89,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -91,6 +97,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -105,6 +112,9 @@ import com.example.contract.ConversationState
 import com.example.contract.InactivityTimeoutOption
 import com.example.contract.TranscriptEntry
 import com.example.coordinator.ConversationUiState
+import com.example.retrieval.PublicRetrievalAttachment
+import com.example.retrieval.RetrievalVerificationStatus
+import com.example.retrieval.UntrustedContentSanitizer
 import com.example.ui.live.LiveDiagnosticsScreen
 import com.example.ui.mic.MicrophoneSetupScreen
 
@@ -1060,7 +1070,11 @@ private fun VoiceTurnPipelineCard(
                 )
             }
 
-            if (uiState.currentTurnUserTranscript.isNotBlank() || uiState.currentTurnModelTranscript.isNotBlank()) {
+            if (uiState.currentTurnUserTranscript.isNotBlank() ||
+                uiState.currentTurnModelTranscript.isNotBlank() ||
+                uiState.isPublicRetrievalInFlight ||
+                uiState.currentTurnRetrievalAttachment != null
+            ) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1073,7 +1087,7 @@ private fun VoiceTurnPipelineCard(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         if (uiState.currentTurnUserTranscript.isNotBlank()) {
                             Text(
@@ -1094,6 +1108,21 @@ private fun VoiceTurnPipelineCard(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .testTag("voice_turn_model_transcript_text")
+                            )
+                        }
+                        if (uiState.isPublicRetrievalInFlight) {
+                            Text(
+                                text = "PUBLIC SEARCH: Checking ${uiState.publicRetrievalModelId} + Google Search grounding...",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.testTag("live_retrieval_in_flight_text")
+                            )
+                        }
+                        uiState.currentTurnRetrievalAttachment?.let { attachment ->
+                            PublicRetrievalMetadataBlock(
+                                attachment = attachment,
+                                tagPrefix = "live_retrieval"
                             )
                         }
                     }
@@ -1273,6 +1302,218 @@ private fun TranscriptEntryCard(entry: TranscriptEntry) {
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.fillMaxWidth()
             )
+            entry.publicRetrievalAttachment?.let { attachment ->
+                PublicRetrievalMetadataBlock(
+                    attachment = attachment,
+                    tagPrefix = "transcript_${entry.turnId.value}"
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun PublicRetrievalMetadataBlock(
+    attachment: PublicRetrievalAttachment,
+    tagPrefix: String
+) {
+    val uriHandler = LocalUriHandler.current
+    val isGrounded = attachment.status == RetrievalVerificationStatus.GROUNDED_CURRENT_WEB ||
+        attachment.status == RetrievalVerificationStatus.GROUNDED_FRESH_CACHE
+    val isSkipped = attachment.status == RetrievalVerificationStatus.SKIPPED_NON_CURRENT_QUERY
+    val containerColor = when {
+        isGrounded -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+        isSkipped -> MaterialTheme.colorScheme.surfaceVariant
+        else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+    }
+    val borderColor = when {
+        isGrounded -> MaterialTheme.colorScheme.secondary
+        isSkipped -> MaterialTheme.colorScheme.outline
+        else -> MaterialTheme.colorScheme.error
+    }
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("${tagPrefix}_retrieval_card"),
+        color = containerColor,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, borderColor)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = if (isGrounded) Icons.Outlined.Public else Icons.Outlined.WarningAmber,
+                    contentDescription = null,
+                    tint = if (isGrounded) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = attachment.status.displayBadge,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.testTag("${tagPrefix}_retrieval_status_badge")
+                )
+            }
+
+            if (attachment.findingsSummary.isNotBlank()) {
+                Text(
+                    text = attachment.findingsSummary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.testTag("${tagPrefix}_retrieval_findings")
+                )
+            }
+
+            Text(
+                text = buildString {
+                    append("Retrieved: ${attachment.fetchedAtLabel} (${attachment.freshnessPolicyLabel})")
+                    if (attachment.expiredCacheRejected) {
+                        append(" • EXPIRED CACHE REJECTED")
+                    }
+                    if (attachment.sanitizationReport.blockedThreatCount > 0) {
+                        append(" • FILTERED ${attachment.sanitizationReport.blockedThreatCount} UNTRUSTED")
+                    }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("${tagPrefix}_retrieval_timing")
+            )
+
+            Text(
+                text = "Published/Event: ${attachment.publicationOrEventTimeNote}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "Uncertainty: ${attachment.uncertaintyNote}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (attachment.sources.isNotEmpty()) {
+                Text(
+                    text = "SOURCES (UNTRUSTED PUBLIC WEB — CLICKABLE HTTPS LINKS):",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    attachment.sources.forEachIndexed { idx, source ->
+                        val safeUrl = UntrustedContentSanitizer.validatePublicHttpsUrl(source.url)
+                        if (safeUrl != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    runCatching { uriHandler.openUri(safeUrl) }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("${tagPrefix}_source_link_$idx"),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = source.title.ifBlank { source.domain },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            text = "${source.domain} • $safeUrl",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Outlined.OpenInNew,
+                                        contentDescription = "Open source ${source.domain}",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!attachment.searchEntryPointRenderedContent.isNullOrBlank() || attachment.webSearchQueries.isNotEmpty()) {
+                Text(
+                    text = "GOOGLE SEARCH SUGGESTIONS:",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (!attachment.searchEntryPointRenderedContent.isNullOrBlank()) {
+                    val html = attachment.searchEntryPointRenderedContent
+                    AndroidView(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 36.dp, max = 96.dp)
+                            .testTag("${tagPrefix}_search_suggestions_view"),
+                        factory = { ctx ->
+                            runCatching {
+                                WebView(ctx).apply {
+                                    settings.javaScriptEnabled = false
+                                    settings.allowFileAccess = false
+                                    settings.allowContentAccess = false
+                                    loadDataWithBaseURL(
+                                        "https://www.google.com/",
+                                        html,
+                                        "text/html",
+                                        "utf-8",
+                                        null
+                                    )
+                                }
+                            }.getOrElse {
+                                TextView(ctx).apply {
+                                    text = attachment.webSearchQueries.joinToString(" • ")
+                                }
+                            }
+                        }
+                    )
+                }
+                if (attachment.webSearchQueries.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        attachment.webSearchQueries.forEachIndexed { idx, query ->
+                            Surface(
+                                color = MaterialTheme.colorScheme.surface,
+                                shape = RoundedCornerShape(6.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                                modifier = Modifier.testTag("${tagPrefix}_search_query_chip_$idx")
+                            ) {
+                                Text(
+                                    text = "Google Search: $query",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
